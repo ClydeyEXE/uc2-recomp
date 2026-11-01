@@ -41,17 +41,24 @@ From a Developer prompt (vcvars64), at the repo root:
     cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
     cmake --build build/game -j 12
 
-Run from the repo root, because paths are relative. All four settings are required:
+`tools/build.cmd` does the same from any shell. Rerun `tools.recomp` first after adding or removing a hand-written
+function in `src/recomp_manual.c`.
+
+To play, use `tools/play.ps1` below, which sets everything. To run by hand, from the repo root because paths are
+relative, these settings are required:
 
 - `RECOMP_EXT_VMA=1`: without it the game loops forever walking memory.
 - `RECOMP_AC97_READY=1`: without it `DirectSoundCreate` fails and the game skips D3D device creation.
 - `RECOMP_PB_EXEC=1`: executes the GPU pushbuffer, so frames are actually drawn.
 - `RECOMP_VBLANK=paced`: delivers 60 Hz vblanks to D3D. Without it, movies never advance past their first frame.
+- `RECOMP_PB_WALK=dma`: reads the pushbuffer as the GPU does. D3D patches commands based on the read position it reports.
+- `RECOMP_GUEST_CPUS=2`: the game's threads share one core, as on the single-CPU console.
+- `RECOMP_HEAP_RECLAIM=1`: reuses freed contiguous memory. Without it the arena runs out about two minutes into a match.
 
 `RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking. `RECOMP_USB=1` attaches an emulated pad, and
 `RECOMP_PAD_SCRIPT` drives it, for example `70000:start:500,100000:a:500` (time in ms, button, hold in ms).
 
-    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; Start-Process build\game\ucc2_recomp.exe -NoNewWindow -RedirectStandardError stderr.txt
+    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; $env:RECOMP_PB_WALK="dma"; $env:RECOMP_GUEST_CPUS="2"; $env:RECOMP_HEAP_RECLAIM="1"; $env:RECOMP_LOG="stderr.txt"; Start-Process build\game\ucc2_recomp.exe
 
 To play in a window, run `powershell -File tools/play.ps1`, which also sets `RECOMP_HEAP_RECLAIM=1` and logs to
 `play_log.txt`. It draws on the GPU; add `-Software` for the old CPU rasteriser. Keys work while the window
