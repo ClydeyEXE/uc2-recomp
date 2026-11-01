@@ -35,3 +35,4 @@ src/recomp/gen/
 
 # Runtime logs
 xbox_kernel.log
+stderr.txt

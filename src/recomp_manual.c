@@ -23,6 +23,10 @@
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
 #include <string.h>
+#include <setjmp.h>
+#include <stdlib.h>
+
+typedef void (*recomp_func_t)(void);
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -44,11 +48,10 @@ extern volatile uint32_t g_icall_trace[16];
 extern volatile uint32_t g_icall_trace_idx;
 extern volatile uint64_t g_icall_count;
 
-typedef void (*recomp_func_t)(void);
 
 /* ── Register state (defined in xbox_memory_layout.c) ──────── */
 
-extern uint32_t g_eax;
+extern __declspec(thread) uint32_t g_eax;
 extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── GPU semaphore ─────────────────────────────────────────── */
@@ -132,7 +135,28 @@ void sub_00386B30(void)
     g_esp += 12; /* ret 8 */
 }
 
-/* ── CRT x87 special cases ─────────────────────────────────── */
+/*
+ * The game's wrapper for D3D's GetVisibilityTestResult(index, *result), replacing
+ * the generated body. It reads a report the GPU writes, and the executor does not
+ * write them, so a caller looping until the test completes never gets out. That
+ * froze map loading. The executor counts no pixels, so report the test as
+ * finished with a full 640x480 frame visible: occlusion culling then only draws
+ * more than it needs to.
+ */
+#define D3D_VISIBILITY_ALL_PIXELS (640u * 480u)
+
+void sub_002043A0(void)
+{
+    const char *mem = (const char *)g_xbox_mem_offset;
+    uint32_t result = *(const uint32_t *)(mem + g_esp + 8);
+
+    if (result)
+        *(uint32_t *)(mem + result) = D3D_VISIBILITY_ALL_PIXELS;
+    g_eax = 1;
+    g_esp += 12; /* ret 8 */
+}
+
+/* ── CRT x87 special cases─────────────────────────────────── */
 
 /*
  * Two targets of the table at 0x0040AAB8, which the CRT's x87 maths helpers
@@ -167,6 +191,254 @@ static void crt_x87_pop2_indefinite(void)
         *err = 1;
     g_esp += 4;
 }
+
+/* ── C++ exceptions ────────────────────────────────────────── */
+
+/*
+ * The runtime does not dispatch exceptions: RtlRaiseException logs and returns,
+ * so code carried on after every `throw`. Unreal's loader throws in normal use,
+ * for instance "Can't resolve package name" for an optional package, and running
+ * on past that ended in a garbage file name and the "dirty disc" screen.
+ *
+ * This replaces _CxxThrowException. It walks the guest's fs:[0] chain and reads
+ * the MSVC tables, as __CxxFrameHandler would: find a catch for the current state,
+ * run destructors in the frames being abandoned, then run the catch funclet and
+ * the continuation it returns. Lifted C cannot be resumed in the middle, so each
+ * function with a catch has a wrapper below, and a native longjmp lands there.
+ * tools/add_eh_entries.py makes the continuations into entry points.
+ *
+ * Guest frames in the chain that are not C++ (__except) are passed over.
+ */
+#define EH_MAGIC 0x19930520u
+#define EH_MAX_SITES 64
+
+#define M8(a)  (*(uint8_t *)((char *)g_xbox_mem_offset + (uint32_t)(a)))
+#define M32(a) (*(uint32_t *)((char *)g_xbox_mem_offset + (uint32_t)(a)))
+
+extern recomp_func_t recomp_lookup(uint32_t xbox_va);
+extern __declspec(thread) uint32_t g_fs_base;
+extern __declspec(thread) uint32_t g_ebp;
+
+typedef struct {
+    jmp_buf env;
+    uint32_t entry_esp;
+    int fp_top;
+} EhSite;
+
+static __declspec(thread) EhSite *eh_sites[EH_MAX_SITES];
+static __declspec(thread) int eh_depth;
+static __declspec(thread) uint32_t eh_obj, eh_info;      /* for a rethrow */
+static __declspec(thread) uint32_t eh_ebp, eh_funclet;   /* the landing */
+
+/* Call a funclet on the frame at ebp. It ends in `ret` and leaves esp as it was. */
+static int eh_call_funclet(uint32_t va, uint32_t ebp)
+{
+    recomp_func_t fn = recomp_lookup(va);
+
+    if (!fn) {
+        fprintf(stderr, "[EH] no translated funclet at 0x%08X\n", va);
+        return 0;
+    }
+    g_ebp = ebp;
+    g_seh_ebp = ebp;
+    g_esp -= 4;
+    M32(g_esp) = 0xEEEE0000u;
+    fn();
+    return 1;
+}
+
+static uint32_t eh_func_info(uint32_t reg)
+{
+    uint32_t handler = M32(reg + 4);
+
+    if (handler < 0x11000u || handler >= 0x400000u)
+        return 0;
+    if (M8(handler) != 0xB8 || M8(handler + 5) != 0xE9)   /* mov eax, fi; jmp */
+        return 0;
+    return M32(M32(handler + 1)) == EH_MAGIC ? M32(handler + 1) : 0;
+}
+
+/* Run the unwind map from `from` down to, but not including, `to`. */
+static void eh_unwind(uint32_t fi, uint32_t reg, int from, int to)
+{
+    uint32_t map = M32(fi + 8);
+    int s = from;
+
+    while (s >= 0 && s != to) {
+        int next = (int)M32(map + s * 8);
+        uint32_t action = M32(map + s * 8 + 4);
+
+        M32(reg + 8) = (uint32_t)next;
+        if (action)
+            eh_call_funclet(action, reg + 0xC);
+        s = next;
+    }
+}
+
+/* Does this catch accept the thrown type? pType 0 is catch (...). */
+static int eh_catch_matches(uint32_t catch_type, uint32_t info)
+{
+    uint32_t array, n, i;
+
+    if (!catch_type)
+        return 1;
+    array = M32(info + 0xC);
+    n = M32(array);
+    for (i = 0; i < n; i++) {
+        uint32_t type = M32(M32(array + 4 + i * 4) + 4);
+
+        if (type == catch_type
+                || !strcmp((char *)&M8(type + 8), (char *)&M8(catch_type + 8)))
+            return 1;
+    }
+    return 0;
+}
+
+/* Find the handler for the current state of a frame; 0 if it has none. */
+static uint32_t eh_find_catch(uint32_t fi, uint32_t reg, uint32_t info, uint32_t *try_block)
+{
+    int state = (int)M32(reg + 8);
+    uint32_t n = M32(fi + 0xC), tries = M32(fi + 0x10), t, c;
+
+    for (t = 0; t < n; t++) {
+        uint32_t block = tries + t * 20;
+
+        if (state < (int)M32(block) || state > (int)M32(block + 4))
+            continue;
+        for (c = 0; c < M32(block + 0xC); c++) {
+            uint32_t handler = M32(block + 0x10) + c * 16;
+
+            if (eh_catch_matches(M32(handler + 4), info)) {
+                *try_block = block;
+                return handler;
+            }
+        }
+    }
+    return 0;
+}
+
+extern void sub_002BA881_gen(void);
+
+void sub_002BA881(void)
+{
+    static long logged;
+    uint32_t obj = M32(g_esp + 4), info = M32(g_esp + 8);
+    uint32_t reg, target = 0, handler = 0, block = 0;
+    int site = -1;
+
+    if (!info) {                                  /* a rethrow */
+        obj = eh_obj;
+        info = eh_info;
+    }
+    eh_obj = obj;
+    eh_info = info;
+
+    for (reg = M32(g_fs_base); reg >= 0x10000u && reg < 0x4000000u; reg = M32(reg)) {
+        uint32_t fi = eh_func_info(reg);
+
+        if (fi && (handler = eh_find_catch(fi, reg, info, &block)) != 0) {
+            target = reg;
+            break;
+        }
+    }
+    if (target) {
+        for (site = eh_depth - 1; site >= 0; site--) {
+            uint32_t entry = eh_sites[site]->entry_esp;
+
+            if (target < entry && target >= entry - 0x20)
+                break;
+        }
+    }
+    if (InterlockedIncrement(&logged) <= 32) {
+        uint32_t text = obj ? M32(obj) : 0;
+
+        fprintf(stderr, "[EH] throw \"%.120s\": %s frame 0x%08X, funclet 0x%08X\n",
+                text >= 0x10000u && text < 0x4000000u ? (char *)&M8(text) : "?",
+                site >= 0 ? "caught at" : "NO CATCH SITE,", target,
+                handler ? M32(handler + 0xC) : 0);
+    }
+    if (site < 0) {
+        sub_002BA881_gen();                       /* the old fall through */
+        return;
+    }
+
+    for (reg = M32(g_fs_base); reg != target; reg = M32(reg)) {
+        uint32_t fi = eh_func_info(reg);
+
+        if (fi)
+            eh_unwind(fi, reg, (int)M32(reg + 8), -1);
+    }
+    eh_unwind(eh_func_info(target), target, (int)M32(target + 8), (int)M32(block));
+    M32(target + 8) = M32(block + 4) + 1;         /* the catch's own state */
+    M32(g_fs_base) = target;
+    if (M32(handler + 4) && M32(handler + 8))     /* catch by pointer: copy it */
+        M32(target + 0xC + (int)M32(handler + 8)) = M32(obj);
+    eh_ebp = target + 0xC;
+    eh_funclet = M32(handler + 0xC);
+    longjmp(eh_sites[site]->env, 1);
+}
+
+static void eh_try_site(void (*body)(void))
+{
+    EhSite site;
+    int index = eh_depth;
+
+    if (index >= EH_MAX_SITES) {
+        body();
+        return;
+    }
+    site.entry_esp = g_esp;
+    site.fp_top = g_fp_top;
+    eh_sites[index] = &site;
+    eh_depth = index + 1;
+    if (!setjmp(site.env)) {
+        body();
+        eh_depth = index;
+        return;
+    }
+    {
+        uint32_t ebp = eh_ebp;
+        recomp_func_t resume;
+
+        eh_depth = index + 1;
+        g_fp_top = site.fp_top;
+        g_esp = M32(ebp - 0x10);                  /* the frame's saved esp */
+        if (!eh_call_funclet(eh_funclet, ebp))
+            abort();
+        eh_depth = index;
+        resume = recomp_lookup(g_eax);
+        if (!resume) {
+            fprintf(stderr, "[EH] no continuation at 0x%08X\n", g_eax);
+            abort();
+        }
+        g_ebp = ebp;
+        g_seh_ebp = ebp;
+        resume();
+    }
+}
+
+extern void sub_00049450_gen(void);
+void sub_00049450(void) { eh_try_site(sub_00049450_gen); }
+extern void sub_000496B0_gen(void);
+void sub_000496B0(void) { eh_try_site(sub_000496B0_gen); }
+extern void sub_000568F0_gen(void);
+void sub_000568F0(void) { eh_try_site(sub_000568F0_gen); }
+extern void sub_00058780_gen(void);
+void sub_00058780(void) { eh_try_site(sub_00058780_gen); }
+extern void sub_00059080_gen(void);
+void sub_00059080(void) { eh_try_site(sub_00059080_gen); }
+extern void sub_00059470_gen(void);
+void sub_00059470(void) { eh_try_site(sub_00059470_gen); }
+extern void sub_00059590_gen(void);
+void sub_00059590(void) { eh_try_site(sub_00059590_gen); }
+extern void sub_00059680_gen(void);
+void sub_00059680(void) { eh_try_site(sub_00059680_gen); }
+extern void sub_00059D10_gen(void);
+void sub_00059D10(void) { eh_try_site(sub_00059D10_gen); }
+extern void sub_000C52E0_gen(void);
+void sub_000C52E0(void) { eh_try_site(sub_000C52E0_gen); }
+extern void sub_0020BBB0_gen(void);
+void sub_0020BBB0(void) { eh_try_site(sub_0020BBB0_gen); }
 
 /* ── Manual function overrides ─────────────────────────────── */
 

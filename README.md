@@ -24,14 +24,15 @@ and its output was byte-identical on `--text-only`. The second lets kernel calls
 
 Then run these from the same folder, with $XBE the absolute path to `assets/default.xbe`. Without
 `--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
-`--exclude-manual` makes the lifter use the hook and the hand-written function in `src/recomp_manual.c`. Without it the
-game freezes after its first flip.
+`--exclude-manual` makes the lifter use the hooks, wrappers and hand-written functions in `src/recomp_manual.c`, and
+`tools/add_eh_entries.py` adds the entry points its exception handling needs. Without them the game does not get far.
 
     python -m tools.xbe_parser $XBE --json <repo>/assets/default_analysis.json
     python -m tools.disasm $XBE --text-only --force -v --extra-sections XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP
     python -m tools.func_id $XBE -v
     python -m tools.abi_analysis $XBE -v
-    python -m tools.recomp $XBE --all --split 250 --game-name "Unreal Championship 2" --gen-dir <repo>/src/recomp/gen --exclude-manual <repo>/src/recomp_manual.c
+    python -I <repo>/tools/add_eh_entries.py tools/disasm/output/functions.json <repo>/build/functions_eh.json
+    python -m tools.recomp $XBE --all --split 250 --game-name "Unreal Championship 2" --gen-dir <repo>/src/recomp/gen --functions <repo>/build/functions_eh.json --exclude-manual <repo>/src/recomp_manual.c
 
 ## Build and run
 From a Developer prompt (vcvars64), at the repo root:
@@ -49,7 +50,7 @@ Run from the repo root, because paths are relative. All four settings are requir
 `RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking. `RECOMP_USB=1` attaches an emulated pad, and
 `RECOMP_PAD_SCRIPT` drives it, for example `70000:start:500,100000:a:500` (time in ms, button, hold in ms).
 
-    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; build\game\ucc2_recomp.exe 2> stderr.txt
+    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; Start-Process build\game\ucc2_recomp.exe -NoNewWindow -RedirectStandardError stderr.txt
 
 To play in a window, also set `RECOMP_FB_WINDOW=1`, `RECOMP_USB=1` and `RECOMP_KEYBOARD=1`. Keys work while the window
 has focus: Enter is Start, Z is A, X is B, C is X, V is Y, arrows are the D-pad, WASD is the left stick and IJKL is the
