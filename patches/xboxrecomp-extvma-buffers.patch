@@ -1,0 +1,56 @@
+diff --git a/src/kernel/guest_vmem.c b/src/kernel/guest_vmem.c
+index 24b948e..d434fe7 100644
+--- a/src/kernel/guest_vmem.c
++++ b/src/kernel/guest_vmem.c
+@@ -305,6 +305,26 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
+     return handled;
+ }
+ 
++int guest_vmem_committed(uint32_t va, uint32_t bytes)
++{
++    uint64_t end = (uint64_t)va + bytes;
++    uint32_t p, last;
++    int ok = 1;
++
++    if (!s_pages || !bytes || va < s_lo || end > s_top)
++        return 0;
++    last = page_index((uint32_t)(end - 1));
++    AcquireSRWLockShared(&s_lock);
++    for (p = page_index(va); p <= last; ++p) {
++        if (s_pages[p].state != MEM_COMMIT_FLAG) {
++            ok = 0;
++            break;
++        }
++    }
++    ReleaseSRWLockShared(&s_lock);
++    return ok;
++}
++
+ /* A region nothing can be allocated in, reported as reserved. */
+ static void reserved_region(uint32_t info[7], uint32_t lo, uint32_t hi)
+ {
+diff --git a/src/kernel/guest_vmem.h b/src/kernel/guest_vmem.h
+index ce05198..c7cd6a4 100644
+--- a/src/kernel/guest_vmem.h
++++ b/src/kernel/guest_vmem.h
+@@ -48,3 +48,6 @@ int guest_vmem_free(uint32_t *base, uint32_t *size, uint32_t free_type,
+  *             State, Protect, Type } -- the 28-byte guest
+  *             MEMORY_BASIC_INFORMATION layout. */
+ int guest_vmem_query(uint32_t address, uint32_t info[7]);
++
++/* True when every page of [va, va + bytes) is committed in the tracked range. */
++int guest_vmem_committed(uint32_t va, uint32_t bytes);
+diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
+index 10d00f4..5c9056a 100644
+--- a/src/kernel/kernel_bridge.c
++++ b/src/kernel/kernel_bridge.c
+@@ -94,6 +94,9 @@ static int bridge_va_mapped(uint32_t va, uint32_t bytes)
+         return 0;
+     if (end <= mapped)
+         return 1;
++    /* Above the mirrors, memory the title committed through RECOMP_EXT_VMA. */
++    if (guest_vmem_committed(va, bytes))
++        return 1;
+     return va >= XBOX_CONTIG_BASE
+         && end <= (uint64_t)XBOX_CONTIG_BASE + XBOX_CONTIG_SIZE;
+ }

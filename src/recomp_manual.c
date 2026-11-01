@@ -49,6 +49,38 @@ typedef void (*recomp_func_t)(void);
 extern uint32_t g_eax;
 extern ptrdiff_t g_xbox_mem_offset;
 
+/* ── GPU semaphore ─────────────────────────────────────────── */
+
+extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+
+#define D3D_DEVICE_PTR_VA     0x00393888u  /* D3D's global device pointer */
+#define D3D_DEV_SEMAPHORE_PTR 0x30u        /* device field: semaphore address */
+
+/*
+ * Entry hook on D3D's fence insert, the only code that pushes the semaphore
+ * release (method 0x1D70). The lifter calls this at the top of sub_00386840
+ * when tools.recomp runs with --exclude-manual on this file.
+ *
+ * D3D's fence wait, sub_00386B30, spins until the semaphore reaches its fence.
+ * The executor drops releases until it is told where the semaphore is, so the
+ * word kept the 3 D3D gave it at init and the title froze after its first
+ * flip. Telling it here comes before any release can be pushed. Re-read on each
+ * call because D3D rewrites the field on device reset.
+ */
+void sub_00386840_enter(void)
+{
+    static uint32_t current;
+    const char *mem = (const char *)g_xbox_mem_offset;
+    uint32_t dev = *(const uint32_t *)(mem + D3D_DEVICE_PTR_VA);
+    uint32_t sem = *(const uint32_t *)(mem + dev + D3D_DEV_SEMAPHORE_PTR);
+
+    if (sem != current) {
+        current = sem;
+        nv2a_pb_set_semaphore_target(sem);
+        fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
+    }
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*

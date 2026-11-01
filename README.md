@@ -16,19 +16,22 @@ Requires CMake, Ninja, Python 3.12, and MSVC (VS 2022 Build Tools, C++ workload)
     python -I tools/verify_setup.py assets
 
 ## Recompile
-Apply the local toolkit patch once, from `third_party/xboxrecomp`. It makes the disassembler about 6x faster and its
-output was byte-identical on `--text-only`:
+Apply the local toolkit patches once, from `third_party/xboxrecomp`. The first makes the disassembler about 6x faster
+and its output was byte-identical on `--text-only`. The second lets kernel calls use buffers in `RECOMP_EXT_VMA` memory:
 
     git apply ../../patches/xboxrecomp-decode-stream.patch
+    git apply ../../patches/xboxrecomp-extvma-buffers.patch
 
 Then run these from the same folder, with $XBE the absolute path to `assets/default.xbe`. Without
 `--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
+`--exclude-manual` makes the lifter call the `sub_XXXXXXXX_enter` hooks in `src/recomp_manual.c`, and without it the
+game freezes after its first flip.
 
     python -m tools.xbe_parser $XBE --json <repo>/assets/default_analysis.json
     python -m tools.disasm $XBE --text-only --force -v --extra-sections XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP
     python -m tools.func_id $XBE -v
     python -m tools.abi_analysis $XBE -v
-    python -m tools.recomp $XBE --all --split 250 --game-name "Unreal Championship 2" --gen-dir <repo>/src/recomp/gen
+    python -m tools.recomp $XBE --all --split 250 --game-name "Unreal Championship 2" --gen-dir <repo>/src/recomp/gen --exclude-manual <repo>/src/recomp_manual.c
 
 ## Build and run
 From a Developer prompt (vcvars64), at the repo root:

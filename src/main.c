@@ -86,6 +86,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 #define YOUR_GAME_XBE_PATH      "assets\\default.xbe"
 #define YOUR_GAME_DIR            "assets"
 
+#define D3D_DEVICE_PTR_VA       0x00393888  /* D3D's global device pointer */
+#define D3D_DEV_VBLANK_COUNT    0x1DE8      /* device field: vblank count */
+
 /* ── Forward declarations ──────────────────────────────────── */
 
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
@@ -408,6 +411,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      * silently inert, and the one diagnostic that tells a hang from slowness
      * does nothing while appearing to be set. */
     xbox_WatchdogStart();
+
+    /* D3D's vblank count. The vblank interrupt moves it on the console, and the
+     * runtime raises none, so it stayed at its first value. XMV playback times
+     * frames against it (sub_00382610 reads it for GetDisplayFieldStatus), so the
+     * logo movie showed its first frame and never advanced. */
+    xbox_Nv2aFrameCounter(D3D_DEVICE_PTR_VA, D3D_DEV_VBLANK_COUNT);
 
     /* Step 7: Call the recompiled entry point */
     printf("\nStarting game...\n");
