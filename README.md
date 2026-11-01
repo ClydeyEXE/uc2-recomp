@@ -39,15 +39,16 @@ From a Developer prompt (vcvars64), at the repo root:
     cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
     cmake --build build/game -j 12
 
-Run from the repo root, because paths are relative. All three settings are required:
+Run from the repo root, because paths are relative. All four settings are required:
 
 - `RECOMP_EXT_VMA=1`: without it the game loops forever walking memory.
 - `RECOMP_AC97_READY=1`: without it `DirectSoundCreate` fails and the game skips D3D device creation.
 - `RECOMP_PB_EXEC=1`: executes the GPU pushbuffer, so frames are actually drawn.
+- `RECOMP_VBLANK=paced`: delivers 60 Hz vblanks to D3D. Without it, movies never advance past their first frame.
 
 `RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking.
 
-    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; build\game\ucc2_recomp.exe 2> stderr.txt
+    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; build\game\ucc2_recomp.exe 2> stderr.txt
 
 The runtime keeps save data in `%LOCALAPPDATA%\xboxrecomp`.
 
