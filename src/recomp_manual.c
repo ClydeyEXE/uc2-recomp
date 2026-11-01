@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
+#include <string.h>
 
 /* ── ICALL trace ring buffer ───────────────────────────────── */
 
@@ -131,6 +132,42 @@ void sub_00386B30(void)
     g_esp += 12; /* ret 8 */
 }
 
+/* ── CRT x87 special cases ─────────────────────────────────── */
+
+/*
+ * Two targets of the table at 0x0040AAB8, which the CRT's x87 maths helpers
+ * index by the class of their operands. The disassembler started neighbouring
+ * functions two bytes further in, past the first `fstp st(0)`, so these
+ * addresses were never translated. A skipped call leaves two extra values on the
+ * guest's FPU stack.
+ */
+extern __declspec(thread) double g_fp_stack[8];
+extern __declspec(thread) int g_fp_top;
+extern __declspec(thread) uint32_t g_seh_ebp;
+extern void sub_002B7B7E(void);
+
+/* fstp st(0), then sub_002B7B7E: fstp st(0); fldz; ret */
+static void crt_x87_pop2_zero(void)
+{
+    g_fp_top = (g_fp_top + 1) & 7;
+    sub_002B7B7E();
+}
+
+/* fstp st(0); fstp st(0); fld tbyte [0x406938], the x87 indefinite NaN; mark the
+ * error class in the caller's frame if none is set; ret */
+static void crt_x87_pop2_indefinite(void)
+{
+    static const uint64_t indefinite = 0xFFF8000000000000ull;
+    const char *mem = (const char *)g_xbox_mem_offset;
+    int8_t *err = (int8_t *)(mem + g_seh_ebp - 0x90);
+
+    g_fp_top = (g_fp_top + 1) & 7;
+    memcpy(&g_fp_stack[g_fp_top], &indefinite, sizeof indefinite);
+    if (*err <= 0)
+        *err = 1;
+    g_esp += 4;
+}
+
 /* ── Manual function overrides ─────────────────────────────── */
 
 /*
@@ -169,6 +206,8 @@ void sub_00386B30(void)
  */
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
+    if (xbox_va == 0x002B7B7Cu) return crt_x87_pop2_zero;
+    if (xbox_va == 0x002B7C1Eu) return crt_x87_pop2_indefinite;
     /*
      * TODO: Add your overrides here. Examples:
      *
