@@ -17,7 +17,8 @@ Requires CMake, Ninja, Python 3.12, and MSVC (VS 2022 Build Tools, C++ workload)
 
 ## Recompile
 Apply the local toolkit patches once, from `third_party/xboxrecomp`. The first makes the disassembler about 6x faster
-and its output was byte-identical on `--text-only`. The second lets kernel calls use buffers in `RECOMP_EXT_VMA` memory:
+and its output was byte-identical on `--text-only`. The second lets kernel calls use buffers in `RECOMP_EXT_VMA` memory.
+The third holds later toolkit work, and `tools/update_patches.ps1` regenerates it:
 
     git apply ../../patches/xboxrecomp-decode-stream.patch
     git apply ../../patches/xboxrecomp-extvma-buffers.patch

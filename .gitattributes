@@ -1,1 +1,4 @@
-* text=auto
+* text=auto eol=lf
+*.cmd text eol=crlf
+# Applied byte for byte by git apply.
+*.patch -text
