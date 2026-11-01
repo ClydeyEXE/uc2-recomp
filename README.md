@@ -24,7 +24,7 @@ and its output was byte-identical on `--text-only`. The second lets kernel calls
 
 Then run these from the same folder, with $XBE the absolute path to `assets/default.xbe`. Without
 `--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
-`--exclude-manual` makes the lifter call the `sub_XXXXXXXX_enter` hooks in `src/recomp_manual.c`, and without it the
+`--exclude-manual` makes the lifter use the hook and the hand-written function in `src/recomp_manual.c`. Without it the
 game freezes after its first flip.
 
     python -m tools.xbe_parser $XBE --json <repo>/assets/default_analysis.json
@@ -46,7 +46,8 @@ Run from the repo root, because paths are relative. All four settings are requir
 - `RECOMP_PB_EXEC=1`: executes the GPU pushbuffer, so frames are actually drawn.
 - `RECOMP_VBLANK=paced`: delivers 60 Hz vblanks to D3D. Without it, movies never advance past their first frame.
 
-`RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking.
+`RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking. `RECOMP_USB=1` attaches an emulated pad, and
+`RECOMP_PAD_SCRIPT` drives it, for example `70000:start:500,100000:a:500` (time in ms, button, hold in ms).
 
     $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; build\game\ucc2_recomp.exe 2> stderr.txt
 

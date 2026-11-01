@@ -349,6 +349,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                 g_apu_state ? "up" : "FAILED to initialise");
     }
 
+    /* The USB host controllers, so the title's XAPI can find a pad. Does nothing
+     * unless RECOMP_USB is set. The VEH above reaches them through
+     * xbox_VehMmioFault. Declared rather than included, like the APU above. */
+    {
+        extern void xbox_OhciInit(void);
+        xbox_OhciInit();
+    }
+
     /* Step 3: Initialize Xbox kernel */
     printf("Initializing Xbox kernel replacement...\n");
     xbox_kernel_init();

@@ -18,6 +18,7 @@
  *   - Intercept D3D/audio calls for custom rendering or sound
  */
 
+#include <windows.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
@@ -54,7 +55,9 @@ extern ptrdiff_t g_xbox_mem_offset;
 extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 
 #define D3D_DEVICE_PTR_VA     0x00393888u  /* D3D's global device pointer */
+#define D3D_DEV_WRITE_SEQ     0x2Cu        /* device field: next fence to issue */
 #define D3D_DEV_SEMAPHORE_PTR 0x30u        /* device field: semaphore address */
+#define D3D_FENCE_WAIT_MS     250u         /* longest a fence wait may last */
 
 /*
  * Entry hook on D3D's fence insert, the only code that pushes the semaphore
@@ -79,6 +82,53 @@ void sub_00386840_enter(void)
         nv2a_pb_set_semaphore_target(sem);
         fprintf(stderr, "[D3D] GPU semaphore at 0x%08X\n", sem);
     }
+}
+
+/*
+ * D3D's fence wait, BlockOnTime(fence, flags), replacing the generated body.
+ *
+ * The original has a "GPU far behind" path that patches a software method into
+ * the pushbuffer, spins on PGRAPH 0x400B10 and sleeps on an event set by the GPU
+ * interrupt. The executor's default segment scan models neither, so the game
+ * froze there when Start was pressed. RECOMP_PB_WALK=dma models the register but
+ * rendered the title screen wrongly and still hung on the event.
+ *
+ * This keeps what the wait means: kick the fence if it is the newest one, then
+ * wait for the real semaphore to reach it. Bounded, as a lost release must not
+ * freeze the title. The original's callback at device+0x19FC is not called.
+ */
+extern void sub_00386840(void);
+extern __declspec(thread) uint32_t g_esp;
+
+void sub_00386B30(void)
+{
+    const char *mem = (const char *)g_xbox_mem_offset;
+    uint32_t fence = *(const uint32_t *)(mem + g_esp + 4);
+    uint32_t dev = *(const uint32_t *)(mem + D3D_DEVICE_PTR_VA);
+    const volatile uint32_t *seq =
+        (const volatile uint32_t *)(mem + dev + D3D_DEV_WRITE_SEQ);
+    const volatile uint32_t *sem = (const volatile uint32_t *)
+        (mem + *(const uint32_t *)(mem + dev + D3D_DEV_SEMAPHORE_PTR));
+    ULONGLONG start = 0;
+
+    if (fence == *seq) {
+        g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0;
+        g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0x00386B5Fu;
+        sub_00386840();
+    }
+    while (*seq - fence < *seq - *sem) {
+        if (!start) {
+            start = GetTickCount64();
+        } else if (GetTickCount64() - start >= D3D_FENCE_WAIT_MS) {
+            static unsigned timeouts;
+            if (timeouts++ < 8)
+                fprintf(stderr, "[D3D] fence 0x%X not reached in %u ms (semaphore 0x%X)\n",
+                        fence, D3D_FENCE_WAIT_MS, *sem);
+            break;
+        }
+        SwitchToThread();
+    }
+    g_esp += 12; /* ret 8 */
 }
 
 /* ── Manual function overrides ─────────────────────────────── */
