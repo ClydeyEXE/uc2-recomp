@@ -16,11 +16,16 @@ Requires CMake, Ninja, Python 3.12, and MSVC (VS 2022 Build Tools, C++ workload)
     python -I tools/verify_setup.py assets
 
 ## Recompile
-Run from `third_party/xboxrecomp`, with $XBE the absolute path to `assets/default.xbe`. The disassembler
-takes about 35 minutes on this game; the other steps take seconds to a couple of minutes.
+Apply the local toolkit patch once, from `third_party/xboxrecomp`. It makes the disassembler about 6x faster and its
+output was byte-identical on `--text-only`:
+
+    git apply ../../patches/xboxrecomp-decode-stream.patch
+
+Then run these from the same folder, with $XBE the absolute path to `assets/default.xbe`. Without
+`--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
 
     python -m tools.xbe_parser $XBE --json <repo>/assets/default_analysis.json
-    python -m tools.disasm $XBE --text-only -v
+    python -m tools.disasm $XBE --text-only --force -v --extra-sections XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP
     python -m tools.func_id $XBE -v
     python -m tools.abi_analysis $XBE -v
     python -m tools.recomp $XBE --all --split 250 --game-name "Unreal Championship 2" --gen-dir <repo>/src/recomp/gen

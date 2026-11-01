@@ -1,0 +1,89 @@
+diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
+index dfb23d2..5344475 100644
+--- a/tools/disasm/engine.py
++++ b/tools/disasm/engine.py
+@@ -493,9 +493,11 @@ class DisasmEngine:
+         if offset < 0 or addr >= file_end:
+             return 0
+ 
++        from ..recomp.disasm import decode_stream
++
+         added = 0
+         overlaps = set()
+-        for cs_insn in self._cs.disasm(data[offset:], addr):
++        for cs_insn in decode_stream(self._cs, data[offset:], addr):
+             if cs_insn.address >= file_end:
+                 break
+             if cs_insn.address != addr and cs_insn.address in self.instructions:
+@@ -696,7 +698,7 @@ class DisasmEngine:
+         A switch arm outside the gap counts as an exit when it is in
+         tail_targets, whether or not escapes is given.
+         """
+-        from ..recomp.disasm import Disassembler
++        from ..recomp.disasm import Disassembler, decode_stream
+ 
+         section = self.image.get_section_at_va(addr)
+         if section is None or not section.executable:
+@@ -712,7 +714,7 @@ class DisasmEngine:
+             # writer defines only its own flags: inc and dec leave CF.
+             pending = {"AF", "CF", "OF", "PF", "SF", "ZF"}
+             flag = lambda kind, name: getattr(x86_const, f"X86_EFLAGS_{kind}_{name}")
+-            for insn in self._cs.disasm(raw[addr - lower:], addr):
++            for insn in decode_stream(self._cs, raw[addr - lower:], addr):
+                 if (X86_REG_EFLAGS in insn.regs_read
+                         and (not insn.eflags or any(
+                             insn.eflags & flag("TEST", f) for f in pending))):
+diff --git a/tools/recomp/disasm.py b/tools/recomp/disasm.py
+index 7ef8cad..5aaa84f 100644
+--- a/tools/recomp/disasm.py
++++ b/tools/recomp/disasm.py
+@@ -147,6 +147,28 @@ def _parse_operand(cs, cs_op, insn_obj):
+         return Operand(type="reg", reg=_reg_names.get(cs_op.reg, f"r{cs_op.reg}"))
+ 
+ 
++def decode_stream(cs, code, va, window=512):
++    """Yield what cs.disasm(code, va) yields, decoding one window at a time.
++
++    cs.disasm decodes its whole buffer before returning the first instruction,
++    so a caller that stops after a few instructions still pays for the rest of
++    the section. An x86 instruction is at most 15 bytes: a window that stops
++    with 15 or more bytes left has hit invalid code, which ends the stream as
++    it would have in one call. Fewer than that may be an instruction cut by the
++    window, so decoding resumes from there.
++    """
++    offset = 0
++    while offset < len(code):
++        chunk = code[offset:offset + window]
++        used = 0
++        for insn in cs.disasm(chunk, va + offset):
++            used += insn.size
++            yield insn
++        offset += used
++        if used == 0 or len(chunk) - used >= 15:
++            return
++
++
+ class Disassembler:
+     """Capstone-based x86-32 disassembler."""
+ 
+@@ -231,8 +253,9 @@ class Disassembler:
+             for addr in [a for a, i in decoded.items()
+                          if a < point < a + i.size]:
+                 del decoded[addr]
+-            for cs_insn in self._cs.disasm(raw_bytes[point - start_va:size],
+-                                           point):
++            for cs_insn in decode_stream(self._cs,
++                                         raw_bytes[point - start_va:size],
++                                         point):
+                 if cs_insn.address in decoded:
+                     break          # rejoined a stream we already have
+                 # The misaligned stream did not only straddle `point`: until
+@@ -264,7 +287,7 @@ class Disassembler:
+             if not (start_va <= entry < end_va) or entry in decoded:
+                 continue
+             offset = entry - start_va
+-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
++            for cs_insn in decode_stream(self._cs, raw_bytes[offset:size], entry):
+                 if cs_insn.address != entry and cs_insn.address in stop_addresses:
+                     break
+                 if cs_insn.address >= end_va or cs_insn.address in decoded:
