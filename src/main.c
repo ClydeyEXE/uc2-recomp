@@ -299,6 +299,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    /* RECOMP_LOG=<file>: the log goes straight to a file. Redirecting through
+     * PowerShell puts a slowly drained pipe under every line. */
+    {
+        const char *log = getenv("RECOMP_LOG");
+        if (log && *log)
+            freopen(log, "w", stderr);
+    }
+
     /* Unbuffered output for immediate visibility during debugging */
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -355,6 +363,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     {
         extern void xbox_OhciInit(void);
         xbox_OhciInit();
+    }
+
+    /* Draw on the GPU instead of the software rasteriser. */
+    {
+        extern void gpu_d3d11_register(void);
+        gpu_d3d11_register();
     }
 
     /* Step 3: Initialize Xbox kernel */

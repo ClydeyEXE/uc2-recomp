@@ -52,6 +52,7 @@ file(GLOB RECOMP_GEN_SOURCES CONFIGURE_DEPENDS "src/recomp/gen/*.c")
 set(GAME_SOURCES
     src/main.c
     src/recomp_manual.c
+    src/gpu_d3d11.c
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -76,11 +77,13 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
     ${XBOXRECOMP_DIR}/include
+    ${XBOXRECOMP_DIR}/src
 )
 
 # Windows SDK libraries needed at link time
 target_link_libraries(${PROJECT_NAME} PRIVATE
     d3d11
+    d3dcompiler
     dxgi
     dxguid
     $<IF:$<BOOL:${MINGW}>,xinput1_4,xinput>   # see src/input/CMakeLists.txt
@@ -94,7 +97,13 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
 if(MSVC)
     target_link_options(${PROJECT_NAME} PRIVATE
         /LARGEADDRESSAWARE
+        # A PDB with every sub_XXXXXXXX public, so tools/prof.py and the fault
+        # handler can name guest functions. /OPT keeps the Release layout.
+        /DEBUG:FULL /OPT:REF /OPT:ICF
     )
+    # Names for the runtime's statics in profiles.
+    target_compile_options(xbox_kernel PRIVATE /Zi)
+    target_compile_options(xbox_video PRIVATE /Zi)
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
 endif()

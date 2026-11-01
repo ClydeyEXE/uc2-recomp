@@ -21,6 +21,7 @@ and its output was byte-identical on `--text-only`. The second lets kernel calls
 
     git apply ../../patches/xboxrecomp-decode-stream.patch
     git apply ../../patches/xboxrecomp-extvma-buffers.patch
+    git apply ../../patches/xboxrecomp-gpu-backend.patch
 
 Then run these from the same folder, with $XBE the absolute path to `assets/default.xbe`. Without
 `--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
@@ -52,7 +53,8 @@ Run from the repo root, because paths are relative. All four settings are requir
 
     $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; Start-Process build\game\ucc2_recomp.exe -NoNewWindow -RedirectStandardError stderr.txt
 
-To play in a window, also set `RECOMP_FB_WINDOW=1`, `RECOMP_USB=1` and `RECOMP_KEYBOARD=1`. Keys work while the window
+To play in a window, run `powershell -File tools/play.ps1`, which also sets `RECOMP_HEAP_RECLAIM=1` and logs to
+`play_log.txt`. It draws on the GPU; add `-Software` for the old CPU rasteriser. Keys work while the window
 has focus: Enter is Start, Z is A, X is B, C is X, V is Y, arrows are the D-pad, WASD is the left stick and IJKL is the
 right stick. A connected XInput controller should also work.
 

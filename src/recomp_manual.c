@@ -61,7 +61,11 @@ extern void nv2a_pb_set_semaphore_target(uint32_t guest_va);
 #define D3D_DEVICE_PTR_VA     0x00393888u  /* D3D's global device pointer */
 #define D3D_DEV_WRITE_SEQ     0x2Cu        /* device field: next fence to issue */
 #define D3D_DEV_SEMAPHORE_PTR 0x30u        /* device field: semaphore address */
-#define D3D_FENCE_WAIT_MS     250u         /* longest a fence wait may last */
+#define D3D_DEV_REGISTERS     0x1C20u      /* device field: USER register block */
+#define D3D_DEV_FLAGS         0x08u        /* device field: state flags */
+#define D3D_DEV_ALT_PUT       0x00000004u  /* flag: the put slot is at device+0x770 */
+#define D3D_DEV_SUSPENDED     0x00002000u  /* flag: kicks do nothing */
+#define D3D_FENCE_WAIT_MS     250u         /* longest a wait lasts with GET not moving */
 
 /*
  * Entry hook on D3D's fence insert, the only code that pushes the semaphore
@@ -98,11 +102,17 @@ void sub_00386840_enter(void)
  * rendered the title screen wrongly and still hung on the event.
  *
  * This keeps what the wait means: kick the fence if it is the newest one, then
- * wait for the real semaphore to reach it. Bounded, as a lost release must not
- * freeze the title. The original's callback at device+0x19FC is not called.
+ * wait for the real semaphore to reach it. It gives up only when the GPU has made
+ * no progress for a while, as a lost release must not freeze the title. Giving up
+ * on a GPU that is just busy lets D3D reuse pushbuffer space the executor has not
+ * read, which desynchronises the walk. The original's callback at device+0x19FC is
+ * not called.
  */
 extern void sub_00386840(void);
 extern __declspec(thread) uint32_t g_esp;
+extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
+
+#define NV2A_USER_DMA_GET 0x800044u
 
 void sub_00386B30(void)
 {
@@ -113,7 +123,10 @@ void sub_00386B30(void)
         (const volatile uint32_t *)(mem + dev + D3D_DEV_WRITE_SEQ);
     const volatile uint32_t *sem = (const volatile uint32_t *)
         (mem + *(const uint32_t *)(mem + dev + D3D_DEV_SEMAPHORE_PTR));
+    const volatile uint32_t *get = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
+    uint32_t last_get = get ? *get : 0;
     ULONGLONG start = 0;
+    int kicked = 0;
 
     if (fence == *seq) {
         g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0;
@@ -121,12 +134,27 @@ void sub_00386B30(void)
         sub_00386840();
     }
     while (*seq - fence < *seq - *sem) {
+        if (get && *get != last_get) {
+            last_get = *get;
+            start = 0;
+        }
         if (!start) {
             start = GetTickCount64();
+        } else if (!kicked && GetTickCount64() - start >= 2) {
+            /* The release may still be in the part of the pushbuffer D3D has not
+             * kicked, in which case no amount of waiting brings it. This is D3D's
+             * own KickOff (sub_00386EA0) less its wait for the GPU to go idle. */
+            uint32_t flags = *(const uint32_t *)(mem + dev + D3D_DEV_FLAGS);
+            kicked = 1;
+            if (!(flags & D3D_DEV_SUSPENDED)) {
+                uint32_t put = *(const uint32_t *)(mem + dev + ((flags & D3D_DEV_ALT_PUT) ? 0x770u : 0u));
+                uint32_t regs = *(const uint32_t *)(mem + dev + D3D_DEV_REGISTERS);
+                *(volatile uint32_t *)(mem + regs + 0x40) = put & 0x0FFFFFFFu;
+            }
         } else if (GetTickCount64() - start >= D3D_FENCE_WAIT_MS) {
             static unsigned timeouts;
             if (timeouts++ < 8)
-                fprintf(stderr, "[D3D] fence 0x%X not reached in %u ms (semaphore 0x%X)\n",
+                fprintf(stderr, "[D3D] fence 0x%X: no GPU progress in %u ms (semaphore 0x%X)\n",
                         fence, D3D_FENCE_WAIT_MS, *sem);
             break;
         }

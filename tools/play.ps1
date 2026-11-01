@@ -1,0 +1,19 @@
+# Play the game in a window, on the GPU renderer. Run from anywhere:
+#
+#   powershell -File tools/play.ps1
+#
+# -Software uses the old CPU rasteriser instead. The log goes to play_log.txt in the repo root.
+param([switch]$Software)
+Set-Location (Split-Path -Parent $PSScriptRoot)
+$env:RECOMP_EXT_VMA = "1"
+$env:RECOMP_AC97_READY = "1"
+$env:RECOMP_PB_EXEC = "1"
+$env:RECOMP_VBLANK = "paced"
+$env:RECOMP_HEAP_RECLAIM = "1"
+$env:RECOMP_FB_WINDOW = "1"
+$env:RECOMP_USB = "1"
+$env:RECOMP_KEYBOARD = "1"
+$env:RECOMP_D3D_PRESENT = "1"
+$env:RECOMP_LOG = "play_log.txt"
+if ($Software) { $env:RECOMP_GPU = "sw" }
+Start-Process build\game\ucc2_recomp.exe
