@@ -51,6 +51,10 @@ Run from the repo root, because paths are relative. All four settings are requir
 
     $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; build\game\ucc2_recomp.exe 2> stderr.txt
 
+To play in a window, also set `RECOMP_FB_WINDOW=1`, `RECOMP_USB=1` and `RECOMP_KEYBOARD=1`. Keys work while the window
+has focus: Enter is Start, Z is A, X is B, C is X, V is Y, arrows are the D-pad, WASD is the left stick and IJKL is the
+right stick. A connected XInput controller should also work.
+
 The runtime keeps save data in `%LOCALAPPDATA%\xboxrecomp`.
 
 ## Target facts (this dump)
