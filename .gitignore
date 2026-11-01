@@ -29,3 +29,9 @@ build/
 __pycache__/
 *.pyc
 .vs/
+
+# Generated recompiled code (regenerate from your own XBE)
+src/recomp/gen/
+
+# Runtime logs
+xbox_kernel.log
