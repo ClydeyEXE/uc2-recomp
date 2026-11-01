@@ -164,6 +164,88 @@ void sub_00386B30(void)
 }
 
 /*
+ * D3D runs a recorded pushbuffer by jumping into it, and the recording ends in a
+ * jump whose target has to be this call's return address. So just before the jump
+ * it pushes NO_OPERATION with a non-zero value, which traps to its interrupt handler
+ * (sub_0038D600) while the GPU waits. Value is argument << 5 | code. Codes 12, 13 and
+ * 14 end in sub_003863F0, which writes the tail's jump and applies the recording's
+ * fixups. Unhandled, every tail kept the return from its first use, so each later
+ * use went back and replayed old commands: parts of old frames in new ones, and
+ * flips in the middle of frames. The executor calls this at the same point in the
+ * stream, so what it patches is what the walk reads next.
+ *
+ * Other codes are not needed: 1 is flip pacing, 5 wakes the event only the original
+ * fence wait slept on, and 6 to 9 have not been seen.
+ */
+#define D3D_FIXUPS_PENDING 0x00391430u   /* counter the handler decrements */
+#define D3D_FIXUP_TABLE    0x00391644u   /* code 13's records, 20 bytes each */
+
+static uint32_t guest_read(uint32_t va)
+{
+    return *(const volatile uint32_t *)((const char *)g_xbox_mem_offset + va);
+}
+
+static void guest_write(uint32_t va, uint32_t v)
+{
+    *(volatile uint32_t *)((char *)g_xbox_mem_offset + va) = v;
+}
+
+static void d3d_apply_fixups(uint32_t rec)
+{
+    do {
+        uint32_t head = guest_read(rec), next;
+
+        guest_write(guest_read(rec + 8), (head & 0x0FFFFFFFu) + 1);  /* jump to the return */
+        if (head & 0x20000000u) {
+            uint32_t base = guest_read(rec + 0x10), p = guest_read(rec + 0xC), size;
+
+            while ((size = guest_read(p)) != 0xFFFFFFFFu) {
+                memcpy((char *)g_xbox_mem_offset + guest_read(p + 4) + base,
+                       (const char *)g_xbox_mem_offset + p + 8, size);
+                p += 8 + size;
+            }
+        }
+        next = guest_read(rec + 4);
+        guest_write(rec + 4, 0xFFFFFFFFu);
+        if (head & 0x80000000u)
+            guest_write(rec, head & 0xBFFFFFFFu);
+        rec = next;
+    } while (rec + 1 > 1);                  /* neither 0 nor -1 */
+}
+
+static void d3d_software_method(uint32_t param)
+{
+    uint32_t arg = param >> 5;
+
+    switch (param & 0x1F) {
+    case 12:
+        guest_write(D3D_FIXUPS_PENDING, guest_read(D3D_FIXUPS_PENDING) - 1);
+        d3d_apply_fixups(arg | 0x80000000u);
+        break;
+    case 13:
+        guest_write(D3D_FIXUPS_PENDING, guest_read(D3D_FIXUPS_PENDING) - 1);
+        d3d_apply_fixups(arg * 20 + D3D_FIXUP_TABLE);
+        break;
+    case 14:
+        d3d_apply_fixups(arg | 0x80000000u);
+        break;
+    default: {
+        static unsigned seen[32];
+        if (!seen[param & 0x1F]++)
+            fprintf(stderr, "[D3D] software method code %u first seen (value 0x%08X)\n",
+                    param & 0x1F, param);
+        break;
+    }
+    }
+}
+
+void recomp_manual_gpu_init(void)
+{
+    extern void nv2a_pb_set_software_method(void (*handler)(uint32_t));
+    nv2a_pb_set_software_method(d3d_software_method);
+}
+
+/*
  * The game's wrapper for D3D's GetVisibilityTestResult(index, *result), replacing
  * the generated body. It reads a report the GPU writes, and the executor does not
  * write them, so a caller looping until the test completes never gets out. That

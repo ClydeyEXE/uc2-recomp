@@ -15,7 +15,7 @@ index 5c9056a..f6a7a14 100644
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..33d9fe7 100644
+index 327f01d..761ad83 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,8 @@
@@ -95,11 +95,31 @@ index 327f01d..33d9fe7 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
+@@ -117,4 +152,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+  * the semaphore context DMA object through RAMIN. */
+ void nv2a_pb_set_semaphore_target(uint32_t guest_va);
+ 
++/* A non-zero NO_OPERATION: on the console the GPU stops here and interrupts the CPU,
++ * whose D3D handler acts on the value. The handler is the title's to supply, as what
++ * the values mean depends on its XDK. Called from the walk, with the GPU "stopped". */
++void nv2a_pb_set_software_method(void (*handler)(uint32_t param));
++
+ #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..c46b987 100644
+index a513bc7..4ab22ca 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
-@@ -700,6 +700,7 @@ static void dump_surface_bmp(void)
+@@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
+ static uint32_t s_sem_va;
+ void nv2a_pb_set_semaphore_target(uint32_t guest_va) { s_sem_va = guest_va; }
+ 
++static void (*s_software_method)(uint32_t);
++void nv2a_pb_set_software_method(void (*handler)(uint32_t)) { s_software_method = handler; }
++
+ /* Unhandled methods, ranked. The interesting output is not that something was
+  * skipped but which things dominate, because that is the order to implement
+  * them in. */
+@@ -700,6 +703,7 @@ static void dump_surface_bmp(void)
      f = fopen(path, "wb");
      if (!f)
          return;
@@ -107,7 +127,7 @@ index a513bc7..c46b987 100644
  
      memset(hdr, 0, sizeof hdr);
      hdr[0] = 'B'; hdr[1] = 'M';
-@@ -794,6 +795,9 @@ static void current_surface(Nv2aSurface *out)
+@@ -794,6 +798,9 @@ static void current_surface(Nv2aSurface *out)
      out->bytes_per_pixel = surface_bpp();
      out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
      out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
@@ -117,7 +137,7 @@ index a513bc7..c46b987 100644
  }
  
  /* Render state in the NV2A's own values, gathered from what the executor
-@@ -827,6 +831,13 @@ static void current_render_state(Nv2aRenderState *r)
+@@ -827,6 +834,13 @@ static void current_render_state(Nv2aRenderState *r)
      r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
      r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
      r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
@@ -131,7 +151,7 @@ index a513bc7..c46b987 100644
  }
  
  static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
-@@ -844,7 +855,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
+@@ -844,7 +858,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
      s_gpu.texs[0].color  = tex->color;
      s_gpu.texs[0].addr_u = 3;
      s_gpu.texs[0].addr_v = 3;
@@ -140,7 +160,7 @@ index a513bc7..c46b987 100644
      s_gpu.texs[0].levels = 1;
      s_gpu.texs[0].filter = 0;
      s_gpu.texs[0].cube   = 0;
-@@ -903,6 +914,11 @@ static void clear_surface(uint32_t param)
+@@ -903,6 +917,11 @@ static void clear_surface(uint32_t param)
          s_backend->clear(&surf, &rs, param, s_gpu.clear_color,
                           s_gpu.zstencil_clear);
          s_gpu.clears++;
@@ -152,7 +172,7 @@ index a513bc7..c46b987 100644
          return;
      }
      if (!(param & NV097_CLEAR_COLOR_MASK))
-@@ -1135,6 +1151,9 @@ static uint32_t linear_twin(uint32_t fmt)
+@@ -1135,6 +1154,9 @@ static uint32_t linear_twin(uint32_t fmt)
      case 0x06: return 0x12;                /* A8R8G8B8  -> LIN_A8R8G8B8  */
      case 0x07: return 0x1E;                /* X8R8G8B8  -> LIN_X8R8G8B8  */
      case 0x19: return 0x1F;                /* A8        -> LIN_A8        */
@@ -162,7 +182,7 @@ index a513bc7..c46b987 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -1996,6 +2015,17 @@ static int s_xf_no_tex;
+@@ -1996,6 +2018,17 @@ static int s_xf_no_tex;
  #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
  static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
  static uint32_t   s_bcount;
@@ -180,7 +200,7 @@ index a513bc7..c46b987 100644
  
  static Nv2aVertex *backend_slot(void)
  {
-@@ -2037,10 +2067,47 @@ static void backend_flush(int textured)
+@@ -2037,10 +2070,47 @@ static void backend_flush(int textured)
          return;
      current_surface(&surf);
      current_render_state(&rs);
@@ -228,7 +248,7 @@ index a513bc7..c46b987 100644
      if (textured && s_gpu.texs[0].valid) {
          tex.offset = s_gpu.texs[0].offset;
          tex.width  = s_gpu.texs[0].width;
-@@ -2082,6 +2149,33 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2082,6 +2152,33 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              && fetch_texcoord(i1, uv[1])
              && fetch_texcoord(i2, uv[2]);
  
@@ -262,7 +282,7 @@ index a513bc7..c46b987 100644
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2679,6 +2773,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2679,6 +2776,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -289,7 +309,36 @@ index a513bc7..c46b987 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -3190,8 +3304,19 @@ static void frame_trace_flip(void)
+@@ -3040,8 +3157,14 @@ static void raster_batch_program(void)
+             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+         break;
+     case NV_PRIM_TRIANGLE_STRIP:
+-        for (i = 0; i + 2 < n; i++)
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++        /* Every other triangle of a strip runs the other way round; culling
++         * goes by the order the vertices arrive in. */
++        for (i = 0; i + 2 < n; i++) {
++            if (i & 1)
++                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
++            else
++                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++        }
+         break;
+     case NV_PRIM_TRIANGLE_FAN:
+     case NV_PRIM_POLYGON:
+@@ -3172,6 +3295,11 @@ static void raster_batch(void)
+  * blend and depth state, and how many pixels it actually wrote. "The frame
+  * is black" has many causes and this is what tells them apart. */
+ 
++int nv2a_pb_exec_tracing(void)
++{
++    return s_ftrace == 2;
++}
++
+ static void frame_trace_flip(void)
+ {
+     static const char *flag = (const char *)-1;
+@@ -3190,8 +3318,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -310,24 +359,30 @@ index a513bc7..c46b987 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3239,7 +3364,7 @@ static void draw_primitive(void)
+@@ -3239,7 +3378,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
 -                    " eq %X | z test %u func %X mask %u | tris %u px %llu\n",
-+                    " eq %X | z test %u func %X mask %u | cull %u %X %X sten %u | tris %u px %llu\n",
++                    " eq %X | z test %u func %X mask %u | cull %u %X %X sten %u | tris %u px %llu"
++                    " | fog %u mode %X p %g %g col %08X oFog %g | prog %u\n",
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,6 +3373,7 @@ static void draw_primitive(void)
+@@ -3248,8 +3388,11 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
 +                    s_reg[0x0308 / 4], s_reg[0x039C / 4], s_reg[0x03A0 / 4], s_reg[0x032C / 4],
                      s_gpu.tris_drawn - t0,
-                     (unsigned long long)(s_gpu.pixels - p0));
+-                    (unsigned long long)(s_gpu.pixels - p0));
++                    (unsigned long long)(s_gpu.pixels - p0),
++                    s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_param[0], s_gpu.fog_param[1],
++                    s_gpu.fog_color, s_xf ? s_xf[0].fog[0] : 0.0f, s_reg[0x1EA0 / 4]);
              if ((s_gpu.xf_mode & 3) == 2 && s_xf)
-@@ -3960,7 +4086,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+                 fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
+                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+@@ -3960,7 +4103,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -336,7 +391,19 @@ index a513bc7..c46b987 100644
              zbuf_clear();
          break;
  
-@@ -4102,6 +4228,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4171,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+     case NV097_NO_OPERATION:
+         /* Non-zero, it is one of D3D's software methods, which the GPU traps
+          * to D3D's interrupt handler on the console. Only the swap's interval
+-         * matters here (nv2a_flip_hold.h); the rest stays a no-op. */
++         * matters here (nv2a_flip_hold.h); the rest stays a no-op unless the
++         * project supplied a handler. */
++        if (param && s_software_method)
++            s_software_method(param);
+         if (!nv2a_pb_exec_flip_pacing()) {
+             if (!imm_vertex_method(method, param))
+                 note_unhandled(method, param);   /* as before the hold */
+@@ -4102,6 +4248,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -346,7 +413,7 @@ index a513bc7..c46b987 100644
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index e3a16e2..926b7cf 100644
+index e3a16e2..a7aec51 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
 @@ -466,12 +466,53 @@ int nv2a_pb_dma_walk(void)
@@ -403,12 +470,20 @@ index e3a16e2..926b7cf 100644
      while (va < end_va && words < 0x100000u) {
          uint32_t w = *(const uint32_t *)(mem + va);
          va += 4;
-@@ -481,8 +522,20 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -481,8 +522,28 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
 -            if (!in_call)
 +            if (!in_call) {
++                {
++                    extern int nv2a_pb_exec_tracing(void);
++                    if (nv2a_pb_exec_tracing()) {
++                        const uint32_t *ws = (const uint32_t *)(mem + va - 4);
++                        fprintf(stderr, "[FTRACE] walk jumpword at %08X: %08X %08X %08X %08X [%08X] %08X %08X\n",
++                                va - 4, ws[-4], ws[-3], ws[-2], ws[-1], ws[0], ws[1], ws[2]);
++                    }
++                }
 +                /* Outside RAM: this is data read as a command, so the walk has
 +                 * lost its place. Give up on the rest of the segment. */
 +                if ((target & 0x0FFFFFFFu) >= PB_RAM_BYTES) {
@@ -425,7 +500,7 @@ index e3a16e2..926b7cf 100644
              va = 0x80000000u | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
-@@ -495,6 +548,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -495,6 +556,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
          if ((w & 3u) == 2u) {                    /* CALL */
              if (!in_call) {
                  uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
@@ -438,7 +513,7 @@ index e3a16e2..926b7cf 100644
                  s_tot_calls++;
                  s_in_call = 1;
                  words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
-@@ -508,15 +567,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -508,15 +575,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
              uint32_t method =  w & 0x1FFCu;
              int noninc = (w & 0xE0000000u) == 0x40000000u;
  
@@ -455,7 +530,7 @@ index e3a16e2..926b7cf 100644
              continue;
          }
          (*unknown)++;
-@@ -524,6 +575,40 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -524,6 +583,50 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
      return words;
  }
  
@@ -481,8 +556,18 @@ index e3a16e2..926b7cf 100644
 +        /* Behind PUT, stop at PUT; ahead of it, the ring's jump is coming. */
 +        uint32_t bound = cur < end ? end : cur + 0x800000u;
 +
++        uint32_t before = words;
++
 +        s_seg_jump = 0;
 +        words += pb_walk_segment(cur, bound, 0, &jumps, &unknown);
++        {
++            extern int nv2a_pb_exec_tracing(void);
++            if (nv2a_pb_exec_tracing())
++                fprintf(stderr, "[FTRACE] walk %08X..%08X (PUT %08X, was %08X): %u words,"
++                                " jump to %08X, %u unknown, %u pending\n", cur, bound, end,
++                        0x80000000u | (last_put & 0x0FFFFFFFu), words - before, s_seg_jump,
++                        unknown, s_seg_left);
++        }
 +        if (!s_seg_jump)
 +            break;
 +        cur = s_seg_jump;

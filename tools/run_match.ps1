@@ -19,13 +19,16 @@ Set-Location $root
 
 # On the GPU renderer the menus keep up with presses a few seconds apart.
 $press = @("45000:start:500", "60000:down:300")
-for ($t = 70000; $t -le 170000; $t += 8000) { $press += "${t}:a:400" }
+for ($t = 70000; $t -le 260000; $t += 8000) { $press += "${t}:a:400" }
 
 $settings = @{
     RECOMP_EXT_VMA       = "1"
     RECOMP_AC97_READY    = "1"
     RECOMP_PB_EXEC       = "1"
     RECOMP_VBLANK        = "paced"
+    RECOMP_PB_WALK       = "dma"
+    RECOMP_GUEST_CPUS    = "2"
+    RECOMP_HEAP_RECLAIM  = "1"
     RECOMP_USB           = "1"
     RECOMP_WATCHDOG_SECS = "$Secs"
     RECOMP_PB_REPORT_MS  = "15000"

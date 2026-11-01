@@ -368,7 +368,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     /* Draw on the GPU instead of the software rasteriser. */
     {
         extern void gpu_d3d11_register(void);
+        extern void recomp_manual_gpu_init(void);
         gpu_d3d11_register();
+        recomp_manual_gpu_init();
     }
 
     /* Step 3: Initialize Xbox kernel */
