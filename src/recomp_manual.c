@@ -164,6 +164,18 @@ void sub_00386B30(void)
 }
 
 /*
+ * D3D's PFB flush before a kick, replacing the generated body. It sets a bit in
+ * 0x100410 and spins until the hardware clears it, which takes the hardware moments.
+ * Here the executor clears it, and it cannot while it runs a batch's vertex programs,
+ * so the game thread sat out most of each frame. Writes to guest memory are already
+ * visible to the executor, so there is nothing to flush.
+ */
+void sub_00386FA0(void)
+{
+    g_esp += 4; /* ret */
+}
+
+/*
  * D3D runs a recorded pushbuffer by jumping into it, and the recording ends in a
  * jump whose target has to be this call's return address. So just before the jump
  * it pushes NO_OPERATION with a non-zero value, which traps to its interrupt handler

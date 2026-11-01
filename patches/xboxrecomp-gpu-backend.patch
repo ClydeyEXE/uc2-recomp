@@ -106,7 +106,7 @@ index 327f01d..761ad83 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..4ab22ca 100644
+index a513bc7..53ae1c9 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
@@ -282,7 +282,35 @@ index a513bc7..4ab22ca 100644
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2679,6 +2776,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2498,8 +2595,13 @@ static struct {
+     const XfTri *tris;
+     int ntris;
+     XfCount cnt[NV_RASTER_MAX_THREADS];
++    /* Non-zero: this wake is a vertex transform job (xf_transform_batch). */
++    uint32_t xf_unique;
++    volatile LONG xf_failed;
+ } s_pool;
+ 
++static int xf_transform_share(uint32_t unique, int k, int n);
++
+ /* Worker k owns the rows y with y % n == k, for every triangle of the run,
+  * in submission order. Each pixel therefore sees its triangles in the order
+  * the title drew them, whichever thread draws it. */
+@@ -2518,6 +2620,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+     int k = (int)(intptr_t)arg;
+     for (;;) {
+         WaitForSingleObject(s_pool.start[k], INFINITE);
++        if (s_pool.xf_unique) {
++            if (!xf_transform_share(s_pool.xf_unique, k, s_pool.n))
++                InterlockedExchange(&s_pool.xf_failed, 1);
++            if (InterlockedDecrement(&s_pool.pending) == 0)
++                SetEvent(s_pool.done);
++            continue;
++        }
+         memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
+         xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
+         if (InterlockedDecrement(&s_pool.pending) == 0)
+@@ -2679,6 +2788,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -309,7 +337,117 @@ index a513bc7..4ab22ca 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -3040,8 +3157,14 @@ static void raster_batch_program(void)
+@@ -2927,15 +3056,106 @@ static void xf_set_viewport(void)
+     s_xf_o[2] = of[2];
+ }
+ 
++/* Transforming a batch: each distinct index once, and big batches across the raster
++ * pool. Strips repeat most of their vertices, and a vertex program is a pure function
++ * of the attributes and the constants, neither of which changes inside a batch. On
++ * the GPU back end this is what is left of the frame's work on this thread. */
++#define XF_PARALLEL_MIN 128
++#define XF_MAP_SLOTS    (NV_MAX_INDICES * 2)
++
++static Nv2aVshOutput *s_xf_unique;
++static uint32_t s_xf_unique_idx[NV_MAX_INDICES];
++static uint32_t s_xf_slot_of[NV_MAX_INDICES];       /* batch position -> unique slot */
++static uint32_t s_xf_map_key[XF_MAP_SLOTS], s_xf_map_val[XF_MAP_SLOTS], s_xf_map_gen[XF_MAP_SLOTS];
++static uint32_t s_xf_gen;
++
++static uint32_t xf_dedupe(uint32_t n)
++{
++    uint32_t i, unique = 0;
++
++    s_xf_gen++;
++    for (i = 0; i < n; i++) {
++        uint32_t index = s_gpu.idx[i];
++        uint32_t h = (index * 2654435761u) >> 15;          /* 17 bits: XF_MAP_SLOTS */
++
++        for (;;) {
++            if (s_xf_map_gen[h] != s_xf_gen) {
++                s_xf_map_gen[h] = s_xf_gen;
++                s_xf_map_key[h] = index;
++                s_xf_map_val[h] = unique;
++                s_xf_unique_idx[unique++] = index;
++                break;
++            }
++            if (s_xf_map_key[h] == index)
++                break;
++            h = (h + 1) & (XF_MAP_SLOTS - 1);
++        }
++        s_xf_slot_of[i] = s_xf_map_val[h];
++    }
++    return unique;
++}
++
++#if defined(_WIN32)
++/* Worker k's share of a transform job; 0 if a vertex had no program to run. */
++static int xf_transform_share(uint32_t unique, int k, int n)
++{
++    uint32_t i;
++    int ok = 1;
++
++    for (i = (uint32_t)k; i < unique; i += (uint32_t)n)
++        if (!transform_vertex(s_xf_unique_idx[i], &s_xf_unique[i]))
++            ok = 0;
++    return ok;
++}
++#endif
++
++static int xf_transform_batch(uint32_t n)
++{
++    uint32_t i, unique;
++
++    /* A program that writes constants (_CXT_WRITE_EN) depends on the order: as it was. */
++    if (s_reg[0x1E98 / 4]) {
++        for (i = 0; i < n; i++)
++            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
++                return 0;
++        return 1;
++    }
++    if (!s_xf_unique
++        && !(s_xf_unique = (Nv2aVshOutput *)malloc(NV_MAX_INDICES * sizeof *s_xf_unique)))
++        return 0;
++    unique = xf_dedupe(n);
++#if defined(_WIN32)
++    if (unique >= XF_PARALLEL_MIN && raster_pool_size() > 1) {
++        int k, pool = s_pool.n, ok;
++
++        s_pool.xf_unique = unique;
++        s_pool.xf_failed = 0;
++        s_pool.pending = pool - 1;
++        for (k = 0; k < pool - 1; k++)
++            SetEvent(s_pool.start[k]);
++        ok = xf_transform_share(unique, pool - 1, pool);
++        WaitForSingleObject(s_pool.done, INFINITE);
++        s_pool.xf_unique = 0;
++        if (!ok || s_pool.xf_failed)
++            return 0;
++    } else
++#endif
++    for (i = 0; i < unique; i++)
++        if (!transform_vertex(s_xf_unique_idx[i], &s_xf_unique[i]))
++            return 0;                                  /* no program loaded */
++    for (i = 0; i < n; i++)
++        s_xf[i] = s_xf_unique[s_xf_slot_of[i]];
++    return 1;
++}
++
+ static void raster_batch_program(void)
+ {
+     uint32_t i, n = s_gpu.idx_count;
+ 
+     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
+         return;
+-    for (i = 0; i < n; i++)
+-        if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
+-            return;                                    /* no program loaded */
++    if (!xf_transform_batch(n))
++        return;
+     xf_set_viewport();
+     {
+         const VertexAttr *tc = texcoord_attr();
+@@ -3040,8 +3260,14 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -326,7 +464,7 @@ index a513bc7..4ab22ca 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3172,6 +3295,11 @@ static void raster_batch(void)
+@@ -3172,6 +3398,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -338,7 +476,7 @@ index a513bc7..4ab22ca 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3190,8 +3318,19 @@ static void frame_trace_flip(void)
+@@ -3190,8 +3421,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -359,7 +497,7 @@ index a513bc7..4ab22ca 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3239,7 +3378,8 @@ static void draw_primitive(void)
+@@ -3239,7 +3481,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -369,7 +507,7 @@ index a513bc7..4ab22ca 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,8 +3388,11 @@ static void draw_primitive(void)
+@@ -3248,8 +3491,11 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -382,7 +520,7 @@ index a513bc7..4ab22ca 100644
              if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -3960,7 +4103,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3960,7 +4206,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -391,7 +529,7 @@ index a513bc7..4ab22ca 100644
              zbuf_clear();
          break;
  
-@@ -4028,7 +4171,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4274,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -403,7 +541,7 @@ index a513bc7..4ab22ca 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4102,6 +4248,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4102,6 +4351,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
