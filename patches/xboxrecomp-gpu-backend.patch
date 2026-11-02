@@ -133,6 +133,75 @@ index 5c9056a..f6a7a14 100644
          const uint8_t *p = (const uint8_t *)XBOX_TO_NATIVE(buffer_va);
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
+diff --git a/src/kernel/kernel_thread.c b/src/kernel/kernel_thread.c
+index 9afbbe3..fdc9f37 100644
+--- a/src/kernel/kernel_thread.c
++++ b/src/kernel/kernel_thread.c
+@@ -500,6 +500,54 @@ DWORD_PTR xbox_GuestCpuMask(void)
+     return proc & (DWORD_PTR)(-(intptr_t)proc);
+ }
+ 
++#if defined(_WIN32)
++/* The guest core to the guest threads. Pinning them says where they run, not
++ * that nothing else does: the GPU executor, its vertex workers and the device
++ * threads went wherever the scheduler put them, the guest core and its
++ * hyperthread sibling included, and in a UC2 match the guest core sat at 100%
++ * with the title's main thread the limit. The process's default CPU sets now
++ * leave out the whole physical core; the pinned threads' affinity masks still
++ * put them on it. RECOMP_GUEST_CORE_SHARED=1 leaves the core open, as before. */
++static void guest_core_reserve(int cpu)
++{
++    const char *e = getenv("RECOMP_GUEST_CORE_SHARED");
++    ULONG len = 0, n = 0, total = 0, ids[256];
++    BYTE core = 0;
++    int found = 0;
++    char *buf, *p;
++
++    if (e && *e && *e != '0')
++        return;
++    GetSystemCpuSetInformation(NULL, 0, &len, GetCurrentProcess(), 0);
++    if (!len || !(buf = (char *)malloc(len)))
++        return;
++    if (GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buf, len, &len, GetCurrentProcess(), 0)) {
++        for (p = buf; p < buf + len; p += ((PSYSTEM_CPU_SET_INFORMATION)p)->Size) {
++            PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)p;
++            if (s->Type == CpuSetInformation && s->CpuSet.Group == 0
++                && s->CpuSet.LogicalProcessorIndex == cpu) {
++                core = s->CpuSet.CoreIndex;
++                found = 1;
++            }
++        }
++        for (p = buf; found && p < buf + len; p += ((PSYSTEM_CPU_SET_INFORMATION)p)->Size) {
++            PSYSTEM_CPU_SET_INFORMATION s = (PSYSTEM_CPU_SET_INFORMATION)p;
++            if (s->Type != CpuSetInformation)
++                continue;
++            total++;
++            if (!(s->CpuSet.Group == 0 && s->CpuSet.CoreIndex == core) && n < 256)
++                ids[n++] = s->CpuSet.Id;
++        }
++    }
++    free(buf);
++    if (!found || !n || n == total)
++        return;
++    if (SetProcessDefaultCpuSets(GetCurrentProcess(), ids, n))
++        fprintf(stderr, "  [KERNEL] other threads kept off the guest core (cpu %d and its"
++                        " sibling): %lu of %lu logical cpus\n", cpu, n, total);
++}
++#endif
++
+ void xbox_GuestThreadPin(const char *role)
+ {
+     static int announced, failed;
+@@ -521,6 +569,9 @@ void xbox_GuestThreadPin(const char *role)
+     }
+     if (!announced) {
+         announced = 1;
++#if defined(_WIN32)
++        guest_core_reserve(core);
++#endif
+         fprintf(stderr, "  [KERNEL] guest threads on one host core (cpu %d),"
+                         " as on the console (RECOMP_GUEST_CPUS=%s)\n",
+                 core, getenv("RECOMP_GUEST_CPUS"));
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
 index 327f01d..c76e6c2 100644
 --- a/src/kernel/nv2a_backend.h
@@ -227,7 +296,7 @@ index 327f01d..c76e6c2 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..3d232b6 100644
+index a513bc7..adb5f75 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
@@ -405,12 +474,14 @@ index a513bc7..3d232b6 100644
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2498,8 +2597,13 @@ static struct {
+@@ -2498,8 +2597,15 @@ static struct {
      const XfTri *tris;
      int ntris;
      XfCount cnt[NV_RASTER_MAX_THREADS];
-+    /* Non-zero: this wake is a vertex transform job (xf_transform_batch). */
++    /* Non-zero: this wake is a vertex transform job (xf_transform_batch), split
++     * over xf_n threads. */
 +    uint32_t xf_unique;
++    int xf_n;
 +    volatile LONG xf_failed;
  } s_pool;
  
@@ -419,12 +490,12 @@ index a513bc7..3d232b6 100644
  /* Worker k owns the rows y with y % n == k, for every triangle of the run,
   * in submission order. Each pixel therefore sees its triangles in the order
   * the title drew them, whichever thread draws it. */
-@@ -2518,6 +2622,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2518,6 +2624,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      int k = (int)(intptr_t)arg;
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
 +        if (s_pool.xf_unique) {
-+            if (!xf_transform_share(s_pool.xf_unique, k, s_pool.n))
++            if (!xf_transform_share(s_pool.xf_unique, k, s_pool.xf_n))
 +                InterlockedExchange(&s_pool.xf_failed, 1);
 +            if (InterlockedDecrement(&s_pool.pending) == 0)
 +                SetEvent(s_pool.done);
@@ -433,7 +504,7 @@ index a513bc7..3d232b6 100644
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
          xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
          if (InterlockedDecrement(&s_pool.pending) == 0)
-@@ -2668,7 +2779,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2668,7 +2781,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
      T.a = a; T.b = b; T.c = c;
@@ -446,7 +517,7 @@ index a513bc7..3d232b6 100644
          return;
      if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
          s_gpu.tris_behind++;
-@@ -2679,6 +2794,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2679,6 +2796,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -473,7 +544,7 @@ index a513bc7..3d232b6 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -2927,15 +3062,106 @@ static void xf_set_viewport(void)
+@@ -2927,15 +3064,117 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -482,6 +553,10 @@ index a513bc7..3d232b6 100644
 + * of the attributes and the constants, neither of which changes inside a batch. On
 + * the GPU back end this is what is left of the frame's work on this thread. */
 +#define XF_PARALLEL_MIN 128
++/* Vertices per thread at the least. Waking every worker for any batch over the
++ * minimum gave each of 16 about 8 vertices: in a UC2 match the walker spent a
++ * fifth of its time in SetEvent and the wait for them, and the workers 3 cores. */
++#define XF_PER_THREAD 64
 +#define XF_MAP_SLOTS    (NV_MAX_INDICES * 2)
 +
 +static Nv2aVshOutput *s_xf_unique;
@@ -534,6 +609,8 @@ index a513bc7..3d232b6 100644
 +{
 +    uint32_t i, unique;
 +
++    /* Decoded here, before any worker runs it. */
++    nv2a_vsh_prepare();
 +    /* A program that writes constants (_CXT_WRITE_EN) depends on the order: as it was. */
 +    if (s_reg[0x1E98 / 4]) {
 +        for (i = 0; i < n; i++)
@@ -547,9 +624,14 @@ index a513bc7..3d232b6 100644
 +    unique = xf_dedupe(n);
 +#if defined(_WIN32)
 +    if (unique >= XF_PARALLEL_MIN && raster_pool_size() > 1) {
-+        int k, pool = s_pool.n, ok;
++        int k, pool = (int)(unique / XF_PER_THREAD), ok;
 +
++        if (pool > s_pool.n)
++            pool = s_pool.n;
++        if (pool < 2)
++            pool = 2;
 +        s_pool.xf_unique = unique;
++        s_pool.xf_n = pool;
 +        s_pool.xf_failed = 0;
 +        s_pool.pending = pool - 1;
 +        for (k = 0; k < pool - 1; k++)
@@ -583,7 +665,7 @@ index a513bc7..3d232b6 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3040,8 +3266,14 @@ static void raster_batch_program(void)
+@@ -3040,8 +3279,14 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -600,7 +682,7 @@ index a513bc7..3d232b6 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3172,6 +3404,11 @@ static void raster_batch(void)
+@@ -3172,6 +3417,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -612,7 +694,7 @@ index a513bc7..3d232b6 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3190,8 +3427,19 @@ static void frame_trace_flip(void)
+@@ -3190,8 +3440,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -633,7 +715,24 @@ index a513bc7..3d232b6 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3239,7 +3487,8 @@ static void draw_primitive(void)
+@@ -3204,6 +3465,16 @@ static void frame_trace_flip(void)
+     }
+ }
+ 
++/* RECOMP_PB_EXEC_VERBOSE, read once: getenv on every draw was 3% of the walker's
++ * time in a UC2 match. */
++static int pb_exec_verbose(void)
++{
++    static int on = -1;
++    if (on < 0)
++        on = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
++    return on;
++}
++
+ static void draw_primitive(void)
+ {
+     float v[4];
+@@ -3239,7 +3510,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -643,7 +742,7 @@ index a513bc7..3d232b6 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,8 +3497,11 @@ static void draw_primitive(void)
+@@ -3248,8 +3520,11 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -656,7 +755,16 @@ index a513bc7..3d232b6 100644
              if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -3960,7 +4212,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3284,7 +3559,7 @@ static void draw_primitive(void)
+         }
+     }
+ 
+-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
++    if (pb_exec_verbose()) {
+         static int shown;
+         if (shown++ < 6) {
+             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
+@@ -3960,7 +4235,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -665,7 +773,7 @@ index a513bc7..3d232b6 100644
              zbuf_clear();
          break;
  
-@@ -4028,7 +4280,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4303,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -677,7 +785,7 @@ index a513bc7..3d232b6 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4102,6 +4357,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4102,6 +4380,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -855,6 +963,389 @@ index e3a16e2..a7aec51 100644
  void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)
  {
      uint32_t words, jumps = 0, unknown = 0;
+diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
+index c1b48e4..b51e0b5 100644
+--- a/src/kernel/nv2a_vsh_interp.c
++++ b/src/kernel/nv2a_vsh_interp.c
+@@ -40,6 +40,8 @@ static uint32_t s_load_slot, s_load_word, s_start_slot;
+ static uint32_t s_const_load, s_const_word;
+ static uint32_t s_cxt_write;
+ static int      s_const_trace = -1;      /* RECOMP_VSH_DUMP: constant traffic */
++/* Bumped by anything that changes the program run: its words or start slot. */
++static uint32_t s_prog_gen = 1;
+ 
+ static int vsh_dump_enabled(void)
+ {
+@@ -65,13 +67,19 @@ void nv2a_vsh_program_word(uint32_t word)
+ {
+     if (s_load_slot < NV2A_VSH_SLOTS)
+         s_program[s_load_slot][s_load_word] = word;
++    s_prog_gen++;
+     if (++s_load_word == 4) {
+         s_load_word = 0;
+         s_load_slot++;
+     }
+ }
+ 
+-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
++void nv2a_vsh_set_start_slot(uint32_t slot)
++{
++    if (slot != s_start_slot)
++        s_prog_gen++;
++    s_start_slot = slot;
++}
+ void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+ 
+ void nv2a_vsh_set_constant_load(uint32_t index)
+@@ -116,6 +124,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
+ {
+     if (slot < NV2A_VSH_SLOTS)
+         memcpy(s_program[slot], words, sizeof s_program[slot]);
++    s_prog_gen++;
+ }
+ 
+ /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */
+@@ -329,15 +338,12 @@ static vec4 run_ilu(uint32_t op, vec4 c)
+     return r;
+ }
+ 
+-int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++/* RECOMP_VSH_DUMP: disassemble each distinct program the first time it runs. */
++static void vsh_dump_new(void)
+ {
+     static int dump = -1;
+     static uint32_t dumped[16];
+     static int ndumped;
+-    vec4 temp[12], opos;
+-    float outregs[13][4];
+-    int a0 = 0;
+-    uint32_t s;
+ 
+     if (dump < 0)
+         dump = getenv("RECOMP_VSH_DUMP") != NULL;
+@@ -358,16 +364,53 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+             dump_program(s_start_slot);
+         }
+     }
++}
++
++/* The output registers, as the vertex leaves the program. */
++static void vsh_finish(const vec4 *opos, float outregs[13][4], Nv2aVshOutput *out)
++{
++    int k;
++
++    memcpy(out->pos, opos->v, sizeof out->pos);
++    /* The NV2A clamps the colour outputs to 0..1 before they are
++     * interpolated, as the fixed-function path already does here.
++     * Lighting programs push them well above 1 (SSX 3's riders), and
++     * unclamped every lit model came out washed out. */
++    for (k = 0; k < 4; k++) {
++        float c0 = outregs[3][k], c1 = outregs[4][k];
++        out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
++        out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
++    }
++    memcpy(out->fog, outregs[5], sizeof out->fog);
++    memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
++    memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
++    memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
++    memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++}
+ 
+-    memset(temp, 0, sizeof temp);
+-    memset(&opos, 0, sizeof opos);
+-    memset(outregs, 0, sizeof outregs);
++static void vsh_init_regs(vec4 *temp, vec4 *opos, float outregs[13][4])
++{
++    memset(temp, 0, 12 * sizeof *temp);
++    memset(opos, 0, sizeof *opos);
++    memset(outregs, 0, 13 * sizeof outregs[0]);
+     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
+     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
+      * a projective stage divides by q, and q = 0 would put every texel of an
+      * unwritten stage at infinity. */
+     outregs[9][3] = outregs[10][3] = outregs[11][3] = outregs[12][3] = 1.0f;
++}
+ 
++/* The plain interpreter: every field taken from the instruction words as it
++ * runs. It defines what a program does; nv2a_vsh_run runs the decoded form
++ * and is checked against this (RECOMP_VSH_CHECK). */
++static int vsh_run_reference(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    vec4 temp[12], opos;
++    float outregs[13][4];
++    int a0 = 0;
++    uint32_t s;
++
++    vsh_init_regs(temp, &opos, outregs);
+     for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+         const uint32_t *ins = s_program[s];
+         uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
+@@ -410,23 +453,235 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
+             }
+         }
+         if (field(ins, 3, 0, 1)) {
+-            memcpy(out->pos, opos.v, sizeof out->pos);
+-            /* The NV2A clamps the colour outputs to 0..1 before they are
+-             * interpolated, as the fixed-function path already does here.
+-             * Lighting programs push them well above 1 (SSX 3's riders), and
+-             * unclamped every lit model came out washed out. */
+-            for (int k = 0; k < 4; k++) {
+-                float c0 = outregs[3][k], c1 = outregs[4][k];
+-                out->d0[k] = c0 > 1.0f ? 1.0f : (c0 >= 0.0f ? c0 : 0.0f);
+-                out->d1[k] = c1 > 1.0f ? 1.0f : (c1 >= 0.0f ? c1 : 0.0f);
+-            }
+-            memcpy(out->fog, outregs[5], sizeof out->fog);
+-            memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
+-            memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);
+-            memcpy(out->tex[2], outregs[11], sizeof out->tex[2]);
+-            memcpy(out->tex[3], outregs[12], sizeof out->tex[3]);
++            vsh_finish(&opos, outregs, out);
+             return 1;
+         }
+     }
+     return 0;
+ }
++
++/* ---- decoded execution ---------------------------------------------------- */
++/* The interpreter above takes each instruction apart again for every vertex and
++ * reads all three sources whether the op uses them or not. In a UC2 match that
++ * was the largest single cost on the pushbuffer thread. A program is now
++ * decoded once each time it changes (s_prog_gen) into the form below, and only
++ * the sources an op reads are fetched; reading one has no side effect, so
++ * leaving it out changes nothing. RECOMP_VSH_CHECK=1 runs the reference
++ * interpreter beside it on every vertex and reports any output that differs
++ * by a bit. */
++enum { SRC_TEMP, SRC_OPOS, SRC_IN, SRC_CONST };
++enum { OUT_NONE, OUT_CONST, OUT_OPOS, OUT_REG };
++#define VSH_NO_TEMP 0xFFu
++
++typedef struct {
++    uint8_t kind, reg, rel, neg;   /* reg: temp, input or constant index */
++    uint8_t sw[4];                 /* component read into x, y, z, w */
++} VshSrc;
++
++typedef struct {
++    VshSrc  src[3];
++    uint8_t need;                  /* bit k: source k is read */
++    uint8_t mac, ilu, mac_mask, ilu_mask;
++    uint8_t mac_dst, ilu_dst;      /* temp index, 12 for oPos, VSH_NO_TEMP */
++    uint8_t out, out_ilu, omask, oaddr;
++} VshOp;
++
++static VshOp    s_dec[NV2A_VSH_SLOTS];
++static int      s_dec_n;           /* ops through the FINAL one; 0: none */
++static uint32_t s_dec_gen;
++
++static void decode_src(VshSrc *d, const uint32_t *ins, int which)
++{
++    uint32_t neg, swz, mux, reg;
++
++    if (which == 0) {
++        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
++        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
++    } else if (which == 1) {
++        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
++        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
++    } else {
++        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
++        mux = field(ins, 3, 28, 2);
++        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
++    }
++    memset(d, 0, sizeof *d);
++    if (mux == 1) {
++        d->kind = reg == 12 ? SRC_OPOS : SRC_TEMP;
++        d->reg = (uint8_t)(reg < 12 ? reg : 0);
++    } else if (mux == 2) {
++        d->kind = SRC_IN;
++        d->reg = (uint8_t)field(ins, 1, 9, 4);
++    } else {
++        d->kind = SRC_CONST;
++        d->reg = (uint8_t)field(ins, 1, 13, 8);
++        d->rel = (uint8_t)field(ins, 3, 1, 1);
++    }
++    d->neg = (uint8_t)neg;
++    d->sw[0] = (uint8_t)((swz >> 6) & 3);
++    d->sw[1] = (uint8_t)((swz >> 4) & 3);
++    d->sw[2] = (uint8_t)((swz >> 2) & 3);
++    d->sw[3] = (uint8_t)(swz & 3);
++}
++
++static uint8_t temp_dst(uint32_t t)
++{
++    return (uint8_t)(t <= 12 ? t : VSH_NO_TEMP);
++}
++
++static void vsh_decode(void)
++{
++    uint32_t s;
++
++    s_dec_n = 0;
++    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
++        const uint32_t *ins = s_program[s];
++        VshOp *op = &s_dec[s - s_start_slot];
++        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
++        uint32_t tdst = field(ins, 3, 20, 4), oaddr = field(ins, 3, 3, 8);
++        int k;
++
++        memset(op, 0, sizeof *op);
++        for (k = 0; k < 3; k++)
++            decode_src(&op->src[k], ins, k);
++        op->mac = (uint8_t)mac;
++        op->ilu = (uint8_t)ilu;
++        op->mac_mask = (uint8_t)field(ins, 3, 24, 4);
++        op->ilu_mask = (uint8_t)field(ins, 3, 16, 4);
++        /* Every MAC op reads A; these also B; add and mad C, as does the ILU. */
++        if (mac)
++            op->need |= 1;
++        if (mac == 2 || (mac >= 4 && mac <= 12))
++            op->need |= 2;
++        if (mac == 3 || mac == 4 || ilu)
++            op->need |= 4;
++        op->mac_dst = mac && mac != 13 && op->mac_mask ? temp_dst(tdst) : VSH_NO_TEMP;
++        /* Beside a MAC op the ILU writes R1 (see vsh_run_reference). */
++        op->ilu_dst = ilu && op->ilu_mask ? temp_dst(mac ? 1u : tdst) : VSH_NO_TEMP;
++        op->omask = (uint8_t)field(ins, 3, 12, 4);
++        op->out_ilu = (uint8_t)field(ins, 3, 2, 1);
++        op->oaddr = (uint8_t)oaddr;
++        if (!op->omask)
++            op->out = OUT_NONE;
++        else if (!field(ins, 3, 11, 1))
++            op->out = oaddr < NV2A_VSH_CONSTANTS ? OUT_CONST : OUT_NONE;
++        else if (oaddr == 0)
++            op->out = OUT_OPOS;
++        else
++            op->out = oaddr < 13 ? OUT_REG : OUT_NONE;
++        if (field(ins, 3, 0, 1)) {
++            s_dec_n = (int)(s - s_start_slot) + 1;
++            break;
++        }
++    }
++}
++
++void nv2a_vsh_prepare(void)
++{
++    if (s_dec_gen != s_prog_gen) {
++        vsh_decode();
++        vsh_dump_new();
++        s_dec_gen = s_prog_gen;
++    }
++}
++
++static vec4 fetch(const VshSrc *d, const float in[NV2A_VSH_INPUTS][4],
++                  const vec4 *temp, const vec4 *opos, int a0)
++{
++    const float *s;
++    vec4 r;
++
++    switch (d->kind) {
++    case SRC_TEMP: s = temp[d->reg].v; break;
++    case SRC_OPOS: s = opos->v; break;
++    case SRC_IN:   s = in[d->reg]; break;
++    default: {
++        int ci = (int)d->reg + (d->rel ? a0 : 0);
++        if (ci < 0 || ci >= NV2A_VSH_CONSTANTS)
++            ci = 0;
++        s = s_const[ci];
++        break;
++    }
++    }
++    r.v[0] = s[d->sw[0]];
++    r.v[1] = s[d->sw[1]];
++    r.v[2] = s[d->sw[2]];
++    r.v[3] = s[d->sw[3]];
++    if (d->neg) {
++        r.v[0] = -r.v[0]; r.v[1] = -r.v[1];
++        r.v[2] = -r.v[2]; r.v[3] = -r.v[3];
++    }
++    return r;
++}
++
++static int vsh_run_decoded(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    static const vec4 zero = {{0, 0, 0, 0}};
++    vec4 temp[12], opos;
++    float outregs[13][4];
++    int a0 = 0, i;
++
++    vsh_init_regs(temp, &opos, outregs);
++    for (i = 0; i < s_dec_n; i++) {
++        const VshOp *op = &s_dec[i];
++        vec4 a = zero, b = zero, c = zero, mres = zero, ires = zero;
++
++        if (op->need & 1) a = fetch(&op->src[0], in, temp, &opos, a0);
++        if (op->need & 2) b = fetch(&op->src[1], in, temp, &opos, a0);
++        if (op->need & 4) c = fetch(&op->src[2], in, temp, &opos, a0);
++        if (op->mac)
++            mres = run_mac(op->mac, a, b, c, &a0);
++        if (op->ilu)
++            ires = run_ilu(op->ilu, c);
++        if (op->mac_dst != VSH_NO_TEMP)
++            write_masked(op->mac_dst == 12 ? opos.v : temp[op->mac_dst].v, &mres, op->mac_mask);
++        if (op->ilu_dst != VSH_NO_TEMP)
++            write_masked(op->ilu_dst == 12 ? opos.v : temp[op->ilu_dst].v, &ires, op->ilu_mask);
++        switch (op->out) {
++        case OUT_CONST:
++            if (s_cxt_write)
++                write_masked(s_const[op->oaddr], op->out_ilu ? &ires : &mres, op->omask);
++            break;
++        case OUT_OPOS:
++            write_masked(opos.v, op->out_ilu ? &ires : &mres, op->omask);
++            break;
++        case OUT_REG:
++            write_masked(outregs[op->oaddr], op->out_ilu ? &ires : &mres, op->omask);
++            break;
++        default:
++            break;
++        }
++    }
++    vsh_finish(&opos, outregs, out);
++    return 1;
++}
++
++int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
++{
++    static int check = -1;
++    static unsigned long checked, differ;
++
++    nv2a_vsh_prepare();
++    /* No FINAL flag: the reference runs to the end of program memory as the
++     * hardware would, and reports that there was nothing to transform. */
++    if (!s_dec_n)
++        return vsh_run_reference(in, out);
++    if (check < 0)
++        check = getenv("RECOMP_VSH_CHECK") != NULL;
++    if (!vsh_run_decoded(in, out))
++        return 0;
++    /* A program that writes constants would write them twice. */
++    if (check && !s_cxt_write) {
++        Nv2aVshOutput ref;
++        vsh_run_reference(in, &ref);
++        checked++;
++        if (memcmp(&ref, out, sizeof ref) && differ++ < 8)
++            fprintf(stderr, "[VSH] check: vertex differs from the reference (program at slot %u,"
++                            " pos %g %g %g %g against %g %g %g %g)\n", s_start_slot,
++                    out->pos[0], out->pos[1], out->pos[2], out->pos[3],
++                    ref.pos[0], ref.pos[1], ref.pos[2], ref.pos[3]);
++        if ((checked & 0xFFFFF) == 0)
++            fprintf(stderr, "[VSH] check: %lu vertices, %lu differ\n", checked, differ);
++    }
++    return 1;
++}
+diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
+index 8acb0af..a3aa633 100644
+--- a/src/kernel/nv2a_vsh_interp.h
++++ b/src/kernel/nv2a_vsh_interp.h
+@@ -49,6 +49,10 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+  * FINAL flag within program memory), which the caller treats as "cannot
+  * transform this batch" rather than drawing garbage. */
+ int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
++/* Decode the program if it changed since the last run. nv2a_vsh_run does this
++ * itself; a caller about to run it on several threads at once calls it first,
++ * so they never race to decode. */
++void nv2a_vsh_prepare(void);
+ 
+ /* Direct access, for the self-test. */
+ void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
 index b723a92..7d1fcaa 100644
 --- a/src/kernel/xbox_memory_layout.c

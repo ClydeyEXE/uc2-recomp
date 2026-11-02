@@ -22,6 +22,7 @@
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <intrin.h>
+#include <dbghelp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -268,7 +269,8 @@ static struct {
  * the walker thread (the one that calls present) spent them: D3D11 draw and clear
  * calls, d3d11_present (the blit and Present, or the readback), and its other CPU time (method decode,
  * vertex programs). What is left is the walker waiting for the game. A frame over
- * 100 ms gets a [HITCH] line of its own. */
+ * 100 ms gets a [HITCH] line of its own, naming where the walker was: a thread
+ * samples its instruction pointer every few ms once a frame passes 50 ms. */
 #define FT_MAX 8192
 
 static struct {
@@ -288,6 +290,74 @@ static LONGLONG ft_qpc(void)
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     return q.QuadPart;
+}
+
+/* The hitch sampler: where the walker is while a frame runs long. Averages
+ * cannot show what one 150 ms frame in a minute was doing; this can. */
+#define HS_MAX 160
+
+static HANDLE        s_walker;
+static DWORD64       s_hs_rip[HS_MAX];
+static volatile LONG s_hs_n;
+
+static DWORD WINAPI hitch_sampler(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        CONTEXT c;
+        Sleep(3);
+        if ((double)(ft_qpc() - s_ft.last) / s_ft.qms < 50.0 || s_hs_n >= HS_MAX)
+            continue;
+        if (SuspendThread(s_walker) == (DWORD)-1)
+            continue;
+        memset(&c, 0, sizeof c);
+        c.ContextFlags = CONTEXT_CONTROL;
+        if (GetThreadContext(s_walker, &c) && s_hs_n < HS_MAX)
+            s_hs_rip[s_hs_n++] = c.Rip;
+        ResumeThread(s_walker);
+    }
+    return 0;
+}
+
+/* The sampled functions of the frame just ended, most often first, appended
+ * to its [HITCH] line. dbghelp is initialised in main.c. */
+static void hitch_where(void)
+{
+    char names[HS_MAX][48];
+    int count[HS_MAX], kinds = 0, n = s_hs_n, i, k, shown;
+
+    for (i = 0; i < n; i++) {
+        char buf[sizeof(SYMBOL_INFO) + 64];
+        SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+        DWORD64 disp = 0;
+        char name[48];
+
+        memset(buf, 0, sizeof buf);
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 63;
+        if (SymFromAddr(GetCurrentProcess(), s_hs_rip[i], &disp, sym))
+            _snprintf(name, sizeof name, "%s", sym->Name);
+        else
+            _snprintf(name, sizeof name, "0x%llX", (unsigned long long)s_hs_rip[i]);
+        name[sizeof name - 1] = 0;
+        for (k = 0; k < kinds && strcmp(names[k], name); k++)
+            ;
+        if (k == kinds) {
+            memcpy(names[kinds], name, sizeof name);
+            count[kinds++] = 0;
+        }
+        count[k]++;
+    }
+    fprintf(stderr, "[HITCH]   where (%d samples from 50 ms):", n);
+    for (shown = 0; shown < 8 && shown < kinds; shown++) {
+        int best = 0;
+        for (k = 1; k < kinds; k++)
+            if (count[k] > count[best])
+                best = k;
+        fprintf(stderr, " %s %d", names[best], count[best]);
+        count[best] = -1;
+    }
+    fprintf(stderr, "\n");
 }
 
 static int ft_cmp(const void *a, const void *b)
@@ -311,6 +381,10 @@ static void ft_frame(void)
         s_ft.q0 = s_ft.last = s_ft.report = now;
         s_ft.tsc0 = __rdtsc();
         s_ft.cycles = cyc;
+        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &s_walker,
+                            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                            FALSE, 0))
+            CloseHandle(CreateThread(NULL, 0, hitch_sampler, NULL, 0, NULL));
         return;
     }
     if (!s_ft.tsc_ms && now - s_ft.q0 > (LONGLONG)(s_ft.qms * 1000.0))
@@ -318,9 +392,11 @@ static void ft_frame(void)
     dt = (double)(now - s_ft.last) / s_ft.qms;
     if (s_ft.tsc_ms)
         cpu = (double)(cyc - s_ft.cycles) / s_ft.tsc_ms;
-    if (dt > 100.0)
+    if (dt > 100.0) {
         fprintf(stderr, "[HITCH] %.0f ms frame at %.1f s: walker cpu %.0f ms (d3d11 %.0f, present %.0f)\n",
                 dt, (double)(now - s_ft.q0) / s_ft.qms / 1000.0, cpu, s_ft.d3d, s_ft.present);
+        hitch_where();
+    }
     if (s_ft.n < FT_MAX)
         s_ft.ms[s_ft.n++] = (float)dt;
     s_ft.over25 += dt > 25.0;
@@ -332,6 +408,7 @@ static void ft_frame(void)
     s_ft.d3d = s_ft.present = 0.0;
     s_ft.last = now;
     s_ft.cycles = cyc;
+    InterlockedExchange(&s_hs_n, 0);
 
     if (now - s_ft.report > (LONGLONG)(s_ft.qms * 10000.0) && s_ft.n) {
         uint32_t n = s_ft.n;
