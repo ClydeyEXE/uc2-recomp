@@ -70,7 +70,10 @@ static const char s_hlsl[] =
 "  float2 uv = c.xy / q * ts[st].xy, dx = ddx(uv), dy = ddy(uv);\n"
 "  float3 dxd = ddx(c.xyz), dyd = ddy(c.xyz);\n"
 "  if (mode == 0) return float4(0, 0, 0, 1);\n"
-"  if (mode == 1 || mode == 2) return tx.SampleGrad(s, uv, dx, dy);\n"
+"  if (mode == 1 || mode == 2) {\n"
+"    float4 v = tx.SampleGrad(s, uv, dx, dy);\n"
+"    return ts[st].z != 0 ? float4(v.bbb, 1) : v;\n"   /* an 8-bit target: see d3d11_draw */
+"  }\n"
 "  if (mode == 3) {\n"
 "    if (cube[st]) return cx.SampleGrad(s, c.xyz, dxd, dyd);\n"
 "    return tx.SampleGrad(s, c.xy * ts[st].xy, ddx(c.xy * ts[st].xy), ddy(c.xy * ts[st].xy));\n"
@@ -1005,6 +1008,7 @@ static void unpack(uint32_t c, float o[4])
  * rebind, and a texture stage knows when it would sample what it is drawing to. */
 static Target *s_cur_target;
 static Zeta   *s_cur_zeta;
+static int     s_drawlog;
 
 static void bind_targets(Target *t, Zeta *z)
 {
@@ -1138,6 +1142,9 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
         }
         c.ts[st][0] = sx;
         c.ts[st][1] = sy;
+        /* An 8-bit surface keeps its one channel in blue here, as B8 is written from
+         * blue on the console, and is read back as luminance. */
+        c.ts[st][2] = (used && sh->stage_valid[st] && tx->color == 0x13 && target_at(tx->offset)) ? 1.0f : 0.0f;
         if (!samps[st])
             samps[st] = s_nsamplers ? s_samplers[0].s : NULL;
     }
@@ -1206,6 +1213,80 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     ID3D11DeviceContext_Draw(s_ctx, b->count, first);
+    if (s_drawlog) {
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        const Nv2aVshOutput *o = b->outputs;
+        uint32_t k;
+        for (k = 0; k < b->count; k++) {
+            if (o[k].pos[0] < x0) x0 = o[k].pos[0];
+            if (o[k].pos[0] > x1) x1 = o[k].pos[0];
+            if (o[k].pos[1] < y0) y0 = o[k].pos[1];
+            if (o[k].pos[1] > y1) y1 = o[k].pos[1];
+        }
+        fprintf(stderr, "[DRAW] rt %08X %ux%u fmt %08X n %u box %.0f,%.0f..%.0f,%.0f prog %08X blend %u %X %X eq %X col %08X mask %08X "
+                        "at %u/%X/%u z %u/%X/%u st %u rc %u ctl %X f0 %08X f1 %08X d0 %.2f,%.2f,%.2f,%.2f t0 %.3f,%.3f,%.3f,%.3f\n",
+                s->color_va, t->w, t->h, s->format, b->count, x0, y0, x1, y1, sh->rc.stage_program,
+                r->blend_enable, r->blend_src, r->blend_dst, r->blend_eq, r->blend_color, r->color_mask,
+                r->alpha_test_enable, r->alpha_func, r->alpha_ref,
+                r->depth_test_enable, r->depth_func, r->depth_write, r->stencil_enable,
+                sh->rc_seen, sh->rc.control, sh->rc.final0, sh->rc.final1,
+                o[0].d0[0], o[0].d0[1], o[0].d0[2], o[0].d0[3],
+                o[0].tex[0][0], o[0].tex[0][1], o[0].tex[0][2], o[0].tex[0][3]);
+        for (st = 0; st < 4; st++) {
+            const Nv2aTexture *tx = &sh->stage[st];
+            if (sh->stage_valid[st] && ((sh->rc.stage_program >> (st * 5)) & 0x1F))
+                fprintf(stderr, "[DRAW]   st%d %08X %ux%u color %02X addr %u/%u border %d/%08X %s\n", st, tx->offset, tx->width,
+                        tx->height, tx->color, tx->addr_u, tx->addr_v, tx->border_color, tx->border,
+                        target_at(tx->offset) ? "TARGET" : "");
+        }
+        if (r->blend_src == 0x306) {
+            for (st = 0; st < 2; st++) {
+                float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f, q0 = 1e9f, q1 = -1e9f;
+                for (k = 0; k < b->count; k++) {
+                    float q = o[k].tex[st][3] != 0 ? o[k].tex[st][3] : 1;
+                    float u = o[k].tex[st][0] / q, v = o[k].tex[st][1] / q;
+                    if (u < u0) u0 = u;
+                    if (u > u1) u1 = u;
+                    if (v < v0) v0 = v;
+                    if (v > v1) v1 = v;
+                    if (o[k].tex[st][3] < q0) q0 = o[k].tex[st][3];
+                    if (o[k].tex[st][3] > q1) q1 = o[k].tex[st][3];
+                }
+                fprintf(stderr, "[DRAW]   uv%d %.3f,%.3f..%.3f,%.3f q %.3f..%.3f first %.3f,%.3f,%.3f,%.3f\n", st, u0, v0, u1, v1, q0, q1,
+                        o[0].tex[st][0], o[0].tex[st][1], o[0].tex[st][2], o[0].tex[st][3]);
+                if (sh->stage_valid[st] && !target_at(sh->stage[st].offset)) {
+                    const Nv2aTexture *tx = &sh->stage[st];
+                    uint32_t n = tx->width * tx->height, *px = malloc(n * 4);
+                    if (px && nv2a_backend_decode_texture(tx, px)) {
+                        uint64_t sum[4] = {0, 0, 0, 0};
+                        uint32_t j;
+                        char name[260];
+                        FILE *f;
+                        for (j = 0; j < n; j++) {
+                            sum[0] += px[j] >> 24; sum[1] += (px[j] >> 16) & 0xFF;
+                            sum[2] += (px[j] >> 8) & 0xFF; sum[3] += px[j] & 0xFF;
+                        }
+                        fprintf(stderr, "[DRAW]   tex%d %08X mean a %u r %u g %u b %u corner %08X centre %08X\n", st, tx->offset,
+                                (uint32_t)(sum[0] / n), (uint32_t)(sum[1] / n), (uint32_t)(sum[2] / n), (uint32_t)(sum[3] / n),
+                                px[0], px[tx->height / 2 * tx->width + tx->width / 2]);
+                        snprintf(name, sizeof name, "%s.%08X.ppm", getenv("RECOMP_GPU_DRAWLOG"), tx->offset);
+                        if ((f = fopen(name, "wb")) != NULL) {
+                            fprintf(f, "P6\n%u %u\n255\n", tx->width, tx->height);
+                            for (j = 0; j < n; j++) {
+                                uint8_t rgb[3] = {(uint8_t)(px[j] >> 16), (uint8_t)(px[j] >> 8), (uint8_t)px[j]};
+                                fwrite(rgb, 1, 3, f);
+                            }
+                            fclose(f);
+                        }
+                    }
+                    free(px);
+                }
+            }
+        }
+        for (i = 0; i < (int)(sh->rc.control & 0xFF) && i < 8; i++)
+            fprintf(stderr, "[DRAW]   rc%d %08X %08X %08X %08X k %08X %08X\n", i, sh->rc.color_icw[i], sh->rc.color_ocw[i],
+                    sh->rc.alpha_icw[i], sh->rc.alpha_ocw[i], sh->rc.factor0[i], sh->rc.factor1[i]);
+    }
     s_stats.draws++;
     s_stats.tris += b->count / 3;
 }
@@ -1222,6 +1303,10 @@ static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t
     uint8_t sval = (uint8_t)(zstencil & 0xFF);
     float col[4];
 
+    if (s_drawlog)
+        fprintf(stderr, "[DRAW] clear %08X fmt %08X clip %u,%u %ux%u flags %02X argb %08X rectset %d %08X %08X\n",
+                s->color_va, s->format, s->clip_x, s->clip_y, s->width, s->height, flags, argb,
+                r->clear_rect_set, r->clear_rect_h, r->clear_rect_v);
     if (!device_up())
         return;
     t = target_for(s);
@@ -1305,6 +1390,20 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
 
     s_flip++;
     s_stats.presents++;
+    /* RECOMP_GPU_DRAWLOG=<flag file>: log every draw and clear of the frame that
+     * follows, once per second, while the file exists. */
+    {
+        static const char *flag;
+        static DWORD last;
+        if (!flag) { flag = getenv("RECOMP_GPU_DRAWLOG"); if (!flag) flag = ""; }
+        s_drawlog = 0;
+        if (*flag && GetTickCount() - last > 1000
+            && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
+            last = GetTickCount();
+            s_drawlog = 1;
+            fprintf(stderr, "[DRAW] frame after flip %u, shown %08X\n", s_flip, va);
+        }
+    }
     if (getenv("RECOMP_GPU_STATS") && GetTickCount() - s_stats.last > 5000) {
         s_stats.last = GetTickCount();
         fprintf(stderr, "[D3D11] %u presents, %u draws, %u tris, %u clears, %u uploads (%llu KB, %llu KB held), "

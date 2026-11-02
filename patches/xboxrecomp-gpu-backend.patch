@@ -225,7 +225,7 @@ index 327f01d..761ad83 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..53ae1c9 100644
+index a513bc7..541bcf3 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
@@ -429,7 +429,20 @@ index a513bc7..53ae1c9 100644
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
          xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
          if (InterlockedDecrement(&s_pool.pending) == 0)
-@@ -2679,6 +2788,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2668,7 +2777,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+     v[0] = va; v[1] = vb; v[2] = vc;
+     a = va->pos; b = vb->pos; c = vc->pos;
+     T.a = a; T.b = b; T.c = c;
+-    if (T.bpp != 4 && T.bpp != 2)
++    /* The CPU rasteriser writes 16- and 32-bit pixels only. A back end takes any
++     * surface: UC2 draws its projected shadows into 8-bit (B8) surfaces, and with
++     * those draws dropped its shadow textures stayed black, which the modulate
++     * pass that projects them turned into dark boxes on the floor. */
++    if (T.bpp != 4 && T.bpp != 2 && !(T.bpp == 1 && backend_draws() && s_backend->wants_outputs))
+         return;
+     if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
+         s_gpu.tris_behind++;
+@@ -2679,6 +2792,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -456,7 +469,7 @@ index a513bc7..53ae1c9 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -2927,15 +3056,106 @@ static void xf_set_viewport(void)
+@@ -2927,15 +3060,106 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -566,7 +579,7 @@ index a513bc7..53ae1c9 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3040,8 +3260,14 @@ static void raster_batch_program(void)
+@@ -3040,8 +3264,14 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -583,7 +596,7 @@ index a513bc7..53ae1c9 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3172,6 +3398,11 @@ static void raster_batch(void)
+@@ -3172,6 +3402,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -595,7 +608,7 @@ index a513bc7..53ae1c9 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3190,8 +3421,19 @@ static void frame_trace_flip(void)
+@@ -3190,8 +3425,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -616,7 +629,7 @@ index a513bc7..53ae1c9 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3239,7 +3481,8 @@ static void draw_primitive(void)
+@@ -3239,7 +3485,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -626,7 +639,7 @@ index a513bc7..53ae1c9 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,8 +3491,11 @@ static void draw_primitive(void)
+@@ -3248,8 +3495,11 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -639,7 +652,7 @@ index a513bc7..53ae1c9 100644
              if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -3960,7 +4206,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3960,7 +4210,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -648,7 +661,7 @@ index a513bc7..53ae1c9 100644
              zbuf_clear();
          break;
  
-@@ -4028,7 +4274,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4278,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -660,7 +673,7 @@ index a513bc7..53ae1c9 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4102,6 +4351,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4102,6 +4355,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;

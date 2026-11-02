@@ -3,8 +3,13 @@
 #   powershell -File tools/play.ps1
 #
 # -Software uses the old CPU rasteriser instead. The log goes to play_log.txt in the repo root.
-param([switch]$Software)
+param([switch]$Software, [switch]$DrawLog)
 Set-Location (Split-Path -Parent $PSScriptRoot)
+# -DrawLog logs every draw of one frame a second to the log, for finding out what drew something.
+if ($DrawLog) {
+    $env:RECOMP_GPU_DRAWLOG = "build\drawlog.flag"
+    New-Item -ItemType File -Force $env:RECOMP_GPU_DRAWLOG | Out-Null
+}
 $env:RECOMP_EXT_VMA = "1"
 $env:RECOMP_AC97_READY = "1"
 $env:RECOMP_PB_EXEC = "1"

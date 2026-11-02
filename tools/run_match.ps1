@@ -18,7 +18,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # On the GPU renderer the menus keep up with presses a few seconds apart.
-$press = @("45000:start:500", "60000:down:300")
+$press = @("45000:start:500", "60000:down:100")
 for ($t = 70000; $t -le 260000; $t += 8000) { $press += "${t}:a:400" }
 
 $settings = @{

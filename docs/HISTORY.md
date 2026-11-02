@@ -68,3 +68,8 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     frames for up to 50 ms, as in xemu. In a 400 s capture, runs of zero with sound on both sides went from 17,020 to 3,
     click candidates from 3,993 to 2, and resets to 0. Match frame rate rose from the 40s to about 60 at the same point.
     The GP and EP memories are plain RAM (only `0xFE800000..0xFE830000` traps), so `mcpx_apu_mmio_*` never sees them.
+15. **Black boxes.** UC2 draws its projected shadows into 256x256 B8 surfaces (format `0x119`, pitch 256), then multiplies
+    the scene by them with blend `DST_COLOR, SRC_COLOR` and a combiner that lerps from 0.5 grey to the texture. The
+    vertex-program path dropped triangles for 1 byte a pixel, so the map stayed all zero and the projector darkened its
+    whole frustum. Those triangles now reach the back end, and `gpu_d3d11.c` reads a target sampled as format `0x13` from
+    blue, as luminance. `tools/play.ps1 -DrawLog` found this: it logs one frame's draws each second.
