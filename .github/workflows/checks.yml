@@ -1,0 +1,50 @@
+# The checks that can run without the game. The game itself cannot be built here: that needs C generated from a
+# player's own disc.
+name: checks
+on:
+  push:
+  pull_request:
+permissions: { contents: read }
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: true }
+
+      # .gitignore keeps these out locally, but not from `git add -f` or a pull request.
+      - name: No game data or generated code
+        run: |
+          bad=$(git ls-files | grep -iE '^(assets|generated|src/recomp/gen|build)/|\.(iso|xiso|xbe|xpr|xwb|xmv|xsb|xvs|xap|u|ukx|uix|utx|usx|lin|spa|int|deu|fra|ita|ttf|bin|bmp)$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad" | sed 's|.*|::error file=&::game data or generated code must not be committed|'
+            exit 1
+          fi
+
+      # Every player's setup applies these to the pinned toolkit commit; a developer's tree already has them in.
+      - name: Patches apply to the pinned toolkit
+        working-directory: third_party/xboxrecomp
+        run: |
+          for p in decode-stream extvma-buffers gpu-backend; do
+            git apply "../../patches/xboxrecomp-$p.patch"
+            echo "applied $p"
+          done
+
+      - name: PowerShell scripts parse
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem tools -Filter *.ps1) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$errors) | Out-Null
+            foreach ($e in $errors) {
+              Write-Host "::error file=tools/$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              $bad = 1
+            }
+          }
+          exit $bad
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Python tools compile
+        run: python -m compileall -q tools
