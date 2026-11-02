@@ -4,8 +4,17 @@ Static recompilation of the original Xbox `default.xbe` into C that builds and r
 Windows, using the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit
 (submodule at `third_party/xboxrecomp`, pinned).
 
-No game data or game-derived code belongs in this repo. Supply your own dump. `assets/` and
-`src/recomp/gen/` are gitignored. `assets/default_analysis.json` holds keys from the XBE certificate.
+> [!IMPORTANT]
+> This is an unofficial fan project. It is not affiliated with, endorsed by or sponsored by Epic Games, Midway or
+> Microsoft. Unreal Championship 2 and Unreal are trademarks of Epic Games, and Xbox is a trademark of Microsoft.
+>
+> This repository contains no game data and no code from the game. To use it you need your own copy of the game,
+> dumped from a disc you own. The build turns that dump into an executable on your machine. The executable it makes
+> contains the game's code, so do not share it, and do not ask for game files, dumps or builds in Issues.
+
+No game data or game-derived code belongs in this repo. `assets/` and `src/recomp/gen/` are gitignored.
+`assets/default_analysis.json` holds keys from the XBE certificate. The supported dump is listed under "Target facts"
+below; check yours against its SHA-1.
 
 ## Status
 Full Instant Action matches play from start to finish with a controller or keyboard, on a Direct3D 11 renderer.
@@ -98,3 +107,12 @@ The runtime keeps save data in `%LOCALAPPDATA%\xboxrecomp`.
 - Game code: `.text`, VA 0x11000, 2.8 MB
 - XDK code in its own sections: XMV, D3DX, DSOUND, XNET, XONLINE, WMADEC, XACTENG, XGRPH, D3D, XPP
 - 156 kernel imports: 133 stdcall, 5 fastcall, 18 data exports
+
+## Credits and license
+Built on [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nz, which does the lifting and supplies the
+runtime. xboxrecomp is MIT licensed, and includes parts of [xemu](https://github.com/xemu-project/xemu) under
+LGPL-2.1-or-later (see its `NOTICE`).
+
+The code in this repository is under the MIT license in `LICENSE`. The patches in `patches/` modify xboxrecomp and
+fall under its licenses: the hunks for its `src/apu/` files change xemu code and are LGPL-2.1-or-later, and the rest
+are MIT.
