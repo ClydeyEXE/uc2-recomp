@@ -21,6 +21,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
+#include <xinput.h>
 #include <intrin.h>
 #include <dbghelp.h>
 #include <stdint.h>
@@ -279,8 +280,8 @@ static struct {
     uint64_t tsc0;
     LONGLONG q0, last, report;
     ULONG64  cycles;                 /* the walker's cycle count at the last present */
-    double   d3d, present;          /* this frame, ms */
-    double   sum, d3d_sum, pr_sum, cpu_sum;
+    double   d3d, present, limit;   /* this frame, ms; limit is the frame limit's wait, in present */
+    double   sum, d3d_sum, pr_sum, cpu_sum, lim_sum;
     uint32_t n, over25, over50;
     float    ms[FT_MAX];
 } s_ft;
@@ -292,72 +293,157 @@ static LONGLONG ft_qpc(void)
     return q.QuadPart;
 }
 
-/* The hitch sampler: where the walker is while a frame runs long. Averages
- * cannot show what one 150 ms frame in a minute was doing; this can. */
+/* The hitch sampler: where the walker and the title's main thread are while a
+ * frame runs long. Averages cannot show what one 150 ms frame in a minute was
+ * doing; this can. The main thread's stack is unwound a few frames, as its leaf
+ * is often a helper (a copy, a kernel call) and the caller says what for. */
 #define HS_MAX 160
+#define GS_DEPTH 10
+
+extern void *xbox_guest_main_thread;           /* kernel_thread.c */
 
 static HANDLE        s_walker;
 static DWORD64       s_hs_rip[HS_MAX];
 static volatile LONG s_hs_n;
+static DWORD64       s_gs_pc[HS_MAX][GS_DEPTH];
+static int           s_gs_depth[HS_MAX];
+static volatile LONG s_gs_n;
+
+/* The suspended thread's return addresses, innermost first. */
+static int unwind(CONTEXT *c, DWORD64 *pc, int max)
+{
+    int n = 0;
+    __try {
+        while (n < max && c->Rip) {
+            DWORD64 base = 0, frame = 0;
+            PVOID data = NULL;
+            PRUNTIME_FUNCTION fe;
+            pc[n++] = c->Rip;
+            fe = RtlLookupFunctionEntry(c->Rip, &base, NULL);
+            if (fe) {
+                RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c->Rip, fe, c, &data, &frame, NULL);
+            } else {
+                c->Rip = *(DWORD64 *)c->Rsp;        /* a leaf: the return address is on top */
+                c->Rsp += 8;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    return n;
+}
 
 static DWORD WINAPI hitch_sampler(LPVOID unused)
 {
     (void)unused;
     for (;;) {
         CONTEXT c;
+        HANDLE game = (HANDLE)xbox_guest_main_thread;
         Sleep(3);
-        if ((double)(ft_qpc() - s_ft.last) / s_ft.qms < 50.0 || s_hs_n >= HS_MAX)
+        if ((double)(ft_qpc() - s_ft.last) / s_ft.qms < 50.0)
             continue;
-        if (SuspendThread(s_walker) == (DWORD)-1)
-            continue;
-        memset(&c, 0, sizeof c);
-        c.ContextFlags = CONTEXT_CONTROL;
-        if (GetThreadContext(s_walker, &c) && s_hs_n < HS_MAX)
-            s_hs_rip[s_hs_n++] = c.Rip;
-        ResumeThread(s_walker);
+        if (s_hs_n < HS_MAX && SuspendThread(s_walker) != (DWORD)-1) {
+            memset(&c, 0, sizeof c);
+            c.ContextFlags = CONTEXT_CONTROL;
+            if (GetThreadContext(s_walker, &c) && s_hs_n < HS_MAX)
+                s_hs_rip[s_hs_n++] = c.Rip;
+            ResumeThread(s_walker);
+        }
+        if (game && s_gs_n < HS_MAX && SuspendThread(game) != (DWORD)-1) {
+            memset(&c, 0, sizeof c);
+            c.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(game, &c) && s_gs_n < HS_MAX) {
+                LONG i = s_gs_n;
+                s_gs_depth[i] = unwind(&c, s_gs_pc[i], GS_DEPTH);
+                s_gs_n = i + 1;
+            }
+            ResumeThread(game);
+        }
     }
     return 0;
 }
 
-/* The sampled functions of the frame just ended, most often first, appended
- * to its [HITCH] line. dbghelp is initialised in main.c. */
-static void hitch_where(void)
+static void sym_name(DWORD64 pc, char *name, size_t size)
 {
-    char names[HS_MAX][48];
-    int count[HS_MAX], kinds = 0, n = s_hs_n, i, k, shown;
+    char buf[sizeof(SYMBOL_INFO) + 64];
+    SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+    DWORD64 disp = 0;
 
-    for (i = 0; i < n; i++) {
-        char buf[sizeof(SYMBOL_INFO) + 64];
-        SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
-        DWORD64 disp = 0;
-        char name[48];
+    memset(buf, 0, sizeof buf);
+    sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+    sym->MaxNameLen = 63;
+    if (SymFromAddr(GetCurrentProcess(), pc, &disp, sym))
+        _snprintf(name, size, "%s", sym->Name);
+    else
+        _snprintf(name, size, "0x%llX", (unsigned long long)pc);
+    name[size - 1] = 0;
+}
 
-        memset(buf, 0, sizeof buf);
-        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
-        sym->MaxNameLen = 63;
-        if (SymFromAddr(GetCurrentProcess(), s_hs_rip[i], &disp, sym))
-            _snprintf(name, sizeof name, "%s", sym->Name);
-        else
-            _snprintf(name, sizeof name, "0x%llX", (unsigned long long)s_hs_rip[i]);
-        name[sizeof name - 1] = 0;
-        for (k = 0; k < kinds && strcmp(names[k], name); k++)
-            ;
-        if (k == kinds) {
-            memcpy(names[kinds], name, sizeof name);
-            count[kinds++] = 0;
-        }
-        count[k]++;
+/* Count names, then print the most common: a tally kept across calls until
+ * tally_print. A name counted again for the same sample (same tag) is skipped,
+ * so a stack's counts are inclusive. */
+#define TALLY_MAX (HS_MAX * GS_DEPTH)
+static struct { char name[48]; int count, tag; } s_tally[TALLY_MAX];
+static int s_tally_n;
+
+static void tally(DWORD64 pc, int tag)
+{
+    char name[48];
+    int k;
+    sym_name(pc, name, sizeof name);
+    for (k = 0; k < s_tally_n && strcmp(s_tally[k].name, name); k++)
+        ;
+    if (k == s_tally_n) {
+        if (s_tally_n == TALLY_MAX)
+            return;
+        memcpy(s_tally[k].name, name, sizeof name);
+        s_tally[k].count = 0;
+        s_tally[k].tag = -1;
+        s_tally_n++;
     }
-    fprintf(stderr, "[HITCH]   where (%d samples from 50 ms):", n);
-    for (shown = 0; shown < 8 && shown < kinds; shown++) {
-        int best = 0;
-        for (k = 1; k < kinds; k++)
-            if (count[k] > count[best])
+    if (s_tally[k].tag != tag) {
+        s_tally[k].count++;
+        s_tally[k].tag = tag;
+    }
+}
+
+static void tally_print(const char *what, int n, int max)
+{
+    int shown;
+    fprintf(stderr, "[HITCH]   %s (%d samples from 50 ms):", what, n);
+    for (shown = 0; shown < max && shown < s_tally_n; shown++) {
+        int best = 0, k;
+        for (k = 1; k < s_tally_n; k++)
+            if (s_tally[k].count > s_tally[best].count)
                 best = k;
-        fprintf(stderr, " %s %d", names[best], count[best]);
-        count[best] = -1;
+        if (s_tally[best].count <= 0)
+            break;
+        fprintf(stderr, " %s %d", s_tally[best].name, s_tally[best].count);
+        s_tally[best].count = -1;
     }
     fprintf(stderr, "\n");
+    s_tally_n = 0;
+}
+
+/* The sampled functions of the frame just ended, most often first, appended
+ * to its [HITCH] line: the walker's, the main thread's innermost, and every
+ * function on the main thread's sampled stacks. dbghelp is initialised in main.c. */
+static void hitch_where(void)
+{
+    int n = s_hs_n, g = s_gs_n, i, d;
+
+    for (i = 0; i < n; i++)
+        tally(s_hs_rip[i], i);
+    tally_print("walker", n, 8);
+    if (!g)
+        return;
+    for (i = 0; i < g; i++)
+        if (s_gs_depth[i])
+            tally(s_gs_pc[i][0], i);
+    tally_print("game thread", g, 8);
+    for (i = 0; i < g; i++)
+        for (d = 0; d < s_gs_depth[i]; d++)
+            tally(s_gs_pc[i][d], i);
+    tally_print("game thread, inclusive", g, 14);
 }
 
 static int ft_cmp(const void *a, const void *b)
@@ -403,24 +489,26 @@ static void ft_frame(void)
     s_ft.over50 += dt > 50.0;
     s_ft.sum += dt;
     s_ft.d3d_sum += s_ft.d3d;
-    s_ft.pr_sum += s_ft.present;
+    s_ft.pr_sum += s_ft.present - s_ft.limit;
+    s_ft.lim_sum += s_ft.limit;
     s_ft.cpu_sum += cpu;
-    s_ft.d3d = s_ft.present = 0.0;
+    s_ft.d3d = s_ft.present = s_ft.limit = 0.0;
     s_ft.last = now;
     s_ft.cycles = cyc;
     InterlockedExchange(&s_hs_n, 0);
+    InterlockedExchange(&s_gs_n, 0);
 
     if (now - s_ft.report > (LONGLONG)(s_ft.qms * 10000.0) && s_ft.n) {
         uint32_t n = s_ft.n;
         double busy = s_ft.cpu_sum - s_ft.d3d_sum - s_ft.pr_sum;
         qsort(s_ft.ms, n, sizeof s_ft.ms[0], ft_cmp);
         fprintf(stderr, "[FRAMES] %u in %.1f s (%.1f fps): ms p50 %.1f p90 %.1f p99 %.1f max %.1f, >25 ms %u, >50 ms %u"
-                        " | per frame: d3d11 %.2f, present %.2f, other walker cpu %.2f, walker idle %.2f\n",
+                        " | per frame: d3d11 %.2f, present %.2f, other walker cpu %.2f, walker idle %.2f (limit %.2f)\n",
                 n, s_ft.sum / 1000.0, n * 1000.0 / s_ft.sum, s_ft.ms[n / 2], s_ft.ms[n * 9 / 10],
                 s_ft.ms[n * 99 / 100], s_ft.ms[n - 1], s_ft.over25, s_ft.over50,
-                s_ft.d3d_sum / n, s_ft.pr_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n);
+                s_ft.d3d_sum / n, s_ft.pr_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n, s_ft.lim_sum / n);
         s_ft.n = s_ft.over25 = s_ft.over50 = 0;
-        s_ft.sum = s_ft.d3d_sum = s_ft.pr_sum = s_ft.cpu_sum = 0.0;
+        s_ft.sum = s_ft.d3d_sum = s_ft.pr_sum = s_ft.cpu_sum = s_ft.lim_sum = 0.0;
         s_ft.report = now;
     }
 }
@@ -429,8 +517,12 @@ static void ft_frame(void)
 
 #define MAX_TARGETS 48
 
+/* w and h are the surface's size in guest pixels, which the vertex positions,
+ * clip rectangles and texture coordinates are in. The texture is sc times that
+ * each way (the internal resolution scale, s_scale), and only the viewport,
+ * scissor and depth bias need to know. */
 typedef struct {
-    uint32_t va, w, h, bpp, last_flip;
+    uint32_t va, w, h, bpp, last_flip, sc;
     ID3D11Texture2D *tex, *copy;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv, *copy_srv;
@@ -446,6 +538,11 @@ static Target s_targets[MAX_TARGETS];
 static Zeta   s_zetas[MAX_TARGETS];
 static ID3D11Texture2D *s_staging;
 static uint32_t s_staging_w, s_staging_h;
+static uint32_t s_scale = 1;            /* internal resolution: see the settings panel */
+/* The last target and depth buffer bound, so a draw into the same pair does not
+ * rebind, and a texture stage knows when it would sample what it is drawing to. */
+static Target  *s_cur_target;
+static Zeta    *s_cur_zeta;
 
 static void target_release(Target *t)
 {
@@ -480,16 +577,17 @@ static Target *target_for(const Nv2aSurface *s)
     int kept = 0;
 
     surface_size(s, &w, &h);
-    if (!w || !h || w > 8192 || h > 8192)
+    if (!w || !h || w * s_scale > 8192 || h * s_scale > 8192)
         return NULL;
     for (i = 0; i < MAX_TARGETS; i++) {
         if (s_targets[i].va == s->color_va) {
             t = &s_targets[i];
-            if (t->w == w && t->h >= h)
+            if (t->w == w && t->h >= h && t->sc == s_scale)
                 return t;
             /* Grown: a title narrows the clip for some draws, so the first one
-             * seen may have been small. What was drawn is kept. */
-            kept = t->h < h && t->w == w;
+             * seen may have been small. What was drawn is kept. A new scale
+             * starts afresh. */
+            kept = t->h < h && t->w == w && t->sc == s_scale;
             break;
         }
         if (s_targets[i].last_flip < s_targets[oldest].last_flip || !s_targets[i].va)
@@ -497,7 +595,7 @@ static Target *target_for(const Nv2aSurface *s)
                 oldest = i;
     }
     ZeroMemory(&td, sizeof td);
-    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Width = w * s_scale; td.Height = h * s_scale; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -509,19 +607,20 @@ static Target *target_for(const Nv2aSurface *s)
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex))
             || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)tex, NULL, &rtv))
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &srv))) {
-            fprintf(stderr, "[D3D11] cannot create a %ux%u target\n", w, h);
+            fprintf(stderr, "[D3D11] cannot create a %ux%u target\n", w * s_scale, h * s_scale);
             return NULL;
         }
         if (kept && t) {
-            D3D11_BOX box = {0, 0, 0, t->w, t->h, 1};
+            D3D11_BOX box = {0, 0, 0, t->w * t->sc, t->h * t->sc, 1};
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
                                                       (ID3D11Resource *)t->tex, 0, &box);
         }
         if (!t)
             t = &s_targets[oldest];
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        s_cur_target = NULL;            /* unbound: the next draw binds again */
         target_release(t);
-        t->va = s->color_va; t->w = w; t->h = h; t->bpp = s->bytes_per_pixel;
+        t->va = s->color_va; t->w = w; t->h = h; t->bpp = s->bytes_per_pixel; t->sc = s_scale;
         t->tex = tex; t->rtv = rtv; t->srv = srv;
     }
     return t;
@@ -541,7 +640,12 @@ static Zeta *zeta_for(uint32_t va, uint32_t w, uint32_t h)
                 oldest = i;
     }
     z = &s_zetas[oldest];
-    if (z->dsv) ID3D11DepthStencilView_Release(z->dsv);
+    if (z->dsv) {
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        s_cur_target = NULL;
+        s_cur_zeta = NULL;
+        ID3D11DepthStencilView_Release(z->dsv);
+    }
     if (z->tex) ID3D11Texture2D_Release(z->tex);
     memset(z, 0, sizeof *z);
     ZeroMemory(&td, sizeof td);
@@ -1101,6 +1205,8 @@ static ID3D11ShaderResourceView *make_white(int cube)
     return srv;
 }
 
+static void settings_load(void);
+
 static int device_up(void)
 {
     static const D3D11_INPUT_ELEMENT_DESC el[] = {
@@ -1122,6 +1228,7 @@ static int device_up(void)
         return 0;
     if (s_dev)
         return 1;
+    settings_load();
     hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
                            getenv("RECOMP_GPU_DEBUG") ? D3D11_CREATE_DEVICE_DEBUG : 0,
                            NULL, 0, D3D11_SDK_VERSION, &s_dev, NULL, &s_ctx);
@@ -1186,10 +1293,6 @@ static void unpack(uint32_t c, float o[4])
     o[3] = (float)(c >> 24) / 255.0f;
 }
 
-/* The last target and depth buffer bound, so a draw into the same pair does not
- * rebind, and a texture stage knows when it would sample what it is drawing to. */
-static Target *s_cur_target;
-static Zeta   *s_cur_zeta;
 static int     s_drawlog, s_skip;
 
 static void bind_targets(Target *t, Zeta *z)
@@ -1205,7 +1308,7 @@ static void bind_targets(Target *t, Zeta *z)
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, z ? z->dsv : NULL);
     vp.TopLeftX = 0; vp.TopLeftY = 0;
-    vp.Width = (float)t->w; vp.Height = (float)t->h;
+    vp.Width = (float)(t->w * t->sc); vp.Height = (float)(t->h * t->sc);
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     s_cur_target = t;
@@ -1265,7 +1368,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     /* Depth or stencil in use at all: a title that never tests them may still
      * name a zeta surface from an earlier pass. */
     if (r->zeta_va && (r->depth_test_enable || r->depth_write || r->stencil_enable)) {
-        z = zeta_for(r->zeta_va, t->w, t->h);
+        z = zeta_for(r->zeta_va, t->w * t->sc, t->h * t->sc);
         if (z)
             z->last_flip = s_flip;
     }
@@ -1387,11 +1490,12 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, z ? depth_for(r) : NULL,
                                                r->stencil_ref & 0xFF);
-    ID3D11DeviceContext_RSSetState(s_ctx, raster_for(r->poly_offset_fill ? r->poly_offset_scale : 0.0f));
-    sc.left = (LONG)s->clip_x;
-    sc.top = (LONG)s->clip_y;
-    sc.right = (LONG)(s->clip_x + s->width);
-    sc.bottom = (LONG)(s->clip_y + s->height);
+    /* The slope term is per pixel, and a pixel here is 1/sc of a guest one. */
+    ID3D11DeviceContext_RSSetState(s_ctx, raster_for(r->poly_offset_fill ? r->poly_offset_scale * (float)t->sc : 0.0f));
+    sc.left = (LONG)(s->clip_x * t->sc);
+    sc.top = (LONG)(s->clip_y * t->sc);
+    sc.right = (LONG)((s->clip_x + s->width) * t->sc);
+    sc.bottom = (LONG)((s->clip_y + s->height) * t->sc);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
 
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
@@ -1519,7 +1623,7 @@ static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, ui
         return;
     t->last_flip = s_flip;
     if (r->zeta_va && (depth || stencil)) {
-        z = zeta_for(r->zeta_va, t->w, t->h);
+        z = zeta_for(r->zeta_va, t->w * t->sc, t->h * t->sc);
         if (z)
             z->last_flip = s_flip;
     }
@@ -1575,7 +1679,8 @@ static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, ui
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_for(&cr), none, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, z ? depth_for(&cr) : NULL, sval);
         ID3D11DeviceContext_RSSetState(s_ctx, raster_for(0.0f));
-        sc.left = (LONG)x0; sc.top = (LONG)y0; sc.right = (LONG)x1; sc.bottom = (LONG)y1;
+        sc.left = (LONG)(x0 * t->sc); sc.top = (LONG)(y0 * t->sc);
+        sc.right = (LONG)(x1 * t->sc); sc.bottom = (LONG)(y1 * t->sc);
         ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
         ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_clear, NULL, 0);
         ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_clear, NULL, 0);
@@ -1599,8 +1704,8 @@ static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t
  * (5-8 ms of a 22 ms frame in a match), then copied twice more and uploaded again
  * by the window's own presenter. Guest memory now gets the frame only for frame
  * dumps (RECOMP_FB_DUMP). RECOMP_D3D_READBACK=1 keeps the old way to the screen.
- * Letterboxed to 4:3 at any window size; RECOMP_PRESENT_FILTER=point for sharp
- * pixels, RECOMP_PRESENT_VSYNC=1 to wait for the display. */
+ * Letterboxed to 4:3 at any window size. The filter, vsync, frame limit and
+ * internal resolution are the settings panel's (F1), below. */
 extern void *xbox_FramebufferWindowClaim(void);
 
 static const char s_blit_hlsl[] =
@@ -1616,8 +1721,94 @@ static ID3D11RenderTargetView *s_back;
 static ID3D11VertexShader     *s_vs_blit;
 static ID3D11PixelShader      *s_ps_blit;
 static ID3D11SamplerState     *s_blit_samp;
-static UINT                    s_bw, s_bh, s_vsync;
+static UINT                    s_bw, s_bh;
 static int                     s_failed_present;
+
+/* ---- Settings ------------------------------------------------------------------ */
+/* What the owner can change while playing, in the panel F1 opens (or Back+Start on
+ * the pad). They are kept in %LOCALAPPDATA%\xboxrecomp\ucc2_video.ini, and these
+ * override the file for one run: RECOMP_RES_SCALE=1..4, RECOMP_FPS_LIMIT=<fps>
+ * (0 off), RECOMP_PRESENT_VSYNC=0/1, RECOMP_PRESENT_FILTER=point/linear. */
+static const int s_limits[] = {0, 30, 60, 120, 144, 240};
+#define NLIMITS ((int)(sizeof s_limits / sizeof s_limits[0]))
+
+static struct {
+    int scale;                  /* internal resolution, times the guest's */
+    int limit;                  /* frame limit in fps, 0 for none */
+    int vsync;
+    int point;                  /* sharp pixels when scaling to the window */
+    int counter;                /* frame rate in the corner */
+    int boot;                   /* skip the boot screens' fixed waits, from the next start
+                                   ([game] skip_boot_waits, read by recomp_manual.c) */
+} s_cfg = {1, 0, 0, 0, 0, 0};
+
+static char s_ini[MAX_PATH];
+
+static int env_int(const char *name, int *out)
+{
+    const char *e = getenv(name);
+    if (!e || !*e)
+        return 0;
+    *out = atoi(e);
+    return 1;
+}
+
+static void settings_load(void)
+{
+    const char *base = getenv("LOCALAPPDATA"), *f;
+    if (base) {
+        char dir[MAX_PATH];
+        _snprintf(dir, sizeof dir, "%s\\xboxrecomp", base);
+        dir[sizeof dir - 1] = 0;
+        CreateDirectoryA(dir, NULL);
+        _snprintf(s_ini, sizeof s_ini, "%s\\ucc2_video.ini", dir);
+        s_ini[sizeof s_ini - 1] = 0;
+        s_cfg.scale = (int)GetPrivateProfileIntA("video", "scale", 1, s_ini);
+        s_cfg.limit = (int)GetPrivateProfileIntA("video", "fps_limit", 0, s_ini);
+        s_cfg.vsync = (int)GetPrivateProfileIntA("video", "vsync", 0, s_ini);
+        s_cfg.point = (int)GetPrivateProfileIntA("video", "sharp", 0, s_ini);
+        s_cfg.counter = (int)GetPrivateProfileIntA("video", "fps_counter", 0, s_ini);
+        s_cfg.boot = (int)GetPrivateProfileIntA("game", "skip_boot_waits", 0, s_ini);
+    }
+    env_int("RECOMP_RES_SCALE", &s_cfg.scale);
+    env_int("RECOMP_FPS_LIMIT", &s_cfg.limit);
+    env_int("RECOMP_PRESENT_VSYNC", &s_cfg.vsync);
+    if ((f = getenv("RECOMP_PRESENT_FILTER")) != NULL && *f)
+        s_cfg.point = *f == 'p' || *f == 'P';
+    if (s_cfg.scale < 1) s_cfg.scale = 1;
+    if (s_cfg.scale > 4) s_cfg.scale = 4;
+    if (s_cfg.limit < 0) s_cfg.limit = 0;
+    s_scale = (uint32_t)s_cfg.scale;
+    fprintf(stderr, "[D3D11] settings: %ux internal resolution, frame limit %d, vsync %s, %s filter (%s)\n",
+            s_scale, s_cfg.limit, s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear",
+            s_ini[0] ? s_ini : "no settings file");
+}
+
+static void settings_save(void)
+{
+    char v[16];
+    if (!s_ini[0])
+        return;
+    _snprintf(v, sizeof v, "%d", s_cfg.scale);   WritePrivateProfileStringA("video", "scale", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.limit);   WritePrivateProfileStringA("video", "fps_limit", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.vsync);   WritePrivateProfileStringA("video", "vsync", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.point);   WritePrivateProfileStringA("video", "sharp", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.counter); WritePrivateProfileStringA("video", "fps_counter", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.boot);    WritePrivateProfileStringA("game", "skip_boot_waits", v, s_ini);
+}
+
+static int make_blit_sampler(void)
+{
+    D3D11_SAMPLER_DESC smp;
+    if (s_blit_samp)
+        ID3D11SamplerState_Release(s_blit_samp);
+    s_blit_samp = NULL;
+    ZeroMemory(&smp, sizeof smp);
+    smp.Filter = s_cfg.point ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smp.MaxLOD = D3D11_FLOAT32_MAX;
+    return SUCCEEDED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_samp));
+}
 
 static void client_size(UINT *w, UINT *h)
 {
@@ -1646,14 +1837,11 @@ static int blit_init(HWND hwnd)
     IDXGIAdapter *ad = NULL;
     IDXGIFactory2 *fac = NULL;
     DXGI_SWAP_CHAIN_DESC1 sd;
-    D3D11_SAMPLER_DESC smp;
     ID3DBlob *vb, *pb;
-    const char *f = getenv("RECOMP_PRESENT_FILTER"), *v = getenv("RECOMP_PRESENT_VSYNC");
     HRESULT hr;
     int ok;
 
     s_hwnd = hwnd;
-    s_vsync = v && *v && *v != '0';
     client_size(&s_bw, &s_bh);
     hr = ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&dd);
     if (SUCCEEDED(hr)) {
@@ -1688,10 +1876,6 @@ static int blit_init(HWND hwnd)
                 (unsigned long)hr);
         return 0;
     }
-    ZeroMemory(&smp, sizeof smp);
-    smp.Filter = f && (*f == 'p' || *f == 'P') ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    smp.MaxLOD = D3D11_FLOAT32_MAX;
     vb = compile_from(s_blit_hlsl, sizeof s_blit_hlsl - 1, "vs", "vs_5_0");
     pb = compile_from(s_blit_hlsl, sizeof s_blit_hlsl - 1, "ps", "ps_5_0");
     ok = vb && pb && make_back()
@@ -1699,7 +1883,7 @@ static int blit_init(HWND hwnd)
                                                      ID3D10Blob_GetBufferSize(vb), NULL, &s_vs_blit))
         && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb),
                                                     ID3D10Blob_GetBufferSize(pb), NULL, &s_ps_blit))
-        && SUCCEEDED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_samp));
+        && make_blit_sampler();
     if (vb) ID3D10Blob_Release(vb);
     if (pb) ID3D10Blob_Release(pb);
     if (!ok) {
@@ -1708,9 +1892,335 @@ static int blit_init(HWND hwnd)
         s_chain = NULL;
         return 0;
     }
-    fprintf(stderr, "[D3D11] presenting to the window (%ux%u, vsync %s, %s filter)\n", s_bw, s_bh,
-            s_vsync ? "on" : "off", smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear");
+    fprintf(stderr, "[D3D11] presenting to the window (%ux%u)\n", s_bw, s_bh);
     return 1;
+}
+
+/* ---- Settings panel and frame rate counter ------------------------------------- */
+/* Text is drawn with GDI into a bitmap, which is uploaded only when the text
+ * changes and drawn over the frame, at one texel a pixel, half see-through.
+ * While the panel is open the game sees its pads at rest (xbox_input_held). */
+extern volatile long xbox_input_held;          /* src/input/xinput_device.c */
+
+enum { ROW_SCALE, ROW_LIMIT, ROW_VSYNC, ROW_FILTER, ROW_COUNTER, ROW_BOOT, ROWS };
+
+static struct {
+    int open, row;
+    int pad_ok;                 /* pad 0 answered last time */
+    DWORD pad_retry;            /* when to ask a missing pad again */
+    WORD pad_last;
+    uint8_t key_last[256];
+    /* frame rate, over half-second windows */
+    LONGLONG fps_t0;
+    uint32_t fps_n;
+    double fps;
+    uint32_t game_w, game_h;    /* the shown surface, in guest pixels */
+    /* the text bitmap */
+    HDC dc;
+    HBITMAP bmp;
+    void *bits;
+    HFONT font;
+    int font_px, bw, bh;        /* font size, bitmap size */
+    char text[1024];            /* what the texture holds now */
+    UINT tw, th;                /* texture and text size */
+    ID3D11Texture2D *tex;
+    ID3D11ShaderResourceView *srv;
+    ID3D11BlendState *blend;
+} s_ui;
+
+static int key_pressed(int vk, int fg)
+{
+    int down = fg && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    int edge = down && !s_ui.key_last[vk];
+    s_ui.key_last[vk] = (uint8_t)down;
+    return edge;
+}
+
+static void ui_change(int row, int dir)
+{
+    int i;
+    switch (row) {
+    case ROW_SCALE:
+        s_cfg.scale += dir;
+        if (s_cfg.scale < 1) s_cfg.scale = 4;
+        if (s_cfg.scale > 4) s_cfg.scale = 1;
+        s_scale = (uint32_t)s_cfg.scale;        /* targets remake themselves as they are drawn */
+        break;
+    case ROW_LIMIT:
+        for (i = 0; i < NLIMITS && s_limits[i] != s_cfg.limit; i++)
+            ;
+        i = i == NLIMITS ? 0 : (i + dir + NLIMITS) % NLIMITS;
+        s_cfg.limit = s_limits[i];
+        break;
+    case ROW_VSYNC:
+        s_cfg.vsync = !s_cfg.vsync;
+        break;
+    case ROW_FILTER:
+        s_cfg.point = !s_cfg.point;
+        make_blit_sampler();
+        break;
+    case ROW_COUNTER:
+        s_cfg.counter = !s_cfg.counter;
+        break;
+    case ROW_BOOT:
+        s_cfg.boot = !s_cfg.boot;
+        break;
+    }
+    settings_save();
+    fprintf(stderr, "[D3D11] settings: %dx internal resolution, frame limit %d, vsync %s, %s filter, counter %s\n",
+            s_cfg.scale, s_cfg.limit, s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear",
+            s_cfg.counter ? "on" : "off");
+}
+
+/* Keys while the window has the focus, and pad 0: F1 or Back+Start opens and
+ * closes; up and down choose, left and right (or A, Enter) change; B or Esc closes. */
+static void ui_input(void)
+{
+    int fg = s_hwnd && GetForegroundWindow() == s_hwnd;
+    WORD pad = 0, press;
+    int toggle, up, down, left, right, close;
+
+    if (s_ui.pad_ok || GetTickCount() - s_ui.pad_retry < 0x80000000u) {
+        /* XInputGetState is slow for a pad that is not there: ask every 2 s. */
+        XINPUT_STATE xs;
+        s_ui.pad_ok = XInputGetState(0, &xs) == ERROR_SUCCESS;
+        if (s_ui.pad_ok)
+            pad = xs.Gamepad.wButtons;
+        else
+            s_ui.pad_retry = GetTickCount() + 2000;
+    }
+    press = (WORD)(pad & ~s_ui.pad_last);
+    s_ui.pad_last = pad;
+
+    toggle = key_pressed(VK_F1, fg)
+          || ((pad & XINPUT_GAMEPAD_BACK) && (pad & XINPUT_GAMEPAD_START)
+              && (press & (XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START)));
+    up = key_pressed(VK_UP, fg) | !!(press & XINPUT_GAMEPAD_DPAD_UP);
+    down = key_pressed(VK_DOWN, fg) | !!(press & XINPUT_GAMEPAD_DPAD_DOWN);
+    left = key_pressed(VK_LEFT, fg) | !!(press & XINPUT_GAMEPAD_DPAD_LEFT);
+    right = key_pressed(VK_RIGHT, fg) | key_pressed(VK_RETURN, fg) | !!(press & XINPUT_GAMEPAD_DPAD_RIGHT)
+          | !!(press & XINPUT_GAMEPAD_A);
+    close = key_pressed(VK_ESCAPE, fg) | !!(press & XINPUT_GAMEPAD_B);
+
+    if (toggle || (s_ui.open && close)) {
+        s_ui.open = toggle ? !s_ui.open : 0;
+        InterlockedExchange(&xbox_input_held, s_ui.open);
+        return;
+    }
+    if (!s_ui.open)
+        return;
+    if (up) s_ui.row = (s_ui.row + ROWS - 1) % ROWS;
+    if (down) s_ui.row = (s_ui.row + 1) % ROWS;
+    if (left) ui_change(s_ui.row, -1);
+    if (right) ui_change(s_ui.row, 1);
+}
+
+/* Render the lines (separated by \n) into the bitmap and the texture, if they
+ * differ from what is there. Line 0 of the panel is a title; the row the cursor
+ * is on is the line hl (or none, -1). */
+static int ui_text(const char *text, int hl)
+{
+    char key[sizeof s_ui.text];
+    int px = (int)s_bh / 32, lines = 1, w = 0, i, y;
+    const char *p;
+    D3D11_TEXTURE2D_DESC td;
+
+    if (px < 14) px = 14;
+    if (px > 40) px = 40;
+    _snprintf(key, sizeof key, "%d|%d|%s", px, hl, text);
+    key[sizeof key - 1] = 0;
+    if (s_ui.srv && !strcmp(key, s_ui.text))
+        return 1;
+    if (!s_ui.dc && !(s_ui.dc = CreateCompatibleDC(NULL)))
+        return 0;
+    if (px != s_ui.font_px) {
+        if (s_ui.font) DeleteObject(s_ui.font);
+        s_ui.font = CreateFontA(-px, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                                CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, "Consolas");
+        s_ui.font_px = px;
+    }
+    SelectObject(s_ui.dc, s_ui.font);
+    for (p = text; *p; p++)
+        lines += *p == '\n';
+    for (p = text; ; ) {
+        const char *e = strchr(p, '\n');
+        int n = e ? (int)(e - p) : (int)strlen(p);
+        SIZE sz;
+        if (GetTextExtentPoint32A(s_ui.dc, p, n, &sz) && sz.cx > w)
+            w = sz.cx;
+        if (!e) break;
+        p = e + 1;
+    }
+    {
+        int lh = px * 5 / 4, pad = px / 2;
+        UINT tw = (UINT)(w + pad * 2), th = (UINT)(lines * lh + pad * 2);
+        if (!s_ui.bmp || (int)tw > s_ui.bw || (int)th > s_ui.bh) {
+            BITMAPINFO bi;
+            ZeroMemory(&bi, sizeof bi);
+            bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+            bi.bmiHeader.biWidth = (LONG)tw;
+            bi.bmiHeader.biHeight = -(LONG)th;
+            bi.bmiHeader.biPlanes = 1;
+            bi.bmiHeader.biBitCount = 32;
+            if (s_ui.bmp) DeleteObject(s_ui.bmp);
+            s_ui.bmp = CreateDIBSection(s_ui.dc, &bi, DIB_RGB_COLORS, &s_ui.bits, NULL, 0);
+            if (!s_ui.bmp)
+                return 0;
+            SelectObject(s_ui.dc, s_ui.bmp);
+            s_ui.bw = (int)tw;
+            s_ui.bh = (int)th;
+        }
+        {
+            RECT all = {0, 0, s_ui.bw, s_ui.bh};
+            HBRUSH bg = CreateSolidBrush(RGB(12, 14, 22));
+            FillRect(s_ui.dc, &all, bg);
+            DeleteObject(bg);
+        }
+        SetBkMode(s_ui.dc, TRANSPARENT);
+        for (p = text, i = 0, y = pad; ; i++, y += lh) {
+            const char *e = strchr(p, '\n');
+            int n = e ? (int)(e - p) : (int)strlen(p);
+            if (i == hl) {
+                RECT r = {pad / 2, y - px / 8, (LONG)tw - pad / 2, y + lh - px / 8};
+                HBRUSH b = CreateSolidBrush(RGB(48, 56, 92));
+                FillRect(s_ui.dc, &r, b);
+                DeleteObject(b);
+            }
+            SetTextColor(s_ui.dc, i == hl ? RGB(255, 214, 90) : i == 0 && hl >= 0 ? RGB(150, 190, 255)
+                                                                                  : RGB(230, 230, 230));
+            TextOutA(s_ui.dc, pad, y, p, n);
+            if (!e) break;
+            p = e + 1;
+        }
+        GdiFlush();
+        if (!s_ui.tex || s_ui.tw != tw || s_ui.th != th) {
+            if (s_ui.srv) ID3D11ShaderResourceView_Release(s_ui.srv);
+            if (s_ui.tex) ID3D11Texture2D_Release(s_ui.tex);
+            s_ui.srv = NULL;
+            s_ui.tex = NULL;
+            ZeroMemory(&td, sizeof td);
+            td.Width = tw; td.Height = th; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_ui.tex))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_ui.tex, NULL, &s_ui.srv)))
+                return 0;
+            s_ui.tw = tw;
+            s_ui.th = th;
+        }
+        {
+            D3D11_BOX box = {0, 0, 0, tw, th, 1};
+            ID3D11DeviceContext_UpdateSubresource(s_ctx, (ID3D11Resource *)s_ui.tex, 0, &box, s_ui.bits,
+                                                  (UINT)s_ui.bw * 4, 0);
+        }
+    }
+    memcpy(s_ui.text, key, sizeof key);
+    return 1;
+}
+
+/* Over the frame in the back buffer, at the top left of the picture (x0, y0).
+ * Uses the blit shaders and sampler that blit_present has bound. */
+static void ui_draw(float x0, float y0)
+{
+    char text[sizeof s_ui.text - 64];
+    int hl = -1;
+    D3D11_VIEWPORT vp;
+    float k[4] = {0.88f, 0.88f, 0.88f, 0.88f};
+
+    if (s_ui.open) {
+        static const char *const sharp[] = {"smooth", "sharp"}, *const onoff[] = {"off", "on"};
+        char limit[16];
+        if (s_cfg.limit)
+            _snprintf(limit, sizeof limit, "%d fps", s_cfg.limit);
+        else
+            _snprintf(limit, sizeof limit, "off");
+        limit[sizeof limit - 1] = 0;
+        _snprintf(text, sizeof text,
+                  "Settings                      %4.0f fps\n"
+                  "Resolution    %dx  (%ux%u)\n"
+                  "Frame limit   %s\n"
+                  "Vsync         %s\n"
+                  "Scaling       %s\n"
+                  "FPS counter   %s\n"
+                  "Boot waits    %s\n"
+                  " \n"
+                  "Up/Down choose, Left/Right change\n"
+                  "F1, Esc or B closes",
+                  s_ui.fps, s_cfg.scale, s_ui.game_w * (UINT)s_cfg.scale, s_ui.game_h * (UINT)s_cfg.scale,
+                  limit, onoff[s_cfg.vsync], sharp[s_cfg.point], onoff[s_cfg.counter],
+                  s_cfg.boot ? "skip (from next start)" : "keep");
+        hl = 1 + s_ui.row;
+    } else if (s_cfg.counter) {
+        _snprintf(text, sizeof text, "%.0f fps", s_ui.fps);
+    } else {
+        return;
+    }
+    text[sizeof text - 1] = 0;
+    if (!ui_text(text, hl))
+        return;
+    if (!s_ui.blend) {
+        D3D11_BLEND_DESC bd;
+        ZeroMemory(&bd, sizeof bd);
+        bd.RenderTarget[0].BlendEnable = TRUE;
+        bd.RenderTarget[0].SrcBlend = bd.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
+        bd.RenderTarget[0].DestBlend = bd.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_BLEND_FACTOR;
+        bd.RenderTarget[0].BlendOp = bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(ID3D11Device_CreateBlendState(s_dev, &bd, &s_ui.blend)))
+            return;
+    }
+    vp.TopLeftX = x0 + (float)(s_ui.font_px / 2);
+    vp.TopLeftY = y0 + (float)(s_ui.font_px / 2);
+    vp.Width = (float)s_ui.tw;
+    vp.Height = (float)s_ui.th;
+    vp.MinDepth = 0;
+    vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, s_ui.blend, k, 0xFFFFFFFFu);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &s_ui.srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+}
+
+/* The frame limit: hold each present until 1/limit s after the last one. A
+ * high-resolution waitable timer sleeps most of the way and the last half
+ * millisecond is spun. Holding the walker holds the game, which waits on its
+ * flips. A late frame starts a new schedule rather than letting the next ones
+ * hurry to catch up. Returns the ms spent waiting. */
+static double limit_wait(void)
+{
+    static HANDLE timer;
+    static int tried;
+    static LONGLONG next;
+    LONGLONG now = ft_qpc(), start = now, period;
+
+    if (!s_cfg.limit || !s_ft.qms) {
+        next = 0;
+        return 0.0;
+    }
+    period = (LONGLONG)(s_ft.qms * 1000.0 / s_cfg.limit);
+    if (!tried) {
+        tried = 1;
+        timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                       TIMER_ALL_ACCESS);
+    }
+    if (next && now < next) {
+        LONGLONG spin = (LONGLONG)(s_ft.qms * 0.5);
+        if (next - now > spin) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((double)(next - now - spin) / s_ft.qms * 10000.0);
+            if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+                WaitForSingleObject(timer, 100);
+            else
+                Sleep((DWORD)((double)(next - now - spin) / s_ft.qms));
+        }
+        while ((now = ft_qpc()) < next)
+            YieldProcessor();
+    }
+    next = next && now - next < period ? next + period : now + period;
+    return (double)(now - start) / s_ft.qms;
 }
 
 /* Draw the frame into the back buffer, letterboxed, and present it. The state it
@@ -1757,11 +2267,15 @@ static void blit_present(Target *t)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    s_ui.game_w = t->w;
+    s_ui.game_h = t->h;
+    ui_draw((float)(int)vp.TopLeftX, (float)(int)vp.TopLeftY);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
     s_cur_target = NULL;
     s_cur_zeta = NULL;
-    IDXGISwapChain1_Present(s_chain, s_vsync, 0);
+    s_ft.limit += limit_wait();
+    IDXGISwapChain1_Present(s_chain, (UINT)(s_cfg.vsync != 0), 0);
 }
 
 /* The frame is finished: copy it to guest memory, where the window and the frame
@@ -1801,6 +2315,18 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
             }
         }
     }
+    {
+        LONGLONG now = ft_qpc();
+        s_ui.fps_n++;
+        if (!s_ui.fps_t0) {
+            s_ui.fps_t0 = now;
+        } else if (s_ft.qms && now - s_ui.fps_t0 > (LONGLONG)(s_ft.qms * 500.0)) {
+            s_ui.fps = s_ui.fps_n * 1000.0 / ((double)(now - s_ui.fps_t0) / s_ft.qms);
+            s_ui.fps_t0 = now;
+            s_ui.fps_n = 0;
+        }
+    }
+    ui_input();
     if (getenv("RECOMP_GPU_STATS") && GetTickCount() - s_stats.last > 5000) {
         s_stats.last = GetTickCount();
         fprintf(stderr, "[D3D11] %u presents, %u draws, %u tris, %u clears, %u uploads (%llu KB, %llu KB held), "
@@ -1838,7 +2364,7 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
             }
         }
     }
-    if (!s_staging || s_staging_w != t->w || s_staging_h != t->h) {
+    if (!s_staging || s_staging_w != t->w * t->sc || s_staging_h != t->h * t->sc) {
         D3D11_TEXTURE2D_DESC td;
         if (s_staging)
             ID3D11Texture2D_Release(s_staging);
@@ -1849,21 +2375,26 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_staging)))
             return;
-        s_staging_w = t->w;
-        s_staging_h = t->h;
+        s_staging_w = t->w * t->sc;
+        s_staging_h = t->h * t->sc;
     }
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_staging, (ID3D11Resource *)t->tex);
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0, D3D11_MAP_READ, 0, &m)))
         return;
+    /* Above 1x, guest memory gets every sc-th pixel: dumps stay the guest's size. */
     for (y = 0; y < t->h; y++) {
-        const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * m.RowPitch;
+        const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * t->sc * m.RowPitch;
         uint8_t *dst = mem + va + (size_t)y * pitch;
-        if (t->bpp == 4) {
+        if (t->bpp == 4 && t->sc == 1) {
             memcpy(dst, src, (size_t)t->w * 4);
+        } else if (t->bpp == 4) {
+            uint32_t x;
+            for (x = 0; x < t->w; x++)
+                ((uint32_t *)dst)[x] = ((const uint32_t *)src)[x * t->sc];
         } else if (t->bpp == 2) {
             uint32_t x;
             for (x = 0; x < t->w; x++) {
-                uint32_t p = ((const uint32_t *)src)[x];
+                uint32_t p = ((const uint32_t *)src)[x * t->sc];
                 ((uint16_t *)dst)[x] = (uint16_t)(((p >> 8) & 0xF800) | ((p >> 5) & 0x07E0)
                                                   | ((p >> 3) & 0x001F));
             }

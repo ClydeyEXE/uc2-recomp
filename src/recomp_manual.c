@@ -278,6 +278,49 @@ void sub_002043A0(void)
     g_esp += 12; /* ret 8 */
 }
 
+/*
+ * The title's Sleep(ms), wrapping the generated body. Boot (sub_00019BB0) holds
+ * its first screens for a fixed time: it sleeps out the rest of a minimum after
+ * its set-up, then sleeps 4900 ms more, about 9 s of every boot with nothing to
+ * do. With skip_boot_waits=1 under [game] in %LOCALAPPDATA%\xboxrecomp\ucc2_video.ini
+ * (the settings panel's "Skip boot waits"), or RECOMP_SKIP_BOOT_WAITS=1, those two
+ * sleeps are 0 ms. Every other caller sleeps as before.
+ */
+#define BOOT_WAIT_RET_MIN   0x00019CEDu  /* after the call that pads to a minimum */
+#define BOOT_WAIT_RET_FIXED 0x00019D1Cu  /* after Sleep(0x1324) */
+
+extern void sub_00266885_gen(void);
+
+static int skip_boot_waits(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_SKIP_BOOT_WAITS"), *base = getenv("LOCALAPPDATA");
+        char ini[MAX_PATH];
+        on = 0;
+        if (base) {
+            _snprintf(ini, sizeof ini, "%s\\xboxrecomp\\ucc2_video.ini", base);
+            ini[sizeof ini - 1] = 0;
+            on = GetPrivateProfileIntA("game", "skip_boot_waits", 0, ini) != 0;
+        }
+        if (e && *e)
+            on = *e != '0';
+        if (on)
+            fprintf(stderr, "[BOOT] skipping the boot screens' fixed waits\n");
+    }
+    return on;
+}
+
+void sub_00266885(void)
+{
+    char *mem = (char *)g_xbox_mem_offset;
+    uint32_t ret = *(const uint32_t *)(mem + g_esp);
+
+    if ((ret == BOOT_WAIT_RET_MIN || ret == BOOT_WAIT_RET_FIXED) && skip_boot_waits())
+        *(uint32_t *)(mem + g_esp + 4) = 0;
+    sub_00266885_gen();
+}
+
 /* ── CRT x87 special cases─────────────────────────────────── */
 
 /*

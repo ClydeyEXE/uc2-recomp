@@ -117,6 +117,43 @@ index 7318675..6b2267b 100644
      bool pace_stalled;          /* device stopped consuming: host-clock pacing,
                                   * periods dropped (mcpx_apu_pace_step) */
  
+diff --git a/src/input/xinput_device.c b/src/input/xinput_device.c
+index 5975014..aa7755f 100644
+--- a/src/input/xinput_device.c
++++ b/src/input/xinput_device.c
+@@ -71,7 +71,7 @@ void xbox_InputInit(void)
+     }
+ }
+ 
+-DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++static DWORD input_get_state(DWORD dwPort, XBOX_INPUT_STATE *pState)
+ {
+     XINPUT_STATE xi_state;
+     DWORD result;
+@@ -134,6 +134,23 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
+     return ERROR_SUCCESS;
+ }
+ 
++/* Set while a host overlay (the settings panel) has the input: the game still
++ * sees its pads connected, but at rest, so menu keys and buttons go to the
++ * overlay alone. */
++volatile long xbox_input_held;
++
++DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
++{
++    DWORD r = input_get_state(dwPort, pState);
++    if (xbox_input_held && r == ERROR_SUCCESS) {
++        /* A packet number of its own, so the change is seen both ways. */
++        DWORD packet = pState->dwPacketNumber ^ 0x40000000u;
++        memset(pState, 0, sizeof *pState);
++        pState->dwPacketNumber = packet;
++    }
++    return r;
++}
++
+ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
+ {
+     XINPUT_VIBRATION xi_vib;
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
 index 5c9056a..f6a7a14 100644
 --- a/src/kernel/kernel_bridge.c
@@ -134,10 +171,10 @@ index 5c9056a..f6a7a14 100644
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
 diff --git a/src/kernel/kernel_thread.c b/src/kernel/kernel_thread.c
-index 9afbbe3..fdc9f37 100644
+index 9afbbe3..46a065d 100644
 --- a/src/kernel/kernel_thread.c
 +++ b/src/kernel/kernel_thread.c
-@@ -500,6 +500,54 @@ DWORD_PTR xbox_GuestCpuMask(void)
+@@ -500,12 +500,75 @@ DWORD_PTR xbox_GuestCpuMask(void)
      return proc & (DWORD_PTR)(-(intptr_t)proc);
  }
  
@@ -189,10 +226,31 @@ index 9afbbe3..fdc9f37 100644
 +}
 +#endif
 +
++#if defined(_WIN32)
++/* The title's main thread, for a host profiler to sample (the renderer's hitch
++ * lines): a handle that may suspend it and read its registers, or NULL. */
++void *xbox_guest_main_thread;
++#endif
++
  void xbox_GuestThreadPin(const char *role)
  {
      static int announced, failed;
-@@ -521,6 +569,9 @@ void xbox_GuestThreadPin(const char *role)
+     DWORD_PTR mask = xbox_GuestCpuMask();
+     int core = 0;
+ 
++#if defined(_WIN32)
++    if (role && !strcmp(role, "guest-main") && !xbox_guest_main_thread) {
++        HANDLE h = NULL;
++        if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
++                            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
++                            FALSE, 0))
++            xbox_guest_main_thread = h;
++    }
++#endif
+     if (!mask)
+         return;
+     while (!((mask >> core) & 1))
+@@ -521,6 +584,9 @@ void xbox_GuestThreadPin(const char *role)
      }
      if (!announced) {
          announced = 1;
