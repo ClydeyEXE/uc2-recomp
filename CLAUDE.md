@@ -1,7 +1,11 @@
 # Unreal Championship 2 recompilation
 
-Start with `docs/HANDOFF.md` for current state and next steps. `README.md` covers setup, and `docs/HISTORY.md` records
+Open work is in GitHub Issues: start with the pinned Roadmap issue (`gh issue list`, `gh issue view <n>`) for order and
+evidence. `README.md` covers setup and status, `docs/DEVELOPING.md` the debugging tools, and `docs/HISTORY.md` records
 past bugs and their fixes.
+
+Issues are public: put symptoms, addresses and measurements in them, never disassembly or game-derived dumps. When work
+fixes an issue, say `Fixes #<n>` in the commit, and add new findings to the issue rather than to a file.
 
 ## Commands
 - Build: `tools/build.cmd` (log in `build/build.log`, ends with `BUILD_EXIT=`)

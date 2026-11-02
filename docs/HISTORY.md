@@ -1,6 +1,6 @@
 # Fixed so far, and how
 
-Read this when a symptom looks familiar, or before changing the code a fix touched. `HANDOFF.md` has what is still open.
+Read this when a symptom looks familiar, or before changing the code a fix touched. GitHub Issues have what is still open.
 
 1. **Freeze after the first flip.** The dump's registers fit the spin at `loc_00386C60` in `sub_00386B30`
    (`eax=2`, `ecx=3`, `esi=0xD`, `edi=0xA`), which waits for the semaphore to reach the fence. It is not the

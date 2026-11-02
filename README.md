@@ -7,6 +7,15 @@ Windows, using the [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) toolkit
 No game data or game-derived code belongs in this repo. Supply your own dump. `assets/` and
 `src/recomp/gen/` are gitignored. `assets/default_analysis.json` holds keys from the XBE certificate.
 
+## Status
+Full Instant Action matches play from start to finish with a controller or keyboard, on a Direct3D 11 renderer.
+Typical matches run 60-130 fps, but busy scenes still drop to 35-48 fps, and there are occasional 100-160 ms hitches
+while the game loads files. Audio plays without dropouts, but effects such as reverb are missing. Story Mode cutscenes
+play; the rest of Story Mode, and the DLC, are untested.
+
+Open work is in [Issues](https://github.com/ClydeyEXE/ucc2-recomp/issues), in the order of the pinned Roadmap issue.
+`docs/DEVELOPING.md` covers debugging tools, and `docs/HISTORY.md` records past bugs and their fixes.
+
 ## Setup
 Requires CMake, Ninja, Python 3.12, and MSVC (VS 2022 Build Tools, C++ workload).
 
@@ -89,5 +98,3 @@ The runtime keeps save data in `%LOCALAPPDATA%\xboxrecomp`.
 - Game code: `.text`, VA 0x11000, 2.8 MB
 - XDK code in its own sections: XMV, D3DX, DSOUND, XNET, XONLINE, WMADEC, XACTENG, XGRPH, D3D, XPP
 - 156 kernel imports: 133 stdcall, 5 fastcall, 18 data exports
-
-See docs/ROADMAP.md for status and open decisions.
