@@ -134,7 +134,7 @@ index 5c9056a..f6a7a14 100644
          uint32_t got = (uint32_t)ios.Information;
          /* The offset matters as much as the length. A title streaming a pack
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 327f01d..761ad83 100644
+index 327f01d..c76e6c2 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,8 @@
@@ -166,7 +166,7 @@ index 327f01d..761ad83 100644
  } Nv2aTexture;
  
  typedef struct {
-@@ -80,13 +88,36 @@ typedef struct {
+@@ -80,13 +88,38 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -186,6 +186,8 @@ index 327f01d..761ad83 100644
 +    int          rc_seen;               /* the title has programmed the combiners */
 +    uint32_t     clip_plane_mode;       /* SET_SHADER_CLIP_PLANE_MODE */
 +    uint32_t     fog_color;             /* SET_FOG_COLOR: R in bits 0-7 */
++    uint32_t     dot_rgb_mapping;       /* SET_DOT_RGBMAPPING: stage 1 in bits 0-3 */
++    uint32_t     other_stage_input;     /* SET_SHADER_OTHER_STAGE_INPUT: stage 1 in bits 16-19 */
 +} Nv2aShading;
 +
  typedef struct {
@@ -203,7 +205,7 @@ index 327f01d..761ad83 100644
  } Nv2aBatch;
  
  typedef struct {
-@@ -96,6 +127,10 @@ typedef struct {
+@@ -96,6 +129,10 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -214,7 +216,7 @@ index 327f01d..761ad83 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -117,4 +152,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+@@ -117,4 +154,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
   * the semaphore context DMA object through RAMIN. */
  void nv2a_pb_set_semaphore_target(uint32_t guest_va);
  
@@ -225,7 +227,7 @@ index 327f01d..761ad83 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..541bcf3 100644
+index a513bc7..3d232b6 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
@@ -319,7 +321,7 @@ index a513bc7..541bcf3 100644
  
  static Nv2aVertex *backend_slot(void)
  {
-@@ -2037,10 +2070,47 @@ static void backend_flush(int textured)
+@@ -2037,10 +2070,49 @@ static void backend_flush(int textured)
          return;
      current_surface(&surf);
      current_render_state(&rs);
@@ -355,6 +357,8 @@ index a513bc7..541bcf3 100644
 +        sh.rc_seen = s_gpu.rc_seen;
 +        sh.clip_plane_mode = s_gpu.clip_plane_mode;
 +        sh.fog_color = s_gpu.fog_color;
++        sh.dot_rgb_mapping = s_reg[0x1E74 / 4];
++        sh.other_stage_input = s_reg[0x1E78 / 4];
 +        batch.vertices = NULL;
 +        batch.outputs = s_boutputs;
 +        batch.shading = &sh;
@@ -367,7 +371,7 @@ index a513bc7..541bcf3 100644
      if (textured && s_gpu.texs[0].valid) {
          tex.offset = s_gpu.texs[0].offset;
          tex.width  = s_gpu.texs[0].width;
-@@ -2082,6 +2152,33 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2082,6 +2154,33 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              && fetch_texcoord(i1, uv[1])
              && fetch_texcoord(i2, uv[2]);
  
@@ -401,7 +405,7 @@ index a513bc7..541bcf3 100644
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2498,8 +2595,13 @@ static struct {
+@@ -2498,8 +2597,13 @@ static struct {
      const XfTri *tris;
      int ntris;
      XfCount cnt[NV_RASTER_MAX_THREADS];
@@ -415,7 +419,7 @@ index a513bc7..541bcf3 100644
  /* Worker k owns the rows y with y % n == k, for every triangle of the run,
   * in submission order. Each pixel therefore sees its triangles in the order
   * the title drew them, whichever thread draws it. */
-@@ -2518,6 +2620,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
+@@ -2518,6 +2622,13 @@ static DWORD WINAPI raster_worker(LPVOID arg)
      int k = (int)(intptr_t)arg;
      for (;;) {
          WaitForSingleObject(s_pool.start[k], INFINITE);
@@ -429,7 +433,7 @@ index a513bc7..541bcf3 100644
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
          xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
          if (InterlockedDecrement(&s_pool.pending) == 0)
-@@ -2668,7 +2777,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2668,7 +2779,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
      T.a = a; T.b = b; T.c = c;
@@ -442,7 +446,7 @@ index a513bc7..541bcf3 100644
          return;
      if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
          s_gpu.tris_behind++;
-@@ -2679,6 +2792,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2679,6 +2794,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -469,7 +473,7 @@ index a513bc7..541bcf3 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -2927,15 +3060,106 @@ static void xf_set_viewport(void)
+@@ -2927,15 +3062,106 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -579,7 +583,7 @@ index a513bc7..541bcf3 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3040,8 +3264,14 @@ static void raster_batch_program(void)
+@@ -3040,8 +3266,14 @@ static void raster_batch_program(void)
              raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
@@ -596,7 +600,7 @@ index a513bc7..541bcf3 100644
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3172,6 +3402,11 @@ static void raster_batch(void)
+@@ -3172,6 +3404,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -608,7 +612,7 @@ index a513bc7..541bcf3 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3190,8 +3425,19 @@ static void frame_trace_flip(void)
+@@ -3190,8 +3427,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -629,7 +633,7 @@ index a513bc7..541bcf3 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3239,7 +3485,8 @@ static void draw_primitive(void)
+@@ -3239,7 +3487,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -639,7 +643,7 @@ index a513bc7..541bcf3 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,8 +3495,11 @@ static void draw_primitive(void)
+@@ -3248,8 +3497,11 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -652,7 +656,7 @@ index a513bc7..541bcf3 100644
              if ((s_gpu.xf_mode & 3) == 2 && s_xf)
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
                          s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -3960,7 +4210,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3960,7 +4212,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -661,7 +665,7 @@ index a513bc7..541bcf3 100644
              zbuf_clear();
          break;
  
-@@ -4028,7 +4278,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4280,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -673,7 +677,7 @@ index a513bc7..541bcf3 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4102,6 +4355,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4102,6 +4357,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;

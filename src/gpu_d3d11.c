@@ -44,7 +44,7 @@ static const char s_hlsl[] =
 "  uint4  misc;\n"           /* alpha test, alpha func, alpha ref, clip plane mode */
 "  float4 ts[4];\n"          /* texture coordinate scale: 1/texels for a linear texture */
 "  uint4  cube;\n"
-"  uint4  flags;\n"          /* x: combiners programmed, y: stage 0 usable */
+"  uint4  flags;\n"          /* x: combiners programmed, y: stage 0 usable, z: dot mapping, w: stage inputs */
 "};\n"
 "Texture2D t0_ : register(t0); Texture2D t1_ : register(t1);\n"
 "Texture2D t2_ : register(t2); Texture2D t3_ : register(t3);\n"
@@ -180,10 +180,23 @@ static const char s_hlsl[] =
 "  }\n"
 "  return saturate(R[12]);\n"
 "}\n"
+/* DOT_PRODUCT in one stage, then DOT_ST in the next: each dots its coordinate with a
+ * colour from an earlier stage, and the two results address the second stage's texture.
+ * UC2's heat haze and its colour grading both read the scene this way. */
+"float3 dotmap(float3 x, uint m) { return m >= 1 && m <= 3 ? x * 2 - 1 : x; }\n"
+"float dot_stage(uint st, float4 c, float4 t0, float4 t1, float4 t2) {\n"
+"  uint from = (flags.w >> (16 + (st - 1) * 4)) & 15;\n"
+"  float3 v = from == 2 ? t2.rgb : from == 1 ? t1.rgb : t0.rgb;\n"
+"  return dot(c.xyz, dotmap(v, (flags.z >> ((st - 1) * 4)) & 15));\n"
+"}\n"
 "float4 ps(VO i) : SV_Target {\n"
 "  float4 t0 = fetch(0, t0_, c0_, s0_, i.t0), t1 = fetch(1, t1_, c1_, s1_, i.t1);\n"
 "  float4 t2 = fetch(2, t2_, c2_, s2_, i.t2), t3 = fetch(3, t3_, c3_, s3_, i.t3);\n"
 "  float4 c;\n"
+"  if (((fin.w >> 5) & 31) == 0x11 && ((fin.w >> 10) & 31) == 9) {\n"
+"    float2 uv = float2(dot_stage(1, i.t1, t0, t1, t2), dot_stage(2, i.t2, t0, t1, t2)) * ts[2].xy;\n"
+"    t2 = t2_.SampleGrad(s2_, uv, ddx(uv), ddy(uv));\n"
+"  }\n"
 "  if (flags.x) {\n"
 "    c = combine(i.d0, i.d1, i.fog, t0, t1, t2, t3);\n"
 "  } else {\n"
@@ -1008,7 +1021,7 @@ static void unpack(uint32_t c, float o[4])
  * rebind, and a texture stage knows when it would sample what it is drawing to. */
 static Target *s_cur_target;
 static Zeta   *s_cur_zeta;
-static int     s_drawlog;
+static int     s_drawlog, s_skip;
 
 static void bind_targets(Target *t, Zeta *z)
 {
@@ -1187,6 +1200,8 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     c.misc[3] = sh->clip_plane_mode;
     c.flags[0] = sh->rc_seen != 0;
     c.flags[1] = sh->stage_valid[0] != 0;
+    c.flags[2] = sh->dot_rgb_mapping;
+    c.flags[3] = sh->other_stage_input;
     ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
     memcpy(m.pData, &c, sizeof c);
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb, 0);
@@ -1212,7 +1227,16 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
 
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
-    ID3D11DeviceContext_Draw(s_ctx, b->count, first);
+    {
+        /* -DrawLog's F5: leave out one kind of blended draw, to see what a stray
+         * shape on screen is made of. */
+        int skip = (s_skip == 1 && r->blend_enable && r->blend_src == 0 && r->blend_dst == 0x301)
+                || (s_skip == 2 && r->blend_enable && r->blend_src == 0x306)
+                || (s_skip == 3 && r->blend_enable && r->blend_src == 0x302 && r->blend_dst == 0x303)
+                || (s_skip == 4 && r->blend_enable && r->blend_src == 1 && r->blend_dst != 0);
+        if (!skip)
+            ID3D11DeviceContext_Draw(s_ctx, b->count, first);
+    }
     if (s_drawlog) {
         float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
         const Nv2aVshOutput *o = b->outputs;
@@ -1232,6 +1256,10 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                 sh->rc_seen, sh->rc.control, sh->rc.final0, sh->rc.final1,
                 o[0].d0[0], o[0].d0[1], o[0].d0[2], o[0].d0[3],
                 o[0].tex[0][0], o[0].tex[0][1], o[0].tex[0][2], o[0].tex[0][3]);
+        if (((sh->rc.stage_program >> 5) & 0x1F) == 0x11)
+            fprintf(stderr, "[DRAW]   dot map %08X input %08X t1 %.3f,%.3f,%.3f t2 %.3f,%.3f,%.3f\n", sh->dot_rgb_mapping,
+                    sh->other_stage_input, o[0].tex[1][0], o[0].tex[1][1], o[0].tex[1][2],
+                    o[0].tex[2][0], o[0].tex[2][1], o[0].tex[2][2]);
         for (st = 0; st < 4; st++) {
             const Nv2aTexture *tx = &sh->stage[st];
             if (sh->stage_valid[st] && ((sh->rc.stage_program >> (st * 5)) & 0x1F))
@@ -1239,7 +1267,7 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
                         tx->height, tx->color, tx->addr_u, tx->addr_v, tx->border_color, tx->border,
                         target_at(tx->offset) ? "TARGET" : "");
         }
-        if (r->blend_src == 0x306) {
+        if (r->blend_src == 0x306 || (r->blend_src == 0 && r->blend_dst == 0x301)) {
             for (st = 0; st < 2; st++) {
                 float u0 = 1e9f, v0 = 1e9f, u1 = -1e9f, v1 = -1e9f, q0 = 1e9f, q1 = -1e9f;
                 for (k = 0; k < b->count; k++) {
@@ -1391,17 +1419,25 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
     s_flip++;
     s_stats.presents++;
     /* RECOMP_GPU_DRAWLOG=<flag file>: log every draw and clear of the frame that
-     * follows, once per second, while the file exists. */
+     * follows, once per second while the file exists, and every frame while F7 is
+     * held. F5 steps through the kinds of draw to leave out (see d3d11_draw). */
     {
         static const char *flag;
         static DWORD last;
         if (!flag) { flag = getenv("RECOMP_GPU_DRAWLOG"); if (!flag) flag = ""; }
         s_drawlog = 0;
-        if (*flag && GetTickCount() - last > 1000
-            && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES) {
-            last = GetTickCount();
-            s_drawlog = 1;
-            fprintf(stderr, "[DRAW] frame after flip %u, shown %08X\n", s_flip, va);
+        if (*flag) {
+            int held = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
+            if (GetAsyncKeyState(VK_F5) & 1) {
+                s_skip = (s_skip + 1) % 5;
+                fprintf(stderr, "[DRAW] leaving out kind %d\n", s_skip);
+            }
+            if (held || (GetTickCount() - last > 1000
+                         && GetFileAttributesA(flag) != INVALID_FILE_ATTRIBUTES)) {
+                last = GetTickCount();
+                s_drawlog = 1;
+                fprintf(stderr, "[DRAW] frame after flip %u, shown %08X%s\n", s_flip, va, held ? " (F7)" : "");
+            }
         }
     }
     if (getenv("RECOMP_GPU_STATS") && GetTickCount() - s_stats.last > 5000) {
