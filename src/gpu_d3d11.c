@@ -518,11 +518,13 @@ static void ft_frame(void)
 #define MAX_TARGETS 48
 
 /* w and h are the surface's size in guest pixels, which the vertex positions,
- * clip rectangles and texture coordinates are in. The texture is sc times that
- * each way (the internal resolution scale, s_scale), and only the viewport,
- * scissor and depth bias need to know. */
+ * clip rectangles and texture coordinates are in. The texture is pw x ph, sx and
+ * sy times that (the internal resolution, s_sx and s_sy, which differ when the
+ * picture is stretched to 16:9), and only the viewport, scissor and depth bias
+ * need to know. res is the s_res it was made for. */
 typedef struct {
-    uint32_t va, w, h, bpp, last_flip, sc;
+    uint32_t va, w, h, bpp, last_flip, pw, ph, res;
+    float sx, sy;
     ID3D11Texture2D *tex, *copy;
     ID3D11RenderTargetView *rtv;
     ID3D11ShaderResourceView *srv, *copy_srv;
@@ -538,7 +540,10 @@ static Target s_targets[MAX_TARGETS];
 static Zeta   s_zetas[MAX_TARGETS];
 static ID3D11Texture2D *s_staging;
 static uint32_t s_staging_w, s_staging_h;
-static uint32_t s_scale = 1;            /* internal resolution: see the settings panel */
+/* Internal resolution, as a scale on each axis from the guest's 640x480 (see the
+ * settings panel), and a count that changes with it, so targets remake themselves. */
+static float s_sx = 1.0f, s_sy = 1.0f;
+static uint32_t s_res;
 /* The last target and depth buffer bound, so a draw into the same pair does not
  * rebind, and a texture stage knows when it would sample what it is drawing to. */
 static Target  *s_cur_target;
@@ -575,19 +580,22 @@ static Target *target_for(const Nv2aSurface *s)
     Target *t = NULL;
     D3D11_TEXTURE2D_DESC td;
     int kept = 0;
+    uint32_t pw, ph;
 
     surface_size(s, &w, &h);
-    if (!w || !h || w * s_scale > 8192 || h * s_scale > 8192)
+    pw = (uint32_t)((float)w * s_sx + 0.5f);
+    ph = (uint32_t)((float)h * s_sy + 0.5f);
+    if (!w || !h || pw > 8192 || ph > 8192)
         return NULL;
     for (i = 0; i < MAX_TARGETS; i++) {
         if (s_targets[i].va == s->color_va) {
             t = &s_targets[i];
-            if (t->w == w && t->h >= h && t->sc == s_scale)
+            if (t->w == w && t->h >= h && t->res == s_res)
                 return t;
             /* Grown: a title narrows the clip for some draws, so the first one
              * seen may have been small. What was drawn is kept. A new scale
              * starts afresh. */
-            kept = t->h < h && t->w == w && t->sc == s_scale;
+            kept = t->h < h && t->w == w && t->res == s_res;
             break;
         }
         if (s_targets[i].last_flip < s_targets[oldest].last_flip || !s_targets[i].va)
@@ -595,7 +603,7 @@ static Target *target_for(const Nv2aSurface *s)
                 oldest = i;
     }
     ZeroMemory(&td, sizeof td);
-    td.Width = w * s_scale; td.Height = h * s_scale; td.MipLevels = 1; td.ArraySize = 1;
+    td.Width = pw; td.Height = ph; td.MipLevels = 1; td.ArraySize = 1;
     td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
@@ -607,11 +615,11 @@ static Target *target_for(const Nv2aSurface *s)
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &tex))
             || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)tex, NULL, &rtv))
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)tex, NULL, &srv))) {
-            fprintf(stderr, "[D3D11] cannot create a %ux%u target\n", w * s_scale, h * s_scale);
+            fprintf(stderr, "[D3D11] cannot create a %ux%u target\n", pw, ph);
             return NULL;
         }
         if (kept && t) {
-            D3D11_BOX box = {0, 0, 0, t->w * t->sc, t->h * t->sc, 1};
+            D3D11_BOX box = {0, 0, 0, t->pw, t->ph, 1};
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
                                                       (ID3D11Resource *)t->tex, 0, &box);
         }
@@ -620,7 +628,8 @@ static Target *target_for(const Nv2aSurface *s)
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
         s_cur_target = NULL;            /* unbound: the next draw binds again */
         target_release(t);
-        t->va = s->color_va; t->w = w; t->h = h; t->bpp = s->bytes_per_pixel; t->sc = s_scale;
+        t->va = s->color_va; t->w = w; t->h = h; t->bpp = s->bytes_per_pixel;
+        t->pw = pw; t->ph = ph; t->res = s_res; t->sx = (float)pw / (float)w; t->sy = (float)ph / (float)h;
         t->tex = tex; t->rtv = rtv; t->srv = srv;
     }
     return t;
@@ -1308,7 +1317,7 @@ static void bind_targets(Target *t, Zeta *z)
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &t->rtv, z ? z->dsv : NULL);
     vp.TopLeftX = 0; vp.TopLeftY = 0;
-    vp.Width = (float)(t->w * t->sc); vp.Height = (float)(t->h * t->sc);
+    vp.Width = (float)t->pw; vp.Height = (float)t->ph;
     vp.MinDepth = 0; vp.MaxDepth = 1;
     ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
     s_cur_target = t;
@@ -1368,7 +1377,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     /* Depth or stencil in use at all: a title that never tests them may still
      * name a zeta surface from an earlier pass. */
     if (r->zeta_va && (r->depth_test_enable || r->depth_write || r->stencil_enable)) {
-        z = zeta_for(r->zeta_va, t->w * t->sc, t->h * t->sc);
+        z = zeta_for(r->zeta_va, t->pw, t->ph);
         if (z)
             z->last_flip = s_flip;
     }
@@ -1490,12 +1499,14 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     }
     ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, z ? depth_for(r) : NULL,
                                                r->stencil_ref & 0xFF);
-    /* The slope term is per pixel, and a pixel here is 1/sc of a guest one. */
-    ID3D11DeviceContext_RSSetState(s_ctx, raster_for(r->poly_offset_fill ? r->poly_offset_scale * (float)t->sc : 0.0f));
-    sc.left = (LONG)(s->clip_x * t->sc);
-    sc.top = (LONG)(s->clip_y * t->sc);
-    sc.right = (LONG)((s->clip_x + s->width) * t->sc);
-    sc.bottom = (LONG)((s->clip_y + s->height) * t->sc);
+    /* The slope term is per pixel, and a pixel here is 1/sy of a guest one (or
+     * 1/sx across, when stretched: the larger is the safer bias). */
+    ID3D11DeviceContext_RSSetState(s_ctx, raster_for(r->poly_offset_fill
+                                                     ? r->poly_offset_scale * (t->sx > t->sy ? t->sx : t->sy) : 0.0f));
+    sc.left = (LONG)((float)s->clip_x * t->sx + 0.5f);
+    sc.top = (LONG)((float)s->clip_y * t->sy + 0.5f);
+    sc.right = (LONG)((float)(s->clip_x + s->width) * t->sx + 0.5f);
+    sc.bottom = (LONG)((float)(s->clip_y + s->height) * t->sy + 0.5f);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
 
     ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
@@ -1623,7 +1634,7 @@ static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, ui
         return;
     t->last_flip = s_flip;
     if (r->zeta_va && (depth || stencil)) {
-        z = zeta_for(r->zeta_va, t->w * t->sc, t->h * t->sc);
+        z = zeta_for(r->zeta_va, t->pw, t->ph);
         if (z)
             z->last_flip = s_flip;
     }
@@ -1679,8 +1690,8 @@ static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, ui
         ID3D11DeviceContext_OMSetBlendState(s_ctx, blend_for(&cr), none, 0xFFFFFFFFu);
         ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, z ? depth_for(&cr) : NULL, sval);
         ID3D11DeviceContext_RSSetState(s_ctx, raster_for(0.0f));
-        sc.left = (LONG)(x0 * t->sc); sc.top = (LONG)(y0 * t->sc);
-        sc.right = (LONG)(x1 * t->sc); sc.bottom = (LONG)(y1 * t->sc);
+        sc.left = (LONG)((float)x0 * t->sx + 0.5f); sc.top = (LONG)((float)y0 * t->sy + 0.5f);
+        sc.right = (LONG)((float)x1 * t->sx + 0.5f); sc.bottom = (LONG)((float)y1 * t->sy + 0.5f);
         ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
         ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_clear, NULL, 0);
         ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_clear, NULL, 0);
@@ -1704,7 +1715,7 @@ static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t
  * (5-8 ms of a 22 ms frame in a match), then copied twice more and uploaded again
  * by the window's own presenter. Guest memory now gets the frame only for frame
  * dumps (RECOMP_FB_DUMP). RECOMP_D3D_READBACK=1 keeps the old way to the screen.
- * Letterboxed to 4:3 at any window size. The filter, vsync, frame limit and
+ * Letterboxed to 4:3, or 16:9 when the panel stretches it, at any window size. The filter, vsync, frame limit and
  * internal resolution are the settings panel's (F1), below. */
 extern void *xbox_FramebufferWindowClaim(void);
 
@@ -1727,20 +1738,44 @@ static int                     s_failed_present;
 /* ---- Settings ------------------------------------------------------------------ */
 /* What the owner can change while playing, in the panel F1 opens (or Back+Start on
  * the pad). They are kept in %LOCALAPPDATA%\xboxrecomp\ucc2_video.ini, and these
- * override the file for one run: RECOMP_RES_SCALE=1..4, RECOMP_FPS_LIMIT=<fps>
- * (0 off), RECOMP_PRESENT_VSYNC=0/1, RECOMP_PRESENT_FILTER=point/linear. */
+ * override the file for one run: RECOMP_RES_SCALE=1..4 or RECOMP_RES_HEIGHT=<lines>,
+ * RECOMP_WIDESCREEN=0/1, RECOMP_FPS_LIMIT=<fps> (0 off), RECOMP_PRESENT_VSYNC=0/1,
+ * RECOMP_PRESENT_FILTER=point/linear. */
 static const int s_limits[] = {0, 30, 60, 120, 144, 240};
 #define NLIMITS ((int)(sizeof s_limits / sizeof s_limits[0]))
+/* Internal resolutions, by height: the guest's 480, its multiples (960, 1440, 1920)
+ * and the heights of 16:9 displays (720p, 1080p, 1440p, 4K). */
+static const int s_heights[] = {480, 720, 960, 1080, 1440, 1920, 2160};
+#define NHEIGHTS ((int)(sizeof s_heights / sizeof s_heights[0]))
 
 static struct {
-    int scale;                  /* internal resolution, times the guest's */
+    int height;                 /* internal resolution, in lines (one of s_heights) */
+    int wide;                   /* stretched to 16:9: the game's camera is still 4:3 */
     int limit;                  /* frame limit in fps, 0 for none */
     int vsync;
     int point;                  /* sharp pixels when scaling to the window */
     int counter;                /* frame rate in the corner */
     int boot;                   /* skip the boot screens' fixed waits, from the next start
                                    ([game] skip_boot_waits, read by recomp_manual.c) */
-} s_cfg = {1, 0, 0, 0, 0, 0};
+} s_cfg = {480, 0, 0, 0, 0, 0, 0};
+
+/* The width of a picture height lines high, in the chosen shape, kept even. */
+static int res_width(int height)
+{
+    return s_cfg.wide ? (height * 16 / 9 + 1) & ~1 : height * 4 / 3;
+}
+
+/* The scale on each axis from 640x480, after a change of resolution or shape. */
+static void res_apply(void)
+{
+    int i = 0;
+    while (i < NHEIGHTS - 1 && s_heights[i] < s_cfg.height)
+        i++;
+    s_cfg.height = s_heights[i];
+    s_sy = (float)s_cfg.height / 480.0f;
+    s_sx = (float)res_width(s_cfg.height) / 640.0f;
+    s_res++;
+}
 
 static char s_ini[MAX_PATH];
 
@@ -1763,25 +1798,33 @@ static void settings_load(void)
         CreateDirectoryA(dir, NULL);
         _snprintf(s_ini, sizeof s_ini, "%s\\ucc2_video.ini", dir);
         s_ini[sizeof s_ini - 1] = 0;
-        s_cfg.scale = (int)GetPrivateProfileIntA("video", "scale", 1, s_ini);
+        /* Older files have only a whole scale. */
+        s_cfg.height = (int)GetPrivateProfileIntA("video", "height",
+                                                  480 * (int)GetPrivateProfileIntA("video", "scale", 1, s_ini), s_ini);
+        s_cfg.wide = (int)GetPrivateProfileIntA("video", "widescreen", 0, s_ini);
         s_cfg.limit = (int)GetPrivateProfileIntA("video", "fps_limit", 0, s_ini);
         s_cfg.vsync = (int)GetPrivateProfileIntA("video", "vsync", 0, s_ini);
         s_cfg.point = (int)GetPrivateProfileIntA("video", "sharp", 0, s_ini);
         s_cfg.counter = (int)GetPrivateProfileIntA("video", "fps_counter", 0, s_ini);
         s_cfg.boot = (int)GetPrivateProfileIntA("game", "skip_boot_waits", 0, s_ini);
     }
-    env_int("RECOMP_RES_SCALE", &s_cfg.scale);
+    {
+        int n;
+        if (env_int("RECOMP_RES_SCALE", &n))
+            s_cfg.height = 480 * n;
+    }
+    env_int("RECOMP_RES_HEIGHT", &s_cfg.height);
+    env_int("RECOMP_WIDESCREEN", &s_cfg.wide);
     env_int("RECOMP_FPS_LIMIT", &s_cfg.limit);
     env_int("RECOMP_PRESENT_VSYNC", &s_cfg.vsync);
     if ((f = getenv("RECOMP_PRESENT_FILTER")) != NULL && *f)
         s_cfg.point = *f == 'p' || *f == 'P';
-    if (s_cfg.scale < 1) s_cfg.scale = 1;
-    if (s_cfg.scale > 4) s_cfg.scale = 4;
+    s_cfg.wide = s_cfg.wide != 0;
     if (s_cfg.limit < 0) s_cfg.limit = 0;
-    s_scale = (uint32_t)s_cfg.scale;
-    fprintf(stderr, "[D3D11] settings: %ux internal resolution, frame limit %d, vsync %s, %s filter (%s)\n",
-            s_scale, s_cfg.limit, s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear",
-            s_ini[0] ? s_ini : "no settings file");
+    res_apply();
+    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter (%s)\n",
+            res_width(s_cfg.height), s_cfg.height, s_cfg.wide ? "16:9" : "4:3", s_cfg.limit,
+            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_ini[0] ? s_ini : "no settings file");
 }
 
 static void settings_save(void)
@@ -1789,7 +1832,10 @@ static void settings_save(void)
     char v[16];
     if (!s_ini[0])
         return;
-    _snprintf(v, sizeof v, "%d", s_cfg.scale);   WritePrivateProfileStringA("video", "scale", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.height);  WritePrivateProfileStringA("video", "height", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.wide);    WritePrivateProfileStringA("video", "widescreen", v, s_ini);
+    /* The nearest whole scale, for a build from before heights. */
+    _snprintf(v, sizeof v, "%d", (s_cfg.height + 240) / 480); WritePrivateProfileStringA("video", "scale", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.limit);   WritePrivateProfileStringA("video", "fps_limit", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.vsync);   WritePrivateProfileStringA("video", "vsync", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.point);   WritePrivateProfileStringA("video", "sharp", v, s_ini);
@@ -1902,7 +1948,7 @@ static int blit_init(HWND hwnd)
  * While the panel is open the game sees its pads at rest (xbox_input_held). */
 extern volatile long xbox_input_held;          /* src/input/xinput_device.c */
 
-enum { ROW_SCALE, ROW_LIMIT, ROW_VSYNC, ROW_FILTER, ROW_COUNTER, ROW_BOOT, ROWS };
+enum { ROW_SCALE, ROW_ASPECT, ROW_LIMIT,ROW_VSYNC, ROW_FILTER, ROW_COUNTER, ROW_BOOT, ROWS };
 
 static struct {
     int open, row;
@@ -1914,7 +1960,7 @@ static struct {
     LONGLONG fps_t0;
     uint32_t fps_n;
     double fps;
-    uint32_t game_w, game_h;    /* the shown surface, in guest pixels */
+    uint32_t game_pw, game_ph;  /* the shown surface, in its own pixels */
     /* the text bitmap */
     HDC dc;
     HBITMAP bmp;
@@ -1941,10 +1987,15 @@ static void ui_change(int row, int dir)
     int i;
     switch (row) {
     case ROW_SCALE:
-        s_cfg.scale += dir;
-        if (s_cfg.scale < 1) s_cfg.scale = 4;
-        if (s_cfg.scale > 4) s_cfg.scale = 1;
-        s_scale = (uint32_t)s_cfg.scale;        /* targets remake themselves as they are drawn */
+        for (i = 0; i < NHEIGHTS && s_heights[i] != s_cfg.height; i++)
+            ;
+        i = i == NHEIGHTS ? 0 : (i + dir + NHEIGHTS) % NHEIGHTS;
+        s_cfg.height = s_heights[i];
+        res_apply();                            /* targets remake themselves as they are drawn */
+        break;
+    case ROW_ASPECT:
+        s_cfg.wide = !s_cfg.wide;
+        res_apply();
         break;
     case ROW_LIMIT:
         for (i = 0; i < NLIMITS && s_limits[i] != s_cfg.limit; i++)
@@ -1967,9 +2018,9 @@ static void ui_change(int row, int dir)
         break;
     }
     settings_save();
-    fprintf(stderr, "[D3D11] settings: %dx internal resolution, frame limit %d, vsync %s, %s filter, counter %s\n",
-            s_cfg.scale, s_cfg.limit, s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear",
-            s_cfg.counter ? "on" : "off");
+    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter, counter %s\n",
+            res_width(s_cfg.height), s_cfg.height, s_cfg.wide ? "16:9" : "4:3", s_cfg.limit,
+            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_cfg.counter ? "on" : "off");
 }
 
 /* Keys while the window has the focus, and pad 0: F1 or Back+Start opens and
@@ -2139,7 +2190,8 @@ static void ui_draw(float x0, float y0)
         limit[sizeof limit - 1] = 0;
         _snprintf(text, sizeof text,
                   "Settings                      %4.0f fps\n"
-                  "Resolution    %dx  (%ux%u)\n"
+                  "Resolution    %dx%d%s\n"
+                  "Aspect        %s\n"
                   "Frame limit   %s\n"
                   "Vsync         %s\n"
                   "Scaling       %s\n"
@@ -2148,7 +2200,10 @@ static void ui_draw(float x0, float y0)
                   " \n"
                   "Up/Down choose, Left/Right change\n"
                   "F1, Esc or B closes",
-                  s_ui.fps, s_cfg.scale, s_ui.game_w * (UINT)s_cfg.scale, s_ui.game_h * (UINT)s_cfg.scale,
+                  s_ui.fps, s_ui.game_pw, s_ui.game_ph,
+                  s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
+                  : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",
+                  s_cfg.wide ? "16:9 (stretched)" : "4:3",
                   limit, onoff[s_cfg.vsync], sharp[s_cfg.point], onoff[s_cfg.counter],
                   s_cfg.boot ? "skip (from next start)" : "keep");
         hl = 1 + s_ui.row;
@@ -2249,10 +2304,13 @@ static void blit_present(Target *t)
     }
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back, black);
-    /* The largest 4:3 rectangle that fits, centred. */
-    k = (float)s_bw * 3.0f < (float)s_bh * 4.0f ? (float)s_bw / 4.0f : (float)s_bh / 3.0f;
-    vp.Width = 4.0f * k;
-    vp.Height = 3.0f * k;
+    /* The largest 4:3 (or 16:9) rectangle that fits, centred. */
+    {
+        float aw = s_cfg.wide ? 16.0f : 4.0f, ah = s_cfg.wide ? 9.0f : 3.0f;
+        k = (float)s_bw * ah < (float)s_bh * aw ? (float)s_bw / aw : (float)s_bh / ah;
+        vp.Width = aw * k;
+        vp.Height = ah * k;
+    }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
     vp.MinDepth = 0;
@@ -2267,8 +2325,8 @@ static void blit_present(Target *t)
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->srv);
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_samp);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
-    s_ui.game_w = t->w;
-    s_ui.game_h = t->h;
+    s_ui.game_pw = t->pw;
+    s_ui.game_ph = t->ph;
     ui_draw((float)(int)vp.TopLeftX, (float)(int)vp.TopLeftY);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
     ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
@@ -2364,7 +2422,7 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
             }
         }
     }
-    if (!s_staging || s_staging_w != t->w * t->sc || s_staging_h != t->h * t->sc) {
+    if (!s_staging || s_staging_w != t->pw || s_staging_h != t->ph) {
         D3D11_TEXTURE2D_DESC td;
         if (s_staging)
             ID3D11Texture2D_Release(s_staging);
@@ -2375,26 +2433,26 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
         td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_staging)))
             return;
-        s_staging_w = t->w * t->sc;
-        s_staging_h = t->h * t->sc;
+        s_staging_w = t->pw;
+        s_staging_h = t->ph;
     }
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)s_staging, (ID3D11Resource *)t->tex);
     if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_staging, 0, D3D11_MAP_READ, 0, &m)))
         return;
-    /* Above 1x, guest memory gets every sc-th pixel: dumps stay the guest's size. */
+    /* Above 1x, guest memory gets the nearest pixel: dumps stay the guest's size. */
     for (y = 0; y < t->h; y++) {
-        const uint8_t *src = (const uint8_t *)m.pData + (size_t)y * t->sc * m.RowPitch;
+        const uint8_t *src = (const uint8_t *)m.pData + (size_t)(y * t->ph / t->h) * m.RowPitch;
         uint8_t *dst = mem + va + (size_t)y * pitch;
-        if (t->bpp == 4 && t->sc == 1) {
+        if (t->bpp == 4 && t->pw == t->w) {
             memcpy(dst, src, (size_t)t->w * 4);
         } else if (t->bpp == 4) {
             uint32_t x;
             for (x = 0; x < t->w; x++)
-                ((uint32_t *)dst)[x] = ((const uint32_t *)src)[x * t->sc];
+                ((uint32_t *)dst)[x] = ((const uint32_t *)src)[x * t->pw / t->w];
         } else if (t->bpp == 2) {
             uint32_t x;
             for (x = 0; x < t->w; x++) {
-                uint32_t p = ((const uint32_t *)src)[x * t->sc];
+                uint32_t p = ((const uint32_t *)src)[x * t->pw / t->w];
                 ((uint16_t *)dst)[x] = (uint16_t)(((p >> 8) & 0xF800) | ((p >> 5) & 0x07E0)
                                                   | ((p >> 3) & 0x001F));
             }

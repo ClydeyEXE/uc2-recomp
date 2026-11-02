@@ -71,12 +71,13 @@ To play in a window, run `powershell -File tools/play.ps1`, which also sets `REC
 has focus: Enter is Start, Z is A, X is B, C is X, V is Y, arrows are the D-pad, WASD is the left stick and IJKL is the
 right stick. A connected XInput controller should also work.
 
-F1 (or Back and Start together on the pad) opens a settings panel over the game: internal resolution (1x to 4x the
-console's 640x480), a frame limit (off, 30, 60, 120, 144 or 240 fps), vsync, smooth or sharp scaling to the window, and
+F1 (or Back and Start together on the pad) opens a settings panel over the game: internal resolution (480 to 2160 lines:
+the console's 640x480, its multiples, and 720p, 1080p, 1440p and 4K heights), an aspect of 4:3 or 16:9 (stretched, as
+the game's camera is 4:3; at 2160 lines this renders 3840x2160), a frame limit (off, 30, 60, 120, 144 or 240 fps), vsync, smooth or sharp scaling to the window, and
 an FPS counter, and "Boot waits": skip, from the next start, the 9 s boot holds its first screens for (or
 `RECOMP_SKIP_BOOT_WAITS=1`). Up and down choose, left and right (or A, Enter) change, and F1, Esc or B close it. The game sees the
 pad at rest while it is open. Choices are kept in `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`. For one run,
-`play.ps1 -Scale 2 -Fps 60` (or `RECOMP_RES_SCALE`, `RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`,
+`play.ps1 -Scale 2 -Fps 60` (or `RECOMP_RES_SCALE`, `RECOMP_RES_HEIGHT=<lines>`, `RECOMP_WIDESCREEN=1`, `RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`,
 `RECOMP_PRESENT_FILTER=point`) override the file. F11 or Alt+Enter toggles borderless fullscreen.
 
 The runtime keeps save data in `%LOCALAPPDATA%\xboxrecomp`.
