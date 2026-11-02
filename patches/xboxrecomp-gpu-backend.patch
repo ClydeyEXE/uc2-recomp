@@ -908,3 +908,95 @@ index b723a92..7d1fcaa 100644
      return result;
  }
  
+diff --git a/src/video/fb_present.c b/src/video/fb_present.c
+index 3430107..af51eaf 100644
+--- a/src/video/fb_present.c
++++ b/src/video/fb_present.c
+@@ -47,6 +47,9 @@
+ extern ptrdiff_t xbox_GetMemoryOffset(void);
+ 
+ static volatile LONG s_fb_running;
++static HWND          s_fb_hwnd;
++/* xbox_FramebufferWindowClaim: 1 asked, 2 the window has let go. */
++static volatile LONG s_claim;
+ static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
+ static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
+ 
+@@ -158,7 +161,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+     LONG next;
+     uint32_t bpp, x, y;
+ 
+-    if (!s_fb_running || !fb_va || !pitch)
++    if (!s_fb_running || !fb_va || !pitch || s_claim == 2)
+         return;
+     if (getenv("RECOMP_FB_VA"))
+         return;                       /* pinned: leave the old path alone */
+@@ -222,6 +225,14 @@ void xbox_FramebufferWindowFrameStats(uint32_t draws)
+     InterlockedExchange(&s_frame_draws, (LONG)draws);
+ }
+ 
++void *xbox_FramebufferWindowClaim(void)
++{
++    if (!s_fb_running || !s_fb_hwnd || getenv("RECOMP_FB_VA"))
++        return NULL;
++    InterlockedCompareExchange(&s_claim, 1, 0);
++    return s_claim == 2 ? (void *)s_fb_hwnd : NULL;
++}
++
+ /* Alt+Enter / F11: borderless fullscreen on the window's monitor, and back.
+  * (DXGI's own Alt+Enter, exclusive mode at the frame's 640x480, is off --
+  * gpu_present.c; both presenters letterbox to any size.) */
+@@ -545,6 +556,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             s_fb_width, s_fb_height);
+     if (gpu_present_enabled())
+         gpu_present_init(hwnd, s_fb_width, s_fb_height);
++    s_fb_hwnd = hwnd;
+ 
+     while (InterlockedCompareExchange(&s_fb_running, 1, 1)) {
+         MSG msg;
+@@ -553,7 +565,17 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+             TranslateMessage(&msg);
+             DispatchMessageA(&msg);
+         }
+-        if (s_present_idx >= 0 && s_rgb) {
++        if (s_claim == 1) {
++            /* A renderer presents here now: no swap chain of ours on the
++             * window, and nothing more drawn into it from this thread. */
++            gpu_present_shutdown();
++            InterlockedExchange(&s_claim, 2);
++            fprintf(stderr, "  [FBWIN] the renderer presents to the window now\n");
++        }
++        if (s_claim == 2) {
++            /* Only messages and the title bar: wake on input at once rather
++             * than on a 16 ms sleep. */
++        } else if (s_present_idx >= 0 && s_rgb) {
+             /* A finished frame, published by the flip. Copied into s_rgb so
+              * the dump path and GDI see one consistent image even if the
+              * next flip lands mid-blit. */
+@@ -612,7 +634,9 @@ static DWORD WINAPI fb_thread(LPVOID unused)
+                 t0 = now; f0 = f;
+             }
+         }
+-        if (!paced)
++        if (s_claim == 2)
++            MsgWaitForMultipleObjects(0, NULL, FALSE, 16, QS_ALLINPUT);
++        else if (!paced)
+             Sleep(16);                  /* D3D11's Present waited for vsync */
+     }
+ 
+diff --git a/src/video/video_player.h b/src/video/video_player.h
+index a5b912c..7327b25 100644
+--- a/src/video/video_player.h
++++ b/src/video/video_player.h
+@@ -67,6 +67,11 @@ int  xbox_FramebufferDumpBmp(const char *path);
+  * UTF-16 title (40 chars max); the stats come from each flip. */
+ void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
+ void xbox_FramebufferWindowFrameStats(uint32_t draws);
++/* For a renderer that presents to the window itself. The first call asks the
++ * window thread to give up its own presenting (gpu_present.c or GDI) and the
++ * per-flip copy of guest memory; once it has, this returns the window's HWND
++ * and the caller owns what is on screen. NULL until then, or with no window. */
++void *xbox_FramebufferWindowClaim(void);
+ 
+ #if !defined(_WIN32)
+ /* POSIX hosts: the framebuffer window needs the process main thread (AppKit

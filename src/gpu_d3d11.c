@@ -19,6 +19,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <intrin.h>
 #include <stdint.h>
@@ -265,7 +266,7 @@ static struct {
 /* ---- Frame times ---------------------------------------------------------- */
 /* One [FRAMES] line every 10 s: the spread of present-to-present times, and how
  * the walker thread (the one that calls present) spent them: D3D11 draw and clear
- * calls, the readback in d3d11_present, and its other CPU time (method decode,
+ * calls, d3d11_present (the blit and Present, or the readback), and its other CPU time (method decode,
  * vertex programs). What is left is the walker waiting for the game. A frame over
  * 100 ms gets a [HITCH] line of its own. */
 #define FT_MAX 8192
@@ -276,8 +277,8 @@ static struct {
     uint64_t tsc0;
     LONGLONG q0, last, report;
     ULONG64  cycles;                 /* the walker's cycle count at the last present */
-    double   d3d, readback;          /* this frame, ms */
-    double   sum, d3d_sum, rb_sum, cpu_sum;
+    double   d3d, present;          /* this frame, ms */
+    double   sum, d3d_sum, pr_sum, cpu_sum;
     uint32_t n, over25, over50;
     float    ms[FT_MAX];
 } s_ft;
@@ -318,31 +319,31 @@ static void ft_frame(void)
     if (s_ft.tsc_ms)
         cpu = (double)(cyc - s_ft.cycles) / s_ft.tsc_ms;
     if (dt > 100.0)
-        fprintf(stderr, "[HITCH] %.0f ms frame at %.1f s: walker cpu %.0f ms (d3d11 %.0f, readback %.0f)\n",
-                dt, (double)(now - s_ft.q0) / s_ft.qms / 1000.0, cpu, s_ft.d3d, s_ft.readback);
+        fprintf(stderr, "[HITCH] %.0f ms frame at %.1f s: walker cpu %.0f ms (d3d11 %.0f, present %.0f)\n",
+                dt, (double)(now - s_ft.q0) / s_ft.qms / 1000.0, cpu, s_ft.d3d, s_ft.present);
     if (s_ft.n < FT_MAX)
         s_ft.ms[s_ft.n++] = (float)dt;
     s_ft.over25 += dt > 25.0;
     s_ft.over50 += dt > 50.0;
     s_ft.sum += dt;
     s_ft.d3d_sum += s_ft.d3d;
-    s_ft.rb_sum += s_ft.readback;
+    s_ft.pr_sum += s_ft.present;
     s_ft.cpu_sum += cpu;
-    s_ft.d3d = s_ft.readback = 0.0;
+    s_ft.d3d = s_ft.present = 0.0;
     s_ft.last = now;
     s_ft.cycles = cyc;
 
     if (now - s_ft.report > (LONGLONG)(s_ft.qms * 10000.0) && s_ft.n) {
         uint32_t n = s_ft.n;
-        double busy = s_ft.cpu_sum - s_ft.d3d_sum - s_ft.rb_sum;
+        double busy = s_ft.cpu_sum - s_ft.d3d_sum - s_ft.pr_sum;
         qsort(s_ft.ms, n, sizeof s_ft.ms[0], ft_cmp);
         fprintf(stderr, "[FRAMES] %u in %.1f s (%.1f fps): ms p50 %.1f p90 %.1f p99 %.1f max %.1f, >25 ms %u, >50 ms %u"
-                        " | per frame: d3d11 %.2f, readback %.2f, other walker cpu %.2f, walker idle %.2f\n",
+                        " | per frame: d3d11 %.2f, present %.2f, other walker cpu %.2f, walker idle %.2f\n",
                 n, s_ft.sum / 1000.0, n * 1000.0 / s_ft.sum, s_ft.ms[n / 2], s_ft.ms[n * 9 / 10],
                 s_ft.ms[n * 99 / 100], s_ft.ms[n - 1], s_ft.over25, s_ft.over50,
-                s_ft.d3d_sum / n, s_ft.rb_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n);
+                s_ft.d3d_sum / n, s_ft.pr_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n);
         s_ft.n = s_ft.over25 = s_ft.over50 = 0;
-        s_ft.sum = s_ft.d3d_sum = s_ft.rb_sum = s_ft.cpu_sum = 0.0;
+        s_ft.sum = s_ft.d3d_sum = s_ft.pr_sum = s_ft.cpu_sum = 0.0;
         s_ft.report = now;
     }
 }
@@ -960,10 +961,10 @@ static ID3D11RasterizerState *raster_for(float slope)
 
 /* ---- Set-up -------------------------------------------------------------- */
 
-static ID3DBlob *compile(const char *entry, const char *target)
+static ID3DBlob *compile_from(const char *src, size_t len, const char *entry, const char *target)
 {
     ID3DBlob *code = NULL, *err = NULL;
-    HRESULT hr = D3DCompile(s_hlsl, sizeof s_hlsl - 1, "gpu_d3d11", NULL, NULL, entry, target,
+    HRESULT hr = D3DCompile(src, len, "gpu_d3d11", NULL, NULL, entry, target,
                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
     if (err) {
         if (FAILED(hr))
@@ -972,6 +973,11 @@ static ID3DBlob *compile(const char *entry, const char *target)
         ID3D10Blob_Release(err);
     }
     return SUCCEEDED(hr) ? code : NULL;
+}
+
+static ID3DBlob *compile(const char *entry, const char *target)
+{
+    return compile_from(s_hlsl, sizeof s_hlsl - 1, entry, target);
 }
 
 static ID3D11Buffer *make_buffer(UINT bytes, UINT bind)
@@ -1509,6 +1515,178 @@ static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t
         s_ft.d3d += (double)(ft_qpc() - t) / s_ft.qms;
 }
 
+/* ---- Presenting to the window ------------------------------------------------ */
+/* The finished frame goes from its render target straight to a swap chain on the
+ * game window, which fb_present.c hands over (xbox_FramebufferWindowClaim). It
+ * used to be copied back to guest memory, which waited for the GPU every frame
+ * (5-8 ms of a 22 ms frame in a match), then copied twice more and uploaded again
+ * by the window's own presenter. Guest memory now gets the frame only for frame
+ * dumps (RECOMP_FB_DUMP). RECOMP_D3D_READBACK=1 keeps the old way to the screen.
+ * Letterboxed to 4:3 at any window size; RECOMP_PRESENT_FILTER=point for sharp
+ * pixels, RECOMP_PRESENT_VSYNC=1 to wait for the display. */
+extern void *xbox_FramebufferWindowClaim(void);
+
+static const char s_blit_hlsl[] =
+    "Texture2D t : register(t0); SamplerState s : register(s0);\n"
+    "struct V { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
+    "V vs(uint i : SV_VertexID) { V o; float2 q = float2((i << 1) & 2, i & 2);\n"
+    "  o.uv = q; o.p = float4(q * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+    "float4 ps(V i) : SV_Target { return float4(t.Sample(s, i.uv).rgb, 1); }\n";
+
+static HWND                    s_hwnd;
+static IDXGISwapChain1        *s_chain;
+static ID3D11RenderTargetView *s_back;
+static ID3D11VertexShader     *s_vs_blit;
+static ID3D11PixelShader      *s_ps_blit;
+static ID3D11SamplerState     *s_blit_samp;
+static UINT                    s_bw, s_bh, s_vsync;
+static int                     s_failed_present;
+
+static void client_size(UINT *w, UINT *h)
+{
+    RECT r;
+    GetClientRect(s_hwnd, &r);
+    *w = r.right > r.left ? (UINT)(r.right - r.left) : 1;
+    *h = r.bottom > r.top ? (UINT)(r.bottom - r.top) : 1;
+}
+
+static int make_back(void)
+{
+    ID3D11Texture2D *b = NULL;
+    HRESULT hr = IDXGISwapChain1_GetBuffer(s_chain, 0, &IID_ID3D11Texture2D, (void **)&b);
+    if (FAILED(hr))
+        return 0;
+    hr = ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)b, NULL, &s_back);
+    ID3D11Texture2D_Release(b);
+    return SUCCEEDED(hr);
+}
+
+/* A flip-model swap chain on the window, and what the blit needs. 0 on failure,
+ * after which the window shows nothing: RECOMP_D3D_READBACK=1 is the way back. */
+static int blit_init(HWND hwnd)
+{
+    IDXGIDevice1 *dd = NULL;
+    IDXGIAdapter *ad = NULL;
+    IDXGIFactory2 *fac = NULL;
+    DXGI_SWAP_CHAIN_DESC1 sd;
+    D3D11_SAMPLER_DESC smp;
+    ID3DBlob *vb, *pb;
+    const char *f = getenv("RECOMP_PRESENT_FILTER"), *v = getenv("RECOMP_PRESENT_VSYNC");
+    HRESULT hr;
+    int ok;
+
+    s_hwnd = hwnd;
+    s_vsync = v && *v && *v != '0';
+    client_size(&s_bw, &s_bh);
+    hr = ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&dd);
+    if (SUCCEEDED(hr)) {
+        /* One frame queued, not three: the GPU's work is small, and a deeper
+         * queue is only input latency. */
+        IDXGIDevice1_SetMaximumFrameLatency(dd, 1);
+        hr = IDXGIDevice1_GetAdapter(dd, &ad);
+    }
+    if (SUCCEEDED(hr))
+        hr = IDXGIAdapter_GetParent(ad, &IID_IDXGIFactory2, (void **)&fac);
+    if (SUCCEEDED(hr)) {
+        ZeroMemory(&sd, sizeof sd);
+        sd.Width = s_bw;
+        sd.Height = s_bh;
+        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        sd.BufferCount = 2;
+        sd.Scaling = DXGI_SCALING_STRETCH;
+        sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_dev, hwnd, &sd, NULL, NULL, &s_chain);
+        /* Alt+Enter is the window's borderless fullscreen, not DXGI's exclusive mode. */
+        if (SUCCEEDED(hr))
+            IDXGIFactory2_MakeWindowAssociation(fac, hwnd, DXGI_MWA_NO_ALT_ENTER);
+    }
+    if (fac) IDXGIFactory2_Release(fac);
+    if (ad) IDXGIAdapter_Release(ad);
+    if (dd) IDXGIDevice1_Release(dd);
+    if (FAILED(hr)) {
+        fprintf(stderr, "[D3D11] no swap chain on the window (0x%08lX): set RECOMP_D3D_READBACK=1\n",
+                (unsigned long)hr);
+        return 0;
+    }
+    ZeroMemory(&smp, sizeof smp);
+    smp.Filter = f && (*f == 'p' || *f == 'P') ? D3D11_FILTER_MIN_MAG_MIP_POINT : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smp.MaxLOD = D3D11_FLOAT32_MAX;
+    vb = compile_from(s_blit_hlsl, sizeof s_blit_hlsl - 1, "vs", "vs_5_0");
+    pb = compile_from(s_blit_hlsl, sizeof s_blit_hlsl - 1, "ps", "ps_5_0");
+    ok = vb && pb && make_back()
+        && SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(vb),
+                                                     ID3D10Blob_GetBufferSize(vb), NULL, &s_vs_blit))
+        && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(pb),
+                                                    ID3D10Blob_GetBufferSize(pb), NULL, &s_ps_blit))
+        && SUCCEEDED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_samp));
+    if (vb) ID3D10Blob_Release(vb);
+    if (pb) ID3D10Blob_Release(pb);
+    if (!ok) {
+        fprintf(stderr, "[D3D11] present set-up failed: set RECOMP_D3D_READBACK=1\n");
+        IDXGISwapChain1_Release(s_chain);
+        s_chain = NULL;
+        return 0;
+    }
+    fprintf(stderr, "[D3D11] presenting to the window (%ux%u, vsync %s, %s filter)\n", s_bw, s_bh,
+            s_vsync ? "on" : "off", smp.Filter == D3D11_FILTER_MIN_MAG_MIP_POINT ? "point" : "linear");
+    return 1;
+}
+
+/* Draw the frame into the back buffer, letterboxed, and present it. The state it
+ * changes is put back or left for the next draw to set: d3d11_draw sets blend,
+ * depth, raster, scissor, shaders and samplers every time, and bind_targets binds
+ * the target again once s_cur_target is cleared. */
+static void blit_present(Target *t)
+{
+    static const float black[4] = {0, 0, 0, 1};
+    ID3D11ShaderResourceView *none = NULL;
+    D3D11_VIEWPORT vp;
+    UINT cw, ch;
+    float k;
+
+    client_size(&cw, &ch);
+    if (cw != s_bw || ch != s_bh) {
+        /* Resized, or fullscreen toggled: a back buffer the client area's size. */
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+        ID3D11RenderTargetView_Release(s_back);
+        s_back = NULL;
+        s_cur_target = NULL;
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0)) || !make_back())
+            return;
+        s_bw = cw;
+        s_bh = ch;
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back, NULL);
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back, black);
+    /* The largest 4:3 rectangle that fits, centred. */
+    k = (float)s_bw * 3.0f < (float)s_bh * 4.0f ? (float)s_bw / 4.0f : (float)s_bh / 3.0f;
+    vp.Width = 4.0f * k;
+    vp.Height = 3.0f * k;
+    vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
+    vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;
+    vp.MinDepth = 0;
+    vp.MaxDepth = 1;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, NULL);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFFu);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, NULL, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs_blit, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_blit, NULL, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &t->srv);
+    ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1, &s_blit_samp);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &none);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
+    s_cur_target = NULL;
+    s_cur_zeta = NULL;
+    IDXGISwapChain1_Present(s_chain, s_vsync, 0);
+}
+
 /* The frame is finished: copy it to guest memory, where the window and the frame
  * dumps read it from. */
 static void d3d11_present(uint32_t va, uint32_t pitch)
@@ -1563,6 +1741,26 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
             t = &s_targets[i];
     if (!t)
         return;
+    {
+        static int direct = -1, dumps;
+        if (direct < 0) {
+            const char *e = getenv("RECOMP_D3D_READBACK");
+            direct = !(e && *e && *e != '0');
+            dumps = getenv("RECOMP_FB_DUMP") != NULL;
+        }
+        if (direct && !s_failed_present) {
+            void *hwnd = s_chain ? (void *)s_hwnd : xbox_FramebufferWindowClaim();
+            if (hwnd && !s_chain && !blit_init((HWND)hwnd))
+                s_failed_present = 1;
+            if (s_chain) {
+                blit_present(t);
+                if (!dumps) {
+                    s_ft.present += (double)(ft_qpc() - t0) / s_ft.qms;
+                    return;
+                }
+            }
+        }
+    }
     if (!s_staging || s_staging_w != t->w || s_staging_h != t->h) {
         D3D11_TEXTURE2D_DESC td;
         if (s_staging)
@@ -1595,7 +1793,7 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
         }
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
-    s_ft.readback += (double)(ft_qpc() - t0) / s_ft.qms;
+    s_ft.present += (double)(ft_qpc() - t0) / s_ft.qms;
 }
 
 void gpu_d3d11_register(void)
