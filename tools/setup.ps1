@@ -98,8 +98,9 @@ if (-not $missing) {
     Write-Host "nothing to install"
 } else {
     if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
-        Fail ("winget is not available to install $($missing -join ', '). Install them yourself (links in " +
-              "README.md), or get winget as 'App Installer' from the Microsoft Store")
+        Fail ("winget is not available to install $($missing -join ', '). Get winget as 'App Installer' from the " +
+              "Microsoft Store, or install them yourself: https://git-scm.com, https://www.python.org, and " +
+              "https://visualstudio.microsoft.com/downloads/ (Build Tools, with the C++ workload)")
     }
     if (-not (Ask "Install $($missing -join ', ') with winget now? Windows will ask for permission")) {
         Fail "these are needed: $($missing -join ', ')"
@@ -196,8 +197,11 @@ if ((Test-Path (Join-Path $gen "recomp_funcs.h")) -and -not $Regenerate) {
     New-Item -ItemType Directory -Force (Join-Path $repo "build"), $gen | Out-Null
     $eh = Join-Path $repo "build\functions_eh.json"
     Push-Location $toolkit
-    Run $py -m tools.xbe_parser $xbe --json (Join-Path $assets "default_analysis.json")
-    Run $py -m tools.disasm $xbe --text-only --force -v --extra-sections XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP
+    # The parser prints the certificate's keys, so its output goes to a file rather than a window people paste
+    # into issues.
+    & $py -m tools.xbe_parser $xbe --json (Join-Path $assets "default_analysis.json") > (Join-Path $repo "build\xbe_parser.log")
+    if ($LASTEXITCODE) { Fail "the XBE parser failed; its output is in build\xbe_parser.log" }
+    Run $py -m tools.disasm $xbe --text-only --force -v --extra-sections "XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP"
     Run $py -m tools.func_id $xbe -v
     Run $py -m tools.abi_analysis $xbe -v
     Run $py -I (Join-Path $PSScriptRoot "add_eh_entries.py") tools\disasm\output\functions.json $eh

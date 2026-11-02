@@ -1,8 +1,8 @@
 # Unreal Championship 2 recompilation
 
 Open work is in GitHub Issues: start with the pinned Roadmap issue (`gh issue list`, `gh issue view <n>`) for order and
-evidence. `README.md` covers setup and status, `docs/DEVELOPING.md` the debugging tools, and `docs/HISTORY.md` records
-past bugs and their fixes.
+evidence. `README.md` is for players. `docs/BUILDING.md` covers the build by hand and run-time settings,
+`docs/DEVELOPING.md` the debugging tools, and `docs/HISTORY.md` past bugs and their fixes.
 
 Issues are public: put symptoms, addresses and measurements in them, never disassembly or game-derived dumps. When work
 fixes an issue, say `Fixes #<n>` in the commit, and add new findings to the issue rather than to a file.
@@ -21,7 +21,7 @@ fixes an issue, say `Fixes #<n>` in the commit, and add new findings to the issu
 - Commit locally without asking, on `main`. Ask before pushing.
 - Don't build or run tests while the owner is playing: they lock the exe and open a window.
 - Adding or removing a hook, wrapper or hand-written function in `src/recomp_manual.c` means rerunning `tools.recomp` with
-  the README's flags, then a rebuild. Allow about 10 minutes.
+  the flags in `docs/BUILDING.md` (or `tools/setup.ps1 -Regenerate`), then a rebuild. Allow about 10 minutes.
 - `third_party/xboxrecomp` is pinned at f0f8a46 and shows as modified because `patches/` are applied in its working tree.
   After editing it, regenerate the patch.
 
