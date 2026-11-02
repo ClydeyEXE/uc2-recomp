@@ -86,3 +86,15 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     the guest and writing back the registers the original leaves. A harness running both bodies on 5000 random
     macroblocks (including saturating inputs and non-standard constants) matched every output byte and register, and
     it is about 12x faster (17.0 to 1.45 us a macroblock). A cutscene then held 157-159 fps with no underruns.
+18. **Boot movies stalled now and then.** In about one boot in five the logo movie froze for up to a second at a time,
+    `[IRQ] wait ... gate holder has reached no safe point` lines appeared and audio underran. The holder was the timer
+    thread inside D3D's GPU interrupt DPC (`sub_0038CFA0`), which writes the vblank ack to PCRTC_INTR_0 and spins until
+    PMC_INTR_0's PCRTC bit drops. The suspected cycle (a vblank posted to the DPC with `tick_busy` up) was wrong: logged
+    while it spun, PMC_INTR_EN_0 was 0, `tick_busy` 0 and the ack written, but the vblank-ack thread that takes it was
+    not running. Its stack showed it inside `SwitchToThread`, from the watch's first 2 ms. That call yields only to a
+    thread ready on the same processor, and that was the timer thread, just woken to run the DPC: the watch handed it
+    its core and queued behind the spin for 60-600 ms. The watch now spins on a pause for those 2 ms, which cost no more
+    CPU (the yield returned at once whenever nothing else was ready). That alone left 1 boot in 15 with a 340 ms ack, the
+    thread woken from its 1 ms wait into the same queue, so the thread also runs time-critical; it works for
+    microseconds a vblank. With both, 15 boots in a row had no `[IRQ] wait`, no underruns, vblank gaps of 12-21 ms and
+    no ack later than 7 ms, against gaps of up to 686 ms before.

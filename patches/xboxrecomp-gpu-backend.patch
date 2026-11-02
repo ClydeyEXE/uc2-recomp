@@ -154,11 +154,88 @@ index 5975014..aa7755f 100644
  DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
  {
      XINPUT_VIBRATION xi_vib;
+diff --git a/src/kernel/kernel.h b/src/kernel/kernel.h
+index 4a6389d..824ff70 100644
+--- a/src/kernel/kernel.h
++++ b/src/kernel/kernel.h
+@@ -1284,7 +1284,7 @@ int xbox_VblankMode(const char *env, int paced_wanted);
+ 
+ /* One vblank's acknowledgement (kernel_bridge.c, the vblank-ack thread):
+  * waits for the DPC's write of the PCRTC_INTR_0 vblank bit and clears it and
+- * PMC_INTR_0's PCRTC bit. Yields for 2 ms, then waits on `rearm` in 1 ms
++ * PMC_INTR_0's PCRTC bit. Spins for 2 ms, then waits on `rearm` in 1 ms
+  * steps, and past a second in 16 ms ones, for as long as the PMC bit is up.
+  * While *tick_busy is set the PCRTC bit is a vblank being raised, not an
+  * ack, and is left. late_ms is how late a late ack came. Not static so
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
-index 5c9056a..f6a7a14 100644
+index 5c9056a..7276715 100644
 --- a/src/kernel/kernel_bridge.c
 +++ b/src/kernel/kernel_bridge.c
-@@ -4751,7 +4751,10 @@ static void bridge_NtReadFile(void)
+@@ -2851,7 +2851,7 @@ static long long kernel_clock_ms(void)
+  * pass came round. With a heavy push buffer a pass is hundreds of
+  * milliseconds: the D3D vblank DPC then held the timer thread for a quarter
+  * of the time, vblanks slowed to 45 Hz and audio streaming starved. So after
+- * the first 2 ms of yielding the watch goes on at 1 ms waits, and past a
++ * the first 2 ms the watch goes on at 1 ms waits, and past a
+  * second at 16 ms ones, for as long as PMC_INTR_0's PCRTC bit is up: until
+  * the ack comes, the next vblank re-arms it, or the bit goes down some other
+  * way (the nv2a-ack backstop, xbox_VblankAckHeld).
+@@ -2860,9 +2860,31 @@ static long long kernel_clock_ms(void)
+  * return (tick_busy), PCRTC_INTR_0's bit is the new vblank, not an ack:
+  * taking it then would ack the vblank before the ISR saw it. The bits are
+  * changed with interlocked operations, since the guest and the nv2a-ack
+- * thread write the same words. */
++ * thread write the same words.
++ *
++ * The first 2 ms spin on a pause and never yield. They used to
++ * SwitchToThread, which yields only to a thread ready on this processor,
++ * and that was often the timer thread, just woken to run the D3D DPC: the
++ * watch gave it its core, the DPC acked and spun waiting for the watch, and
++ * the watch sat in that processor's ready queue behind it, untaken, for
++ * 60-600 ms at a time. In one boot in five the logo movie froze, the gate's
++ * interrupts waited out RECOMP_IRQ_SAFE_MS, and audio underran. A spin costs
++ * what the yield did, which returned at once whenever nothing else was
++ * ready here. The thread also runs time-critical (kernel_vblank_ack_init),
++ * so the 1 ms waits after the spin wake into a running thread too. */
+ enum { VBL_ACK_FAST_MS = 2, VBL_ACK_LATE_MS = 1000, VBL_ACK_SLOW_STEP_MS = 16 };
+ 
++static void vbl_ack_pause(void)
++{
++#if defined(_WIN32)
++    YieldProcessor();
++#elif defined(__x86_64__) || defined(__i386__)
++    __builtin_ia32_pause();
++#elif defined(__aarch64__)
++    __asm__ __volatile__("yield");
++#endif
++}
++
+ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_intr,
+                        volatile LONG *tick_busy, HANDLE rearm, long *late_ms)
+ {
+@@ -2885,7 +2907,7 @@ int xbox_VblankAckWait(volatile uint32_t *pcrtc_intr, volatile uint32_t *pmc_int
+         if (!*tick_busy && !(*pmc_intr & NV2A_PMC_INTR_PCRTC))
+             return XBOX_VBL_ACK_NONE;   /* nobody is waiting on it */
+         if (now - start <= VBL_ACK_FAST_MS) {
+-            SwitchToThread();
++            vbl_ack_pause();
+             now = kernel_clock_ms();
+             continue;
+         }
+@@ -2986,6 +3008,12 @@ static BOOL CALLBACK kernel_vblank_ack_init(PINIT_ONCE o, PVOID p, PVOID *c)
+         g_vbl_ack_event = NULL;
+         return FALSE;
+     }
++    /* Above everything it could wait behind: the DPC it serves spins on the
++     * timer thread until it runs. At normal priority it once woke from its
++     * 1 ms wait into a ready queue behind that spin, with idle processors
++     * parked, and the ack came 340 ms late. It works for microseconds a
++     * vblank and spins for at most VBL_ACK_FAST_MS. */
++    SetThreadPriority(t, THREAD_PRIORITY_TIME_CRITICAL);
+     CloseHandle(t);
+     InterlockedExchange(&g_vbl_ack_owned, 1);
+     return TRUE;
+@@ -4751,7 +4779,10 @@ static void bridge_NtReadFile(void)
      /* What a read actually delivered. A decoder that rejects its input cannot
       * say whether the bytes were wrong or the read was, and the two look
       * identical from inside the title -- the first bytes settle it. */
