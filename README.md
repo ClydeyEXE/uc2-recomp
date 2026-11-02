@@ -25,8 +25,27 @@ play; the rest of Story Mode, and the DLC, are untested.
 Open work is in [Issues](https://github.com/ClydeyEXE/ucc2-recomp/issues), in the order of the pinned Roadmap issue.
 `docs/DEVELOPING.md` covers debugging tools, and `docs/HISTORY.md` records past bugs and their fixes.
 
-## Setup
-Requires CMake, Ninja, Python 3.12, and MSVC (VS 2022 Build Tools, C++ workload).
+## Quick start
+You need Windows, about 5 GB free besides the disc image, and:
+- [Git](https://git-scm.com)
+- [Python 3.12](https://www.python.org), with "Add to PATH" ticked
+- [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/downloads/) (or any VS 2022 edition) with the
+  "Desktop development with C++" workload, which includes CMake and Ninja
+- A disc image (`.iso`) of your own copy of the game
+
+Then, in PowerShell:
+
+    git clone --recursive https://github.com/ClydeyEXE/ucc2-recomp.git
+    cd ucc2-recomp
+    powershell -File tools/setup.ps1 -Iso <path to your .iso>
+    powershell -File tools/play.ps1
+
+`setup.ps1` checks the prerequisites, applies the toolkit patches, installs Python packages into `build\venv`,
+extracts and verifies the game, recompiles it and builds it. It takes about 15-30 minutes, most of it the
+disassembler and the C build. If a step fails, fix what it says and run it again: finished steps are skipped.
+
+## Setup by hand
+These are the steps `setup.ps1` runs.
 
     git submodule update --init
     python -m pip install -r requirements.txt
@@ -58,10 +77,10 @@ Then run these from the same folder, with $XBE the absolute path to `assets/defa
 From a Developer prompt (vcvars64), at the repo root:
 
     cmake -S . -B build/game -G Ninja -DCMAKE_BUILD_TYPE=Release
-    cmake --build build/game -j 12
+    cmake --build build/game
 
-`tools/build.cmd` does the same from any shell. Rerun `tools.recomp` first after adding or removing a hand-written
-function in `src/recomp_manual.c`.
+`tools/build.cmd` does the same from any shell. Rerun `tools.recomp` first (or `setup.ps1 -Regenerate`) after adding
+or removing a hand-written function in `src/recomp_manual.c`.
 
 To play, use `tools/play.ps1` below, which sets everything. To run by hand, from the repo root because paths are
 relative, these settings are required:
