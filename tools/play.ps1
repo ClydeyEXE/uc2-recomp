@@ -2,8 +2,9 @@
 #
 #   powershell -File tools/play.ps1
 #
-# -Software uses the old CPU rasteriser instead. The log goes to play_log.txt in the repo root.
-param([switch]$Software, [switch]$DrawLog)
+# -Software uses the old CPU rasteriser instead, and -Limit60 holds flips to the 60 Hz vblank
+# (RECOMP_FLIP_PACING). The log goes to play_log.txt in the repo root.
+param([switch]$Software, [switch]$DrawLog, [switch]$Limit60)
 Set-Location (Split-Path -Parent $PSScriptRoot)
 # -DrawLog logs every draw of one frame a second to the log, for finding out what drew something.
 if ($DrawLog) {
@@ -18,7 +19,7 @@ $env:RECOMP_PB_WALK = "dma"
 $env:RECOMP_GUEST_CPUS = "2"
 $env:RECOMP_HEAP_RECLAIM = "1"
 $env:RECOMP_DISPATCH_GATE = "1"
-$env:RECOMP_FLIP_PACING = "1"
+if ($Limit60) { $env:RECOMP_FLIP_PACING = "1" } else { Remove-Item env:RECOMP_FLIP_PACING -ErrorAction SilentlyContinue }
 $env:RECOMP_FB_WINDOW = "1"
 $env:RECOMP_USB = "1"
 $env:RECOMP_KEYBOARD = "1"

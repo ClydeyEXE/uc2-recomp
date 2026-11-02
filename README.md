@@ -57,9 +57,9 @@ relative, these settings are required:
 - `RECOMP_HEAP_RECLAIM=1`: reuses freed contiguous memory. Without it the arena runs out about two minutes into a match.
 - `RECOMP_DISPATCH_GATE=1`: keeps DPCs and raised-IRQL code apart, as on the single CPU. Without it USB races and crashes.
 
-`RECOMP_FLIP_PACING=1` holds each flip to the next vblank, so a match runs at no more than 60 fps; the scripts set
-it. Menus still reach about 140, down from 290. `edge` also makes a late frame wait for the vblank after, as D3D does, which
-turns a 50 fps stretch into 30.
+`RECOMP_FLIP_PACING=1` holds each flip to the next vblank, capping the rate near 60 fps. `run_match.ps1` sets it, and
+`play.ps1 -Limit60` does. It leaks: one GPU walk can carry several frames, and matches still reached 64-79 fps.
+`edge` also makes a late frame wait for the vblank after, as D3D does, which turns a 50 fps stretch into 30.
 
 `RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking. `RECOMP_USB=1` attaches an emulated pad, and
 `RECOMP_PAD_SCRIPT` drives it, for example `70000:start:500,100000:a:500` (time in ms, button, hold in ms).

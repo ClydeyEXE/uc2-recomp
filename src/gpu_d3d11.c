@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <intrin.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -260,6 +261,91 @@ static struct {
     uint64_t upload_bytes;
     DWORD    last;
 } s_stats;
+
+/* ---- Frame times ---------------------------------------------------------- */
+/* One [FRAMES] line every 10 s: the spread of present-to-present times, and how
+ * the walker thread (the one that calls present) spent them: D3D11 draw and clear
+ * calls, the readback in d3d11_present, and its other CPU time (method decode,
+ * vertex programs). What is left is the walker waiting for the game. A frame over
+ * 100 ms gets a [HITCH] line of its own. */
+#define FT_MAX 8192
+
+static struct {
+    double   qms;                    /* QPC ticks per ms */
+    double   tsc_ms;                 /* cycle counts per ms, measured against QPC */
+    uint64_t tsc0;
+    LONGLONG q0, last, report;
+    ULONG64  cycles;                 /* the walker's cycle count at the last present */
+    double   d3d, readback;          /* this frame, ms */
+    double   sum, d3d_sum, rb_sum, cpu_sum;
+    uint32_t n, over25, over50;
+    float    ms[FT_MAX];
+} s_ft;
+
+static LONGLONG ft_qpc(void)
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return q.QuadPart;
+}
+
+static int ft_cmp(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* At each present, before the readback: close the frame that just ended. */
+static void ft_frame(void)
+{
+    LONGLONG now = ft_qpc();
+    ULONG64 cyc = 0;
+    double dt, cpu = 0.0;
+
+    QueryThreadCycleTime(GetCurrentThread(), &cyc);
+    if (!s_ft.qms) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_ft.qms = (double)f.QuadPart / 1000.0;
+        s_ft.q0 = s_ft.last = s_ft.report = now;
+        s_ft.tsc0 = __rdtsc();
+        s_ft.cycles = cyc;
+        return;
+    }
+    if (!s_ft.tsc_ms && now - s_ft.q0 > (LONGLONG)(s_ft.qms * 1000.0))
+        s_ft.tsc_ms = (double)(__rdtsc() - s_ft.tsc0) / ((double)(now - s_ft.q0) / s_ft.qms);
+    dt = (double)(now - s_ft.last) / s_ft.qms;
+    if (s_ft.tsc_ms)
+        cpu = (double)(cyc - s_ft.cycles) / s_ft.tsc_ms;
+    if (dt > 100.0)
+        fprintf(stderr, "[HITCH] %.0f ms frame at %.1f s: walker cpu %.0f ms (d3d11 %.0f, readback %.0f)\n",
+                dt, (double)(now - s_ft.q0) / s_ft.qms / 1000.0, cpu, s_ft.d3d, s_ft.readback);
+    if (s_ft.n < FT_MAX)
+        s_ft.ms[s_ft.n++] = (float)dt;
+    s_ft.over25 += dt > 25.0;
+    s_ft.over50 += dt > 50.0;
+    s_ft.sum += dt;
+    s_ft.d3d_sum += s_ft.d3d;
+    s_ft.rb_sum += s_ft.readback;
+    s_ft.cpu_sum += cpu;
+    s_ft.d3d = s_ft.readback = 0.0;
+    s_ft.last = now;
+    s_ft.cycles = cyc;
+
+    if (now - s_ft.report > (LONGLONG)(s_ft.qms * 10000.0) && s_ft.n) {
+        uint32_t n = s_ft.n;
+        double busy = s_ft.cpu_sum - s_ft.d3d_sum - s_ft.rb_sum;
+        qsort(s_ft.ms, n, sizeof s_ft.ms[0], ft_cmp);
+        fprintf(stderr, "[FRAMES] %u in %.1f s (%.1f fps): ms p50 %.1f p90 %.1f p99 %.1f max %.1f, >25 ms %u, >50 ms %u"
+                        " | per frame: d3d11 %.2f, readback %.2f, other walker cpu %.2f, walker idle %.2f\n",
+                n, s_ft.sum / 1000.0, n * 1000.0 / s_ft.sum, s_ft.ms[n / 2], s_ft.ms[n * 9 / 10],
+                s_ft.ms[n * 99 / 100], s_ft.ms[n - 1], s_ft.over25, s_ft.over50,
+                s_ft.d3d_sum / n, s_ft.rb_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n);
+        s_ft.n = s_ft.over25 = s_ft.over50 = 0;
+        s_ft.sum = s_ft.d3d_sum = s_ft.rb_sum = s_ft.cpu_sum = 0.0;
+        s_ft.report = now;
+    }
+}
 
 /* ---- Render targets ------------------------------------------------------ */
 
@@ -1072,7 +1158,7 @@ static ID3D11ShaderResourceView *target_view(Target *t)
     return t->copy_srv;
 }
 
-static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
 {
     static DrawConstants c;
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
@@ -1319,8 +1405,16 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     s_stats.tris += b->count / 3;
 }
 
-static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t flags,
-                        uint32_t argb, uint32_t zstencil)
+static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    LONGLONG t = ft_qpc();
+    d3d11_draw_inner(s, b);
+    if (s_ft.qms)
+        s_ft.d3d += (double)(ft_qpc() - t) / s_ft.qms;
+}
+
+static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t flags,
+                              uint32_t argb, uint32_t zstencil)
 {
     Target *t;
     Zeta *z = NULL;
@@ -1406,6 +1500,15 @@ static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t
     }
 }
 
+static void d3d11_clear(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t flags,
+                        uint32_t argb, uint32_t zstencil)
+{
+    LONGLONG t = ft_qpc();
+    d3d11_clear_inner(s, r, flags, argb, zstencil);
+    if (s_ft.qms)
+        s_ft.d3d += (double)(ft_qpc() - t) / s_ft.qms;
+}
+
 /* The frame is finished: copy it to guest memory, where the window and the frame
  * dumps read it from. */
 static void d3d11_present(uint32_t va, uint32_t pitch)
@@ -1413,9 +1516,12 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
     D3D11_MAPPED_SUBRESOURCE m;
     Target *t = NULL;
+    LONGLONG t0;
     uint32_t y;
     int i;
 
+    ft_frame();
+    t0 = ft_qpc();
     s_flip++;
     s_stats.presents++;
     /* RECOMP_GPU_DRAWLOG=<flag file>: log every draw and clear of the frame that
@@ -1489,6 +1595,7 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
         }
     }
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_staging, 0);
+    s_ft.readback += (double)(ft_qpc() - t0) / s_ft.qms;
 }
 
 void gpu_d3d11_register(void)
