@@ -73,3 +73,9 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     vertex-program path dropped triangles for 1 byte a pixel, so the map stayed all zero and the projector darkened its
     whole frustum. Those triangles now reach the back end, and `gpu_d3d11.c` reads a target sampled as format `0x13` from
     blue, as luminance. `tools/play.ps1 -DrawLog` found this: it logs one frame's draws each second.
+16. **Black boxes on explosions.** Explosions draw sprites into a 320x240 distortion map (`0x801CD000`), then a full-screen
+    pass with stage program `0xA621` reads the scene through it: `DOT_PRODUCT` then `DOT_ST`, with an alpha test on the map.
+    The shader returned zero for those modes, so wherever a sprite had written alpha the pass drew black, blocky from the
+    low-resolution map. A colour grading pass (`0x2621`) uses the same pair and was losing about a quarter of its light.
+    The modes are implemented for stage 1 followed by stage 2. Blending can't darken here, so the clue was that hiding
+    additive draws removed the box: they fed the map.
