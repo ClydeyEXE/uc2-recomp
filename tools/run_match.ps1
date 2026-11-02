@@ -29,6 +29,7 @@ $settings = @{
     RECOMP_PB_WALK       = "dma"
     RECOMP_GUEST_CPUS    = "2"
     RECOMP_HEAP_RECLAIM  = "1"
+    RECOMP_DISPATCH_GATE = "1"
     RECOMP_USB           = "1"
     RECOMP_WATCHDOG_SECS = "$Secs"
     RECOMP_PB_REPORT_MS  = "15000"

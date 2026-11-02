@@ -1,3 +1,122 @@
+diff --git a/src/apu/apu_core.c b/src/apu/apu_core.c
+index 7746ae3..2469949 100644
+--- a/src/apu/apu_core.c
++++ b/src/apu/apu_core.c
+@@ -1122,6 +1122,9 @@ static void apu_irq_stats_line(void)
+     s_irq_next_ns = now + 5000000000ull;
+ }
+ 
++/* How long the frame thread produces nothing for a stopped sequencer. */
++#define SEQ_HOLD_US 50000
++
+ static void *mcpx_apu_frame_thread(void *arg)
+ {
+     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+@@ -1167,6 +1170,24 @@ static void *mcpx_apu_frame_thread(void *arg)
+ 
+         hs_trap(fe_trapped);
+ 
++        /* The title has stopped the sequencer for a moment (DirectSound does,
++         * around its SSL service routine and a DSP reset). As with a trap, no
++         * frame is produced meanwhile, as in xemu: the lightweight branch
++         * below would hand the device silent periods and the voices would
++         * resume where they stopped, a hole in the middle of the sound. Only
++         * for a moment, though: a sequencer left off is a title that wants no
++         * audio, and the device goes back to being fed silence. */
++        bool seq_held = false;
++        if (xcntmode == NV_PAPU_SECTL_XCNTMODE_OFF && !g_test_tone.active &&
++            !g_mixer_active_count) {
++            int64_t now_us = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
++            if (!d->seq_off_since_us)
++                d->seq_off_since_us = now_us;
++            seq_held = now_us - d->seq_off_since_us < SEQ_HOLD_US;
++        } else {
++            d->seq_off_since_us = 0;
++        }
++
+         if (apu_active && !g_test_tone.active) {
+             /* Full pipeline: VP voices → DSP → monitor → waveOut */
+             se_frame(d);
+@@ -1185,7 +1206,7 @@ static void *mcpx_apu_frame_thread(void *arg)
+              * zero in streamed music every few seconds). The interrupt is
+              * delivered below; the wait is after it. */
+             apu_irq_stats.fe_trapped_frames++;
+-        } else {
++        } else if (!seq_held) {
+             /* Lightweight: just monitor frame (test tone + software mixer) */
+             mcpx_apu_monitor_frame(d);
+             d->ep_frame_div++;
+@@ -1205,7 +1226,8 @@ static void *mcpx_apu_frame_thread(void *arg)
+         {
+             uint32_t sectl = qatomic_read(&d->regs[NV_PAPU_SECTL]);
+             uint32_t ssl = qatomic_read(&d->regs[NV_PAPU_SSL]);
+-            d->sample_count += NUM_SAMPLES_PER_FRAME;
++            if (!seq_held)
++                d->sample_count += NUM_SAMPLES_PER_FRAME;
+             if (ssl
+                     && d->sample_count >= ssl
+                     && (sectl & NV_PAPU_SECTL_XCNTMODE)
+@@ -1240,12 +1262,15 @@ static void *mcpx_apu_frame_thread(void *arg)
+         qemu_mutex_unlock(&d->lock);
+         SwitchToThread();
+         qemu_mutex_lock(&d->lock);
+-        if (fe_trapped &&
+-            (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+-             NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
++        if ((fe_trapped &&
++             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
++              NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) ||
++            (seq_held &&
++             !(qatomic_read(&d->regs[NV_PAPU_SECTL]) & NV_PAPU_SECTL_XCNTMODE))) {
+             /* Still trapped after the delivery (held off at raised IRQL, or
+-             * cleared from a DPC): give the title a millisecond with the lock
+-             * dropped rather than spinning on it. */
++             * cleared from a DPC), or the sequencer still stopped: give the
++             * title a millisecond with the lock dropped rather than spinning
++             * on it. */
+             qemu_cond_timedwait(&d->cond, &d->lock, 1);
+         }
+     }
+diff --git a/src/apu/apu_dsp.c b/src/apu/apu_dsp.c
+index bd36f2a..4ac79ef 100644
+--- a/src/apu/apu_dsp.c
++++ b/src/apu/apu_dsp.c
+@@ -61,6 +61,8 @@
+  * in the GP/EP; this exists so audio init stops blocking everything behind it.
+  */
+ #define APU_DSP_ACK_MAX 8
++#define EP_ALIVE_VA   0xFE85A018u
++#define EP_ALIVE_WORD 0x00CCCCCCu
+ #define GP_DOORBELL_OFFSET 0x810u
+ static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
+ static int s_dsp_ack_count = -1;
+@@ -163,6 +165,14 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
+         dsp_ack_init();
+     if (!d->ram_ptr)
+         return;
++    /* The EP's program leaves 0xCCCCCC at word 6 of its program memory.
++     * DirectSound, on every DoWork (sub_002F96C7 in UC2), tests for it at
++     * 0xFE85A018 and on anything else takes the DSP to have crashed and resets
++     * it. That memory is plain RAM here and no EP program runs, so the word
++     * stayed 0: about 50 resets a second, each one stopping the sequencer and
++     * stalling the calling thread for 10 ms. Half of all audio periods came
++     * out silent. Another acknowledgement, not a DSP. */
++    *(uint32_t *)(d->ram_ptr + EP_ALIVE_VA) = EP_ALIVE_WORD;
+     if (s_dsp_ack_auto) {
+         uint32_t *slot = dsp_ack_auto_slot(d);
+         if (slot && *slot) {
+diff --git a/src/apu/apu_state.h b/src/apu/apu_state.h
+index 7318675..6b2267b 100644
+--- a/src/apu/apu_state.h
++++ b/src/apu/apu_state.h
+@@ -501,6 +501,7 @@ struct MCPXAPUState {
+     int64_t next_frame_time_us;
+     int pace_q_seen;            /* device queue at the last pacing decision */
+     int64_t pace_drain_us;      /* when that queue last fell or sat below high */
++    int64_t seq_off_since_us;   /* when the sequencer was stopped, 0 while on */
+     bool pace_stalled;          /* device stopped consuming: host-clock pacing,
+                                  * periods dropped (mcpx_apu_pace_step) */
+ 
 diff --git a/src/kernel/kernel_bridge.c b/src/kernel/kernel_bridge.c
 index 5c9056a..f6a7a14 100644
 --- a/src/kernel/kernel_bridge.c

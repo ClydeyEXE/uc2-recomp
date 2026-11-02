@@ -55,11 +55,12 @@ relative, these settings are required:
 - `RECOMP_PB_WALK=dma`: reads the pushbuffer as the GPU does. D3D patches commands based on the read position it reports.
 - `RECOMP_GUEST_CPUS=2`: the game's threads share one core, as on the single-CPU console.
 - `RECOMP_HEAP_RECLAIM=1`: reuses freed contiguous memory. Without it the arena runs out about two minutes into a match.
+- `RECOMP_DISPATCH_GATE=1`: keeps DPCs and raised-IRQL code apart, as on the single CPU. Without it USB races and crashes.
 
 `RECOMP_FB_DUMP=<prefix>` writes frames to BMP files for checking. `RECOMP_USB=1` attaches an emulated pad, and
 `RECOMP_PAD_SCRIPT` drives it, for example `70000:start:500,100000:a:500` (time in ms, button, hold in ms).
 
-    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; $env:RECOMP_PB_WALK="dma"; $env:RECOMP_GUEST_CPUS="2"; $env:RECOMP_HEAP_RECLAIM="1"; $env:RECOMP_LOG="stderr.txt"; Start-Process build\game\ucc2_recomp.exe
+    $env:RECOMP_EXT_VMA="1"; $env:RECOMP_AC97_READY="1"; $env:RECOMP_PB_EXEC="1"; $env:RECOMP_VBLANK="paced"; $env:RECOMP_PB_WALK="dma"; $env:RECOMP_GUEST_CPUS="2"; $env:RECOMP_HEAP_RECLAIM="1"; $env:RECOMP_DISPATCH_GATE="1"; $env:RECOMP_LOG="stderr.txt"; Start-Process build\game\ucc2_recomp.exe
 
 To play in a window, run `powershell -File tools/play.ps1`, which also sets `RECOMP_HEAP_RECLAIM=1` and logs to
 `play_log.txt`. It draws on the GPU; add `-Software` for the old CPU rasteriser. Keys work while the window

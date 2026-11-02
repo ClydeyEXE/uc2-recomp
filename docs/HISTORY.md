@@ -53,3 +53,18 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
 12. **Arena exhausted.** Contiguous frees were ignored without `RECOMP_HEAP_RECLAIM`, so the arena ran out about two
     minutes into a match. Reusing blocks then crashed on pages the last owner had protected, so `xbox_ContiguousAllocEx`
     now resets their protection.
+13. **Crashes in XPP.** `sub_00399A84`, `sub_003998CA` and the others faulted on `0xFFFFFFFF`, reached through a transfer
+    descriptor that had been freed: `sub_00398505` sets a freed descriptor's link to that value. USB submits run on a game
+    thread at DISPATCH and completions in a DPC on the timer thread, with nothing keeping them apart, so the free list
+    and the queues raced. `RECOMP_DISPATCH_GATE=1` serializes them as the single CPU does. A scripted match crashed at
+    about 3.5 minutes without it, and did not crash in four runs of 400 s or in a longer soak with it. The stray
+    `[OHCI0] STALL: 21 09` before the owner's crash did not appear in any gated run, so it looks like a symptom of the
+    race, not a gap in `src/usb`.
+14. **Chopped audio and a 10 ms stall per update.** `sub_002F96C7`, on every DirectSound DoWork, tests `0xFE85A018`, word 6
+    of EP program memory, for `0xCCCCCC`, and otherwise takes the DSP to have crashed and resets it (`sub_002F9487`). No EP
+    program runs here, so the word stayed 0: about 50 resets a second, each stopping the sequencer (SECTL XCNTMODE off) and
+    stalling 10 ms. The frame thread filled that time with silent periods, so about half the output was digital zero, and
+    the voices resumed where they stopped. `mcpx_apu_dsp_ack_poll` now writes the word, and a stopped sequencer produces no
+    frames for up to 50 ms, as in xemu. In a 400 s capture, runs of zero with sound on both sides went from 17,020 to 3,
+    click candidates from 3,993 to 2, and resets to 0. Match frame rate rose from the 40s to about 60 at the same point.
+    The GP and EP memories are plain RAM (only `0xFE800000..0xFE830000` traps), so `mcpx_apu_mmio_*` never sees them.
