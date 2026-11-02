@@ -321,6 +321,201 @@ void sub_00266885(void)
     sub_00266885_gen();
 }
 
+/* ── XMV colour conversion ────────────────────────────────── */
+
+/*
+ * The movie player's YUV 4:2:0 to 32-bit BGRA converter for one 16x16
+ * macroblock, written in MMX and SSE. Lifted, it took half the guest core
+ * during Story Mode cutscenes: every MMX and XMM register is a thread-local
+ * global, every op goes lane by lane through memory, and frames that decoded
+ * overran 33 ms. This is the same instruction sequence in SSE2 intrinsics on
+ * locals, so it gives the same bits: the MMX registers live in the low halves
+ * of __m128i, and the packs pair their operands first because the 128-bit
+ * forms put the second operand's lanes in the upper half.
+ *
+ * The caller loads the constants into mm4-mm7 and xmm4-xmm7 once, so they are
+ * read from the guest registers here, and mm0-mm3 and xmm0-xmm3 are written
+ * back with what the original leaves in them.
+ *
+ * stdcall(y, u, v, y_stride, uv_stride, dst, dst_stride), ret 28.
+ */
+#include <emmintrin.h>
+
+extern __declspec(thread) uint32_t g_ecx, g_edx, g_ebp, g_seh_ebp;
+extern __declspec(thread) uint64_t g_mm0, g_mm1, g_mm2, g_mm3, g_mm4, g_mm5, g_mm6, g_mm7;
+extern __declspec(thread) float g_xmm0[4], g_xmm1[4], g_xmm2[4], g_xmm3[4];
+extern __declspec(thread) float g_xmm4[4], g_xmm5[4], g_xmm6[4], g_xmm7[4];
+
+#define MMX_LOAD(r)     _mm_loadl_epi64((const __m128i *)&(r))
+#define MMX_SAVE(r, v)  _mm_storel_epi64((__m128i *)&(r), (v))
+
+/* punpckhwd on 64-bit registers: words 2 and 3 of each, interleaved. */
+static __forceinline __m128i mmx_punpckhwd(__m128i a, __m128i b)
+{
+    return _mm_srli_si128(_mm_unpacklo_epi16(a, b), 8);
+}
+
+/* cvtpi2ps: two dwords into lanes 0 and 1, lanes 2 and 3 kept. */
+static __forceinline __m128 sse_cvtpi2ps(__m128 dst, __m128i src)
+{
+    return _mm_shuffle_ps(_mm_cvtepi32_ps(src), dst, _MM_SHUFFLE(3, 2, 1, 0));
+}
+
+/* cvtps2pi, psrad 15, packssdw zero, packuswb zero, punpcklbw zero,
+ * punpcklwd zero: two channel values as the low bytes of two dwords. */
+static __forceinline __m128i xmv_channel(__m128 v, __m128i z)
+{
+    __m128i r = _mm_srai_epi32(_mm_cvtps_epi32(v), 15);
+    r = _mm_packs_epi32(_mm_unpacklo_epi64(r, z), z);
+    r = _mm_packus_epi16(_mm_unpacklo_epi64(r, z), z);
+    r = _mm_unpacklo_epi8(r, z);
+    return _mm_unpacklo_epi16(r, z);
+}
+
+typedef struct XmvRegs {
+    __m128i mm0, mm1, mm2, mm4, mm5, mm7;
+    __m128 xmm0, xmm1, xmm2, xmm3, xmm4, xmm5, xmm6, xmm7;
+} XmvRegs;
+
+/* The routine at 0x002C6C86: four luma bytes in mm0 to four pixels in mm0:mm1. */
+static __forceinline void xmv_four_pixels(XmvRegs *r)
+{
+    __m128i m0, m1;
+
+    m0 = _mm_add_epi16(_mm_unpacklo_epi8(r->mm0, r->mm4), r->mm7);
+    m1 = _mm_shufflelo_epi16(m0, 250);
+    m0 = _mm_shufflelo_epi16(m0, 80);
+    m0 = _mm_madd_epi16(m0, r->mm5);
+    m1 = _mm_madd_epi16(m1, r->mm5);
+    r->xmm0 = sse_cvtpi2ps(r->xmm0, m0);
+    r->xmm3 = sse_cvtpi2ps(r->xmm3, m1);
+    r->xmm0 = _mm_shuffle_ps(r->xmm0, r->xmm3, 0x44);
+
+    r->xmm3 = _mm_add_ps(_mm_mul_ps(r->xmm1, r->xmm4), r->xmm0);
+    m0 = _mm_slli_epi32(r->mm7, 20);
+    r->mm2 = xmv_channel(r->xmm3, r->mm4);
+    m0 = _mm_or_si128(m0, r->mm2);
+    m1 = _mm_slli_epi32(r->mm7, 20);
+    r->xmm3 = _mm_shuffle_ps(r->xmm3, r->xmm3, 0x2E);
+    r->mm2 = xmv_channel(r->xmm3, r->mm4);
+    m1 = _mm_or_si128(m1, r->mm2);
+
+    r->xmm3 = _mm_add_ps(_mm_mul_ps(r->xmm2, r->xmm7), r->xmm0);
+    r->mm2 = _mm_slli_epi64(xmv_channel(r->xmm3, r->mm4), 16);
+    m0 = _mm_or_si128(m0, r->mm2);
+    r->xmm3 = _mm_shuffle_ps(r->xmm3, r->xmm3, 0x2E);
+    r->mm2 = _mm_slli_epi64(xmv_channel(r->xmm3, r->mm4), 16);
+    m1 = _mm_or_si128(m1, r->mm2);
+
+    r->xmm3 = _mm_mul_ps(r->xmm2, r->xmm5);
+    r->xmm0 = _mm_add_ps(r->xmm0, r->xmm3);
+    r->xmm3 = _mm_mul_ps(r->xmm1, r->xmm6);
+    r->xmm0 = _mm_add_ps(r->xmm0, r->xmm3);
+    r->mm2 = _mm_slli_epi64(xmv_channel(r->xmm0, r->mm4), 8);
+    m0 = _mm_or_si128(m0, r->mm2);
+    r->xmm0 = _mm_shuffle_ps(r->xmm0, r->xmm0, 0x2E);
+    r->mm2 = _mm_slli_epi64(xmv_channel(r->xmm0, r->mm4), 8);
+    m1 = _mm_or_si128(m1, r->mm2);
+
+    r->mm0 = m0;
+    r->mm1 = m1;
+}
+
+/* Two pixel rows from the four luma bytes at y and y + y_stride. */
+static __forceinline void xmv_two_rows(XmvRegs *r, char *mem, uint32_t y, uint32_t y_stride,
+                                       uint32_t dst, uint32_t dst_stride)
+{
+    r->mm0 = _mm_cvtsi32_si128(*(const int *)(mem + y));
+    xmv_four_pixels(r);
+    _mm_storel_epi64((__m128i *)(mem + dst), r->mm0);
+    _mm_storel_epi64((__m128i *)(mem + dst + 8), r->mm1);
+    r->mm0 = _mm_cvtsi32_si128(*(const int *)(mem + y + y_stride));
+    xmv_four_pixels(r);
+    _mm_storel_epi64((__m128i *)(mem + dst + dst_stride), r->mm0);
+    _mm_storel_epi64((__m128i *)(mem + dst + dst_stride + 8), r->mm1);
+}
+
+void sub_002C6B80(void)
+{
+    char *mem = (char *)g_xbox_mem_offset;
+    uint32_t sp = g_esp;
+    const uint32_t *arg = (const uint32_t *)(mem + sp + 4);
+    uint32_t y = arg[0], u = arg[1], v = arg[2], y_stride = arg[3], uv_stride = arg[4];
+    uint32_t dst = arg[5], dst_stride = arg[6];
+    __m128i mm3, mm6 = MMX_LOAD(g_mm6);
+    XmvRegs r;
+    uint32_t n;
+
+    r.mm4 = MMX_LOAD(g_mm4);
+    r.mm5 = MMX_LOAD(g_mm5);
+    r.mm7 = MMX_LOAD(g_mm7);
+    r.mm1 = MMX_LOAD(g_mm1);
+    r.mm2 = MMX_LOAD(g_mm2);
+    mm3 = MMX_LOAD(g_mm3);
+    r.xmm0 = _mm_loadu_ps(g_xmm0);
+    r.xmm1 = _mm_loadu_ps(g_xmm1);
+    r.xmm2 = _mm_loadu_ps(g_xmm2);
+    r.xmm3 = _mm_loadu_ps(g_xmm3);
+    r.xmm4 = _mm_loadu_ps(g_xmm4);
+    r.xmm5 = _mm_loadu_ps(g_xmm5);
+    r.xmm6 = _mm_loadu_ps(g_xmm6);
+    r.xmm7 = _mm_loadu_ps(g_xmm7);
+
+    for (n = 16; ; ) {
+        __m128i m0;
+
+        m0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)(mem + u)), r.mm4);
+        mm3 = m0;
+        m0 = _mm_add_epi32(_mm_unpacklo_epi16(m0, r.mm4), mm6);
+        r.xmm1 = sse_cvtpi2ps(r.xmm1, m0);
+        r.xmm1 = _mm_shuffle_ps(r.xmm1, r.xmm1, 0x50);
+        m0 = _mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int *)(mem + v)), r.mm4);
+        r.mm1 = m0;
+        m0 = _mm_add_epi32(_mm_unpacklo_epi16(m0, r.mm4), mm6);
+        r.xmm2 = sse_cvtpi2ps(r.xmm2, m0);
+        r.xmm2 = _mm_shuffle_ps(r.xmm2, r.xmm2, 0x50);
+        mm3 = mmx_punpckhwd(mm3, r.mm1);
+        xmv_two_rows(&r, mem, y, y_stride, dst, dst_stride);
+
+        m0 = _mm_add_epi32(_mm_srli_epi32(_mm_slli_epi32(mm3, 16), 16), mm6);
+        r.xmm1 = sse_cvtpi2ps(r.xmm1, m0);
+        r.xmm1 = _mm_shuffle_ps(r.xmm1, r.xmm1, 0x50);
+        mm3 = _mm_add_epi32(_mm_srli_epi32(mm3, 16), mm6);
+        r.xmm2 = sse_cvtpi2ps(r.xmm2, mm3);
+        r.xmm2 = _mm_shuffle_ps(r.xmm2, r.xmm2, 0x50);
+        xmv_two_rows(&r, mem, y + 4, y_stride, dst + 0x10, dst_stride);
+
+        if (--n == 0)
+            break;
+        if (n & 1) {
+            dst += 0x20;
+            y += 8;
+            u += 4;
+            v += 4;
+        } else {
+            dst += dst_stride * 2 - 32;
+            y += y_stride * 2 - 8;
+            u += uv_stride - 4;
+            v += uv_stride - 4;
+        }
+    }
+
+    MMX_SAVE(g_mm0, r.mm0);
+    MMX_SAVE(g_mm1, r.mm1);
+    MMX_SAVE(g_mm2, r.mm2);
+    MMX_SAVE(g_mm3, mm3);
+    _mm_storeu_ps(g_xmm0, r.xmm0);
+    _mm_storeu_ps(g_xmm1, r.xmm1);
+    _mm_storeu_ps(g_xmm2, r.xmm2);
+    _mm_storeu_ps(g_xmm3, r.xmm3);
+    g_eax = 0;
+    g_ecx = u;
+    g_edx = v;
+    g_ebp = sp - 4;           /* the original publishes its frame and leaves it */
+    g_seh_ebp = sp - 4;
+    g_esp = sp + 32;          /* ret 28 */
+}
+
 /* ── CRT x87 special cases─────────────────────────────────── */
 
 /*

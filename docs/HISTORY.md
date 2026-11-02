@@ -79,3 +79,10 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     low-resolution map. A colour grading pass (`0x2621`) uses the same pair and was losing about a quarter of its light.
     The modes are implemented for stage 1 followed by stage 2. Blending can't darken here, so the clue was that hiding
     additive draws removed the box: they fed the map.
+17. **Cutscenes hitched.** In Story Mode videos 1-8 frames a second took 25-80 ms and audio underran. The guest core
+    spent half its time in `sub_002C6B80`, the XMV player's YUV 4:2:0 to BGRA converter for a 16x16 macroblock, because
+    lifted MMX/SSE does every op lane by lane on thread-local register globals. It is now hand-written in
+    `recomp_manual.c` with SSE2 intrinsics on locals, instruction for instruction, reading mm4-mm7 and xmm4-xmm7 from
+    the guest and writing back the registers the original leaves. A harness running both bodies on 5000 random
+    macroblocks (including saturating inputs and non-standard constants) matched every output byte and register, and
+    it is about 12x faster (17.0 to 1.45 us a macroblock). A cutscene then held 157-159 fps with no underruns.
