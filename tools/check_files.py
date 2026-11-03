@@ -1,9 +1,9 @@
 """Refuses files that must never be committed. Usage: python -I tools/check_files.py --staged | --tracked
 
 --staged checks what is about to be committed (the pre-commit hook in .githooks/), --tracked every tracked file (CI).
-Blocked: anything under assets/, generated/, src/recomp/gen/ or build/; game, image and binary file types; files over
-5 MB; and, when assets/default.xbe is present, any file containing that XBE's certificate keys, in hex or raw. The
-keys themselves are never printed.
+Blocked: anything under assets/, generated/, src/recomp/gen/ or build/; game, image and binary file types; XBE tool
+output and logs; files over 5 MB; and, when assets/default.xbe is present, any file containing that XBE's
+certificate keys, in hex or raw. The keys themselves are never printed.
 """
 import os
 import re
@@ -16,6 +16,8 @@ BLOCKED_DIRS = re.compile(r"^(assets|generated|src/recomp/gen|build)/", re.I)
 BLOCKED_TYPES = re.compile(
     r"\.(iso|xiso|xbe|xpr|xwb|xmv|xsb|xvs|xap|u|ukx|uix|utx|usx|lin|spa|int|deu|fra|ita|ttf|bin"
     r"|bmp|png|jpe?g|gif|dds|tga|ppm|exe|dll|pdb|obj|lib)$", re.I)
+# Names the XBE tools write: their output is data dumped from the game, and logs can hold the keys.
+BLOCKED_NAMES = re.compile(r"(^|/)(default_analysis|functions\w*|kernel_imports|xbe)\.json$|\.log$", re.I)
 MAX_BYTES = 5 * 1024 * 1024
 
 
@@ -68,6 +70,9 @@ def main(argv):
             continue
         if BLOCKED_TYPES.search(name):
             bad.append((name, "is a game, image or binary file type"))
+            continue
+        if BLOCKED_NAMES.search(name):
+            bad.append((name, "is XBE tool output or a log"))
             continue
         content = git("cat-file", "blob", ":" + name)
         if len(content) > MAX_BYTES:

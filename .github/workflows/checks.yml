@@ -15,8 +15,8 @@ jobs:
       - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
 
-      # The same check as the pre-commit hook, over every tracked file. .gitignore and the hook keep these out
-      # locally, but not from `git commit --no-verify` or a pull request.
+      # The pre-commit hook's check, over every tracked file: it catches `git commit --no-verify` and pull requests.
+      # CI has no default.xbe, so the certificate key part of it only runs locally.
       - name: No game data, generated code or binaries
         run: python -I tools/check_files.py --tracked
 

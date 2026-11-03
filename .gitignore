@@ -40,3 +40,7 @@ play_log.txt
 
 # Personal agent notes for one machine
 CLAUDE.local.md
+
+# Scripted match logs (tools/run_match.ps1 -Log)
+run*.txt
+*.log

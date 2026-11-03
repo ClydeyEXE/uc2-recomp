@@ -40,6 +40,13 @@ function Run {
     & $exe @rest
     if ($LASTEXITCODE) { Fail "$(Split-Path -Leaf $exe) $rest exited with $LASTEXITCODE" }
 }
+# winget, or the installer it runs, exits 3010 or 1641 when the install worked but Windows must restart first.
+$script:restart = $false
+function Install {
+    & winget install @args
+    if ($LASTEXITCODE -eq 3010 -or $LASTEXITCODE -eq 1641) { $script:restart = $true }
+    elseif ($LASTEXITCODE) { Fail "winget install $args exited with $LASTEXITCODE" }
+}
 # Windows PowerShell turns a native command's stderr into an error under "Stop", so cmd swallows it.
 function Quiet([string]$line) { cmd /c "$line 2>nul" }
 function Refresh-Path {
@@ -106,13 +113,14 @@ if (-not $missing) {
         Fail "these are needed: $($missing -join ', ')"
     }
     $common = @("-e", "--accept-package-agreements", "--accept-source-agreements")
-    if (-not $hasGit) { Run winget install --id Git.Git --silent @common }
-    if (-not $basePy) { Run winget install --id Python.Python.3.12 --silent @common }
+    if (-not $hasGit) { Install --id Git.Git --silent @common }
+    if (-not $basePy) { Install --id Python.Python.3.12 --silent @common }
     if (-not $vs) {
         Write-Host "Visual Studio Build Tools take 10-20 minutes to install; its window shows progress"
-        Run winget install --id Microsoft.VisualStudio.2022.BuildTools @common --override `
+        Install --id Microsoft.VisualStudio.2022.BuildTools @common --override `
             "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.CMake.Project --includeRecommended"
     }
+    if ($script:restart) { Fail "the tools are installed, but Windows needs a restart. Restart, then run Setup.cmd again" }
     Refresh-Path
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) { Fail "Git still not found after installing it. Open a new window and run setup again" }
     $basePy = Find-Python
@@ -129,14 +137,14 @@ if (Test-Path (Join-Path $toolkit "tools\recomp")) {
     Push-Location $repo
     Run git submodule update --init
     Pop-Location
-}
-# In a git checkout, turn on the pre-commit hook that keeps game data and keys out of commits.
-if (Test-Path (Join-Path $repo ".git")) { Run git -C $repo config core.hooksPath .githooks } else {
+} else {
     # A zip of this repo has no submodule contents, so clone the pinned toolkit commit instead.
     if (Test-Path $toolkit) { Remove-Item -Recurse -Force $toolkit }
     Run git clone -q $toolkitUrl $toolkit
     Run git -C $toolkit checkout -q $toolkitPin
 }
+# In a git checkout, turn on the pre-commit hook that keeps game data and keys out of commits.
+if (Test-Path (Join-Path $repo ".git")) { Run git -C $repo config core.hooksPath .githooks }
 
 Step "Applying toolkit patches"
 Push-Location $toolkit
@@ -168,12 +176,13 @@ if (Test-Path $xbe) {
         if ($dlg.ShowDialog() -eq "OK") { $Iso = $dlg.FileName }
     }
     if (-not $Iso) { Fail "no game chosen. Run setup again and choose your .iso, or pass -Iso <path>" }
-    if (-not (Test-Path $Iso)) { Fail "$Iso does not exist" }
-    if (Test-Path $Iso -PathType Container) {
-        if (-not (Test-Path (Join-Path $Iso "default.xbe"))) { Fail "$Iso has no default.xbe. Choose the disc image or the folder it was extracted to" }
+    # -LiteralPath throughout: disc image names often have [brackets], which Test-Path reads as wildcards.
+    if (-not (Test-Path -LiteralPath $Iso)) { Fail "$Iso does not exist" }
+    if (Test-Path -LiteralPath $Iso -PathType Container) {
+        if (-not (Test-Path -LiteralPath (Join-Path $Iso "default.xbe"))) { Fail "$Iso has no default.xbe. Choose the disc image or the folder it was extracted to" }
         Write-Host "copying $Iso"
         New-Item -ItemType Directory -Force $assets | Out-Null
-        Copy-Item -Recurse -Force (Join-Path $Iso "*") $assets
+        Get-ChildItem -LiteralPath $Iso | Copy-Item -Destination $assets -Recurse -Force
     } else {
         Write-Host "extracting $Iso"
         & (Join-Path $PSScriptRoot "extract_xiso.ps1") -Iso $Iso -Out $assets | Select-Object -Last 1
@@ -215,7 +224,10 @@ if ((Test-Path (Join-Path $gen "recomp_funcs.h")) -and -not $Regenerate) {
 Step "Building (10-20 minutes the first time)"
 $log = Join-Path $repo "build\build.log"
 cmd /c "`"$(Join-Path $PSScriptRoot 'build.cmd')`""
-$exit = (Select-String -Path $log -Pattern "BUILD_EXIT=(\d+)" | Select-Object -Last 1).Matches.Groups[1].Value
+if (-not (Test-Path $log)) { Fail "the build did not start; run toolsuild.cmd by hand to see why" }
+# A failed build can report a negative code (BUILD_EXIT=-1).
+$m = Select-String -Path $log -Pattern "BUILD_EXIT=(-?\d+)" | Select-Object -Last 1
+$exit = if ($m) { $m.Matches[0].Groups[1].Value } else { "none" }
 if ($exit -ne "0" -or -not (Test-Path $exePath)) {
     Get-Content $log -Tail 20
     Fail "the build failed; the full log is build\build.log"

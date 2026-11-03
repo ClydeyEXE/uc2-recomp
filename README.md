@@ -26,7 +26,7 @@ What's being worked on, in order: the pinned **Roadmap** in [Issues](https://git
 
 **You need**
 - Windows 10 or 11
-- About 5 GB of free space
+- About 3 GB of free space, plus about 6 GB if setup needs to install the Visual Studio Build Tools
 - A disc image (`.iso`) of your own copy of the game
 
 ### 1. Download
