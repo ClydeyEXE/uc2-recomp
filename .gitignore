@@ -37,3 +37,6 @@ src/recomp/gen/
 xbox_kernel.log
 stderr.txt
 play_log.txt
+
+# Personal agent notes for one machine
+CLAUDE.local.md

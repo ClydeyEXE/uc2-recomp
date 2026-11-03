@@ -17,9 +17,10 @@ fixes an issue, say `Fixes #<n>` in the commit, and add new findings to the issu
 
 ## Rules
 - Never commit game data or anything derived from it: `assets/`, `src/recomp/gen/`, `build/`, screenshots, disassembly.
-- `assets/default_analysis.json` holds keys from the XBE certificate. Keep it in `assets/` and do not quote them.
-- Commit locally without asking, on `main`. Ask before pushing.
-- Don't build or run tests while the owner is playing: they lock the exe and open a window.
+  The pre-commit hook (`.githooks/`, turned on by setup) and CI run `tools/check_files.py` to enforce this.
+- The XBE certificate holds keys, and the toolkit's XBE parser prints them (setup sends that to
+  `build/xbe_parser.log`). Never quote them anywhere; the hook refuses any commit that contains them.
+- Don't build or run tests while the game is running: the build locks the exe, and tests open a window.
 - Adding or removing a hook, wrapper or hand-written function in `src/recomp_manual.c` means rerunning `tools.recomp` with
   the flags in `docs/BUILDING.md` (or `tools/setup.ps1 -Regenerate`), then a rebuild. Allow about 10 minutes.
 - `third_party/xboxrecomp` is pinned at f0f8a46 and shows as modified because `patches/` are applied in its working tree.
@@ -31,9 +32,4 @@ fixes an issue, say `Fixes #<n>` in the commit, and add new findings to the issu
 - Before naming a culprit from an address, check its section with `tools/dis.py sections`.
 - Run the game with a timeout. It can spin forever.
 
-## Machine quirks
-- New shells need a PATH refresh before Python, CMake and Ninja are found:
-  `$env:Path=[Environment]::GetEnvironmentVariable('Path','Machine')+';'+[Environment]::GetEnvironmentVariable('Path','User')`
-- Plain `git push` has no credentials. Use:
-  `git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main`
-- Pass `</dev/null` to long commands in Bash. A bare `cat >` with no input hangs until stopped.
+Personal and machine-specific notes go in `CLAUDE.local.md`, which is gitignored.

@@ -12,14 +12,18 @@ jobs:
       - uses: actions/checkout@v7
         with: { submodules: true }
 
-      # .gitignore keeps these out locally, but not from `git add -f` or a pull request.
-      - name: No game data or generated code
+      - uses: actions/setup-python@v7
+        with: { python-version: "3.12" }
+
+      # The same check as the pre-commit hook, over every tracked file. .gitignore and the hook keep these out
+      # locally, but not from `git commit --no-verify` or a pull request.
+      - name: No game data, generated code or binaries
+        run: python -I tools/check_files.py --tracked
+
+      - name: Setup's toolkit pin matches the submodule
         run: |
-          bad=$(git ls-files | grep -iE '^(assets|generated|src/recomp/gen|build)/|\.(iso|xiso|xbe|xpr|xwb|xmv|xsb|xvs|xap|u|ukx|uix|utx|usx|lin|spa|int|deu|fra|ita|ttf|bin|bmp)$' || true)
-          if [ -n "$bad" ]; then
-            echo "$bad" | sed 's|.*|::error file=&::game data or generated code must not be committed|'
-            exit 1
-          fi
+          sub=$(git ls-tree HEAD third_party/xboxrecomp | awk '{print $3}')
+          grep -q "toolkitPin = \"$sub\"" tools/setup.ps1 || { echo "::error file=tools/setup.ps1::\$toolkitPin is not the submodule's commit $sub"; exit 1; }
 
       # Every player's setup applies these to the pinned toolkit commit; a developer's tree already has them in.
       - name: Patches apply to the pinned toolkit
@@ -44,7 +48,5 @@ jobs:
           }
           exit $bad
 
-      - uses: actions/setup-python@v7
-        with: { python-version: "3.12" }
       - name: Python tools compile
         run: python -m compileall -q tools

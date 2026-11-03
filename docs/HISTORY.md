@@ -23,7 +23,7 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
 5. **Pad not seen.** `main.c` never called `xbox_OhciInit`, so `RECOMP_USB` did nothing.
 6. **Untranslated CRT x87 targets.** The table at `0x0040AAB8` has targets `0x002B7B7C` and `0x002B7C1E` that were
    never translated, because neighbouring functions started two bytes further in. Skipped calls left values on the
-   FPU stack. `recomp_lookup_manual` now supplies both. This did not fix the fatal screen, whatever commit 893e6d1 says.
+   FPU stack. `recomp_lookup_manual` now supplies both. This did not fix the fatal screen, whatever commit 26d677b says.
 7. **Fatal screen on Begin Match.** `RtlRaiseException` only logs and returns, so code ran on after every `throw`. Loading
    a match throws "Can't resolve package name" in normal use, and running past it ended in a garbage file name and
    `sub_00016784`'s dirty disc call. `src/recomp_manual.c` now replaces `_CxxThrowException` (`sub_002BA881`): it walks
@@ -58,7 +58,7 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     thread at DISPATCH and completions in a DPC on the timer thread, with nothing keeping them apart, so the free list
     and the queues raced. `RECOMP_DISPATCH_GATE=1` serializes them as the single CPU does. A scripted match crashed at
     about 3.5 minutes without it, and did not crash in four runs of 400 s or in a longer soak with it. The stray
-    `[OHCI0] STALL: 21 09` before the owner's crash did not appear in any gated run, so it looks like a symptom of the
+    `[OHCI0] STALL: 21 09` before the crash in a played match did not appear in any gated run, so it looks like a symptom of the
     race, not a gap in `src/usb`.
 14. **Chopped audio and a 10 ms stall per update.** `sub_002F96C7`, on every DirectSound DoWork, tests `0xFE85A018`, word 6
     of EP program memory, for `0xCCCCCC`, and otherwise takes the DSP to have crashed and resets it (`sub_002F9487`). No EP

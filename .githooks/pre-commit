@@ -1,0 +1,11 @@
+#!/bin/sh
+# Refuses commits of game data, generated code, big or binary files and certificate keys: see tools/check_files.py.
+# Turned on by tools/setup.ps1, or by hand with: git config core.hooksPath .githooks
+root=$(git rev-parse --show-toplevel)
+for py in "$root/build/venv/Scripts/python.exe" py python3 python; do
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "" >/dev/null 2>&1; then
+        exec "$py" -I "$root/tools/check_files.py" --staged
+    fi
+done
+echo "pre-commit: no Python found, so the file checks did not run" >&2
+exit 0

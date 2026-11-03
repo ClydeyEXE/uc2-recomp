@@ -129,7 +129,9 @@ if (Test-Path (Join-Path $toolkit "tools\recomp")) {
     Push-Location $repo
     Run git submodule update --init
     Pop-Location
-} else {
+}
+# In a git checkout, turn on the pre-commit hook that keeps game data and keys out of commits.
+if (Test-Path (Join-Path $repo ".git")) { Run git -C $repo config core.hooksPath .githooks } else {
     # A zip of this repo has no submodule contents, so clone the pinned toolkit commit instead.
     if (Test-Path $toolkit) { Remove-Item -Recurse -Force $toolkit }
     Run git clone -q $toolkitUrl $toolkit

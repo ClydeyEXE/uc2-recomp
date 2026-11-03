@@ -8,13 +8,17 @@ These are the steps `tools/setup.ps1` runs, by hand. Its options: `-Iso <file or
 `-NoShortcut`, `-Regenerate` (rerun the recompiler) and `-AllowOtherDump`.
 
 Requires Git, Python 3.12, and Visual Studio 2022 or its Build Tools with the C++ workload and "C++ CMake tools for
-Windows". `assets/` and `src/recomp/gen/` are gitignored. `assets/default_analysis.json` holds keys from the XBE
-certificate, so it stays there and its contents are never quoted.
+Windows". `assets/`, `build/` and `src/recomp/gen/` are gitignored. The XBE parser below prints the certificate's
+keys, so keep its output to yourself. Turn on the pre-commit hook that keeps game data and keys out of commits:
 
     git submodule update --init
-    python -m pip install -r requirements.txt
+    git config core.hooksPath .githooks
+    python -m venv build\venv
+    build\venv\Scripts\python -m pip install -r requirements.txt
     tools/extract_xiso.ps1 -Iso <path to iso> -Out assets
-    python -I tools/verify_setup.py assets
+    build\venv\Scripts\python -I tools/verify_setup.py assets
+
+The commands below say `python`: use `build\venv\Scripts\python`, or activate the venv first.
 
 ## Recompile
 Apply the local toolkit patches once, from `third_party/xboxrecomp`. The first makes the disassembler about 6x faster
@@ -29,6 +33,7 @@ Then run these from the same folder, with $XBE the absolute path to `assets/defa
 `--extra-sections`, 446 XDK call targets become stubs and boot crashes. The disassembler takes about 5 minutes.
 `--exclude-manual` makes the lifter use the hooks, wrappers and hand-written functions in `src/recomp_manual.c`, and
 `tools/add_eh_entries.py` adds the entry points its exception handling needs. Without them the game does not get far.
+Create `<repo>/build` and `<repo>/src/recomp/gen` first if they do not exist.
 
     python -m tools.xbe_parser $XBE --json <repo>/assets/default_analysis.json
     python -m tools.disasm $XBE --text-only --force -v --extra-sections "XMV,D3DX,DSOUND,XNET,XONLINE,WMADEC,XACTENG,XGRPH,D3D,XPP"

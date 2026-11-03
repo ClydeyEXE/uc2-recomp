@@ -78,7 +78,7 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`.
 
 ## Contributing
-Bug reports are welcome: include your GPU and the end of `play_log.txt`, but no game files. For working on the code,
+Bug reports are welcome: include your GPU and the end of `play_log.txt` (in the folder you unzipped to), but no game files. For working on the code,
 see [docs/BUILDING.md](docs/BUILDING.md) (the build by hand, run-time settings), [docs/DEVELOPING.md](docs/DEVELOPING.md)
 (debugging tools) and [docs/HISTORY.md](docs/HISTORY.md) (past bugs and their fixes).
 
@@ -87,6 +87,7 @@ Built on [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nz, which 
 runtime. xboxrecomp is MIT licensed and includes parts of [xemu](https://github.com/xemu-project/xemu) under
 LGPL-2.1-or-later (see its `NOTICE`).
 
-The code in this repository is MIT licensed (see [LICENSE](LICENSE)). The patches in `patches/` modify xboxrecomp and
+The code in this repository is MIT licensed (see [LICENSE](LICENSE)), except `docs/xboxkrnl.exe.def`, which is
+CC0-1.0, © 2017 Stefan Schmidt. The patches in `patches/` modify xboxrecomp and
 fall under its licenses: the hunks for its `src/apu/` files change xemu code and are LGPL-2.1-or-later, the rest MIT.
 Unreal Championship 2 and Unreal are trademarks of Epic Games; Xbox is a trademark of Microsoft.
