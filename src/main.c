@@ -315,7 +315,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
 
     printf("=== Unreal Championship 2 - Static Recompilation ===\n");
     /* First in the log, so a bug report says which build it came from. */
-    fprintf(stderr, "ucc2-recomp %s\n", UCC2_VERSION);
+    fprintf(stderr, "uc2-recomp %s\n", UCC2_VERSION);
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */

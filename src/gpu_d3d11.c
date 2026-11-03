@@ -2485,7 +2485,7 @@ static void ui_draw(float x0, float y0)
                   "Up/Down choose, Left/Right change\n"
                   "F1, Esc or B closes\n"
                   " \n"
-                  "ucc2-recomp %s",
+                  "uc2-recomp %s",
                   s_ui.fps, s_ui.game_pw, s_ui.game_ph,
                   s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
                   : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",

@@ -17,7 +17,7 @@ emulator.
 - A disc image (`.iso`) of your own copy of the game
 
 ### 1. Download
-Open the [latest release](https://github.com/ClydeyEXE/ucc2-recomp/releases/latest) and download **Source code
+Open the [latest release](https://github.com/ClydeyEXE/uc2-recomp/releases/latest) and download **Source code
 (zip)** under Assets. Unzip it somewhere with space, such as `C:\Games\ucc2`.
 
 ### 2. Set up
@@ -68,7 +68,7 @@ Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`. 
 version you're running.
 
 ## Contributing
-Bug reports are welcome: the [bug report form](https://github.com/ClydeyEXE/ucc2-recomp/issues/new?template=bug_report.yml)
+Bug reports are welcome: the [bug report form](https://github.com/ClydeyEXE/uc2-recomp/issues/new?template=bug_report.yml)
 asks for your version, your GPU and the end of `play_log.txt` (in the folder you unzipped to). Please attach no game files.
 Code contributions aren't taken; see [CONTRIBUTING.md](CONTRIBUTING.md). For working on the code yourself,
 see [docs/BUILDING.md](docs/BUILDING.md) (the build by hand, run-time settings), [docs/DEVELOPING.md](docs/DEVELOPING.md)
