@@ -9,19 +9,6 @@ emulator.
 > no game data and no code from the game: you need your own copy, and the build makes the game on your machine. The
 > program it makes contains the game's code, so don't share it, and don't ask for game files or builds in Issues.
 
-## Status
-**Playable.** Full Instant Action matches play start to finish with a controller or keyboard.
-
-| | |
-|---|---|
-| Frame rate | 60-130 fps in most of a match; busy scenes still drop to 35-48 |
-| Hitches | Occasional 100-160 ms pauses while the game loads files |
-| Audio | No dropouts; effects such as reverb are missing |
-| Story Mode | The first quarter plays through with no issues, cutscenes included; the rest is untested |
-| DLC | Not supported yet |
-
-What's being worked on, in order: the pinned **Roadmap** in [Issues](https://github.com/ClydeyEXE/ucc2-recomp/issues).
-
 ## Getting started
 
 **You need**
