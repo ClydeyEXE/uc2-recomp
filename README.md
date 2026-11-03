@@ -23,22 +23,59 @@ emulator.
 What's being worked on, in order: the pinned **Roadmap** in [Issues](https://github.com/ClydeyEXE/ucc2-recomp/issues).
 
 ## Getting started
-You need Windows 10 or 11, about 5 GB free, and a disc image (`.iso`) of your own copy of the game. The supported
-release has a `default.xbe` with SHA-1 `1f6e3417b6a912b5d3503593fd54d9b7a92c4bd0`; setup checks it for you.
 
-1. Download this repository (green **Code** button, **Download ZIP**) and unzip it somewhere with space.
-2. Double-click **`Setup.cmd`** and choose your `.iso`. It installs anything missing (Git, Python 3.12 and the Visual
-   Studio 2022 Build Tools, after asking), then unpacks, recompiles and builds the game. The first run takes about
-   30-60 minutes. If it stops, fix what it says and run it again: finished steps are skipped.
-3. Double-click **`Play.cmd`**, or the desktop shortcut setup offers to make.
+**You need**
+- Windows 10 or 11
+- About 5 GB of free space
+- A disc image (`.iso`) of your own copy of the game
+
+### 1. Download
+Click the green **Code** button above, then **Download ZIP**. Unzip it somewhere with space, such as `C:\Games\ucc2`.
+
+### 2. Set up
+Double-click **`Setup.cmd`**, then choose your `.iso` when it asks.
+
+- If Git, Python or the Visual Studio Build Tools are missing, it asks once, then installs them.
+- It then unpacks, checks, recompiles and builds the game.
+- The first run takes **30-60 minutes**. Leave the window open until it says **Done**.
+- If it stops with an error, fix what it says and run `Setup.cmd` again. It carries on where it stopped.
+
+### 3. Play
+Double-click **`Play.cmd`**, or use the desktop shortcut that setup offers to make.
 
 ## Playing
-A controller (XInput, such as an Xbox pad) works. On the keyboard: Enter is Start, Z/X/C/V are A/B/X/Y, the arrows are
-the D-pad, WASD the left stick and IJKL the right stick.
 
-**F1** (or Back + Start) opens a settings panel: internal resolution up to 4K, 4:3 or stretched 16:9, a frame limit,
-vsync, scaling, an FPS counter, and skipping the boot screens' fixed waits. **F11** or **Alt+Enter** toggles
-fullscreen. Settings and saves are kept in `%LOCALAPPDATA%\xboxrecomp`.
+> [!TIP]
+> Press **F1** in the game to open the **settings menu**: resolution, widescreen, frame limit and more.
+
+### Controls
+An Xbox controller, or any XInput controller, works as on the console. On the keyboard:
+
+| Controller | Keyboard |
+|---|---|
+| Start | Enter |
+| A / B / X / Y | Z / X / C / V |
+| D-pad | Arrow keys |
+| Left stick | W A S D |
+| Right stick | I J K L |
+
+**F11** or **Alt+Enter** switches between a window and fullscreen.
+
+### Settings menu
+Open it with **F1**, or **Back + Start** on a controller. The game pauses its input while the menu is open.
+
+| Setting | Choices |
+|---|---|
+| Resolution | 640x480 (the console's) up to 4K |
+| Aspect | 4:3, or 16:9 (stretched) |
+| Frame limit | Off, 30, 60, 120, 144 or 240 fps |
+| Vsync | On or off |
+| Scaling | Smooth or sharp |
+| FPS counter | On or off |
+| Boot waits | Skip the 9 seconds the startup screens hold for |
+
+**Up / Down** picks a setting, **Left / Right** (or A, Enter) changes it, and **F1**, **Esc** or **B** closes the menu.
+Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`.
 
 ## Contributing
 Bug reports are welcome: include your GPU and the end of `play_log.txt`, but no game files. For working on the code,
