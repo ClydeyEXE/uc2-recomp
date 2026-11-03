@@ -82,7 +82,8 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`.
 
 ## Contributing
-Bug reports are welcome: include your GPU and the end of `play_log.txt` (in the folder you unzipped to), but no game files. For working on the code,
+Bug reports are welcome: include your GPU and the end of `play_log.txt` (in the folder you unzipped to), but no game files.
+Code contributions aren't taken; see [CONTRIBUTING.md](CONTRIBUTING.md). For working on the code yourself,
 see [docs/BUILDING.md](docs/BUILDING.md) (the build by hand, run-time settings), [docs/DEVELOPING.md](docs/DEVELOPING.md)
 (debugging tools) and [docs/HISTORY.md](docs/HISTORY.md) (past bugs and their fixes).
 
