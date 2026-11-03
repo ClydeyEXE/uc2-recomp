@@ -31,6 +31,7 @@
 
 #include "kernel/nv2a_backend.h"
 #include "d3d/d3d8_swizzle.h"
+#include "version.h"            /* written by tools/version.cmake as the game builds */
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -973,6 +974,8 @@ typedef struct { uint32_t key[10]; ID3D11DepthStencilState *s; } DepthEntry;
 typedef struct { float slope; ID3D11RasterizerState *s; } RasterEntry;
 
 static SamplerEntry s_samplers[CACHE_MAX]; static int s_nsamplers;
+static int          s_sampler_aniso;    /* the forced anisotropy the samplers were made for */
+static int cfg_aniso(void);
 static BlendEntry   s_blends[CACHE_MAX];   static int s_nblends;
 static DepthEntry   s_depths[CACHE_MAX];   static int s_ndepths;
 static RasterEntry  s_rasters[32];         static int s_nrasters;
@@ -991,8 +994,15 @@ static ID3D11SamplerState *sampler_for(const Nv2aTexture *t)
 {
     uint32_t key[6];
     uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0x3F;
-    int i;
+    int i, aniso = cfg_aniso();
 
+    /* A change in the settings panel remakes them all, here on the drawing thread. */
+    if (aniso != s_sampler_aniso) {
+        for (i = 0; i < s_nsamplers; i++)
+            ID3D11SamplerState_Release(s_samplers[i].s);
+        s_nsamplers = 0;
+        s_sampler_aniso = aniso;
+    }
     key[0] = t->addr_u; key[1] = t->addr_v; key[2] = t->filter;
     key[3] = t->border; key[4] = (uint32_t)t->border_color; key[5] = 0;
     for (i = 0; i < s_nsamplers; i++)
@@ -1017,6 +1027,12 @@ static ID3D11SamplerState *sampler_for(const Nv2aTexture *t)
                                              mag_linear ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
                                              mip_linear ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
                                              D3D11_FILTER_REDUCTION_TYPE_STANDARD);
+        /* Forced anisotropy only where the game filters smoothly across mip levels:
+         * point-sampled and single-level textures (the HUD, fonts) stay as they are. */
+        if (aniso > 1 && min_linear && mag_linear && !lod0) {
+            d.Filter = D3D11_FILTER_ANISOTROPIC;
+            d.MaxAnisotropy = (UINT)aniso;
+        }
         d.AddressU = address_mode(t->addr_u, t->border_color);
         d.AddressV = address_mode(t->addr_v, t->border_color);
         d.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -1974,9 +1990,12 @@ static int                     s_failed_present;
  * the pad). They are kept in %LOCALAPPDATA%\xboxrecomp\ucc2_video.ini, and these
  * override the file for one run: RECOMP_RES_SCALE=1..4 or RECOMP_RES_HEIGHT=<lines>,
  * RECOMP_WIDESCREEN=0/1, RECOMP_FPS_LIMIT=<fps> (0 off), RECOMP_PRESENT_VSYNC=0/1,
- * RECOMP_PRESENT_FILTER=point/linear. */
+ * RECOMP_PRESENT_FILTER=point/linear, RECOMP_ANISOTROPY=<1, 2, 4, 8 or 16>. */
 static const int s_limits[] = {0, 30, 60, 120, 144, 240};
 #define NLIMITS ((int)(sizeof s_limits / sizeof s_limits[0]))
+/* Forced anisotropic filtering; 1 leaves the game's own filtering. */
+static const int s_anisos[] = {1, 2, 4, 8, 16};
+#define NANISOS ((int)(sizeof s_anisos / sizeof s_anisos[0]))
 /* Internal resolutions, by height: the guest's 480, its multiples (960, 1440, 1920)
  * and the heights of 16:9 displays (720p, 1080p, 1440p, 4K). */
 static const int s_heights[] = {480, 720, 960, 1080, 1440, 1920, 2160};
@@ -1991,7 +2010,13 @@ static struct {
     int counter;                /* frame rate in the corner */
     int boot;                   /* skip the boot screens' fixed waits, from the next start
                                    ([game] skip_boot_waits, read by recomp_manual.c) */
-} s_cfg = {480, 0, 0, 0, 0, 0, 0};
+    int aniso;                  /* forced anisotropy (one of s_anisos), 1 for the game's own */
+} s_cfg = {480, 0, 0, 0, 0, 0, 0, 1};
+
+static int cfg_aniso(void)
+{
+    return s_cfg.aniso;
+}
 
 /* The width of a picture height lines high, in the chosen shape, kept even. */
 static int res_width(int height)
@@ -2041,6 +2066,7 @@ static void settings_load(void)
         s_cfg.point = (int)GetPrivateProfileIntA("video", "sharp", 0, s_ini);
         s_cfg.counter = (int)GetPrivateProfileIntA("video", "fps_counter", 0, s_ini);
         s_cfg.boot = (int)GetPrivateProfileIntA("game", "skip_boot_waits", 0, s_ini);
+        s_cfg.aniso = (int)GetPrivateProfileIntA("video", "anisotropy", 1, s_ini);
     }
     {
         int n;
@@ -2051,14 +2077,24 @@ static void settings_load(void)
     env_int("RECOMP_WIDESCREEN", &s_cfg.wide);
     env_int("RECOMP_FPS_LIMIT", &s_cfg.limit);
     env_int("RECOMP_PRESENT_VSYNC", &s_cfg.vsync);
+    env_int("RECOMP_ANISOTROPY", &s_cfg.aniso);
     if ((f = getenv("RECOMP_PRESENT_FILTER")) != NULL && *f)
         s_cfg.point = *f == 'p' || *f == 'P';
     s_cfg.wide = s_cfg.wide != 0;
     if (s_cfg.limit < 0) s_cfg.limit = 0;
+    {
+        /* The nearest offered level at or below what was asked. */
+        int i = 0;
+        while (i < NANISOS - 1 && s_anisos[i + 1] <= s_cfg.aniso)
+            i++;
+        s_cfg.aniso = s_anisos[i];
+    }
     res_apply();
-    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter (%s)\n",
+    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter, "
+            "anisotropy %dx (%s)\n",
             res_width(s_cfg.height), s_cfg.height, s_cfg.wide ? "16:9" : "4:3", s_cfg.limit,
-            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_ini[0] ? s_ini : "no settings file");
+            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_cfg.aniso,
+            s_ini[0] ? s_ini : "no settings file");
 }
 
 static void settings_save(void)
@@ -2075,6 +2111,7 @@ static void settings_save(void)
     _snprintf(v, sizeof v, "%d", s_cfg.point);   WritePrivateProfileStringA("video", "sharp", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.counter); WritePrivateProfileStringA("video", "fps_counter", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.boot);    WritePrivateProfileStringA("game", "skip_boot_waits", v, s_ini);
+    _snprintf(v, sizeof v, "%d", s_cfg.aniso);   WritePrivateProfileStringA("video", "anisotropy", v, s_ini);
 }
 
 static int make_blit_sampler(void)
@@ -2182,7 +2219,7 @@ static int blit_init(HWND hwnd)
  * While the panel is open the game sees its pads at rest (xbox_input_held). */
 extern volatile long xbox_input_held;          /* src/input/xinput_device.c */
 
-enum { ROW_SCALE, ROW_ASPECT, ROW_LIMIT,ROW_VSYNC, ROW_FILTER, ROW_COUNTER, ROW_BOOT, ROWS };
+enum { ROW_SCALE, ROW_ASPECT, ROW_LIMIT,ROW_VSYNC, ROW_FILTER, ROW_ANISO, ROW_COUNTER, ROW_BOOT, ROWS };
 
 static struct {
     int open, row;
@@ -2244,6 +2281,12 @@ static void ui_change(int row, int dir)
         s_cfg.point = !s_cfg.point;
         make_blit_sampler();
         break;
+    case ROW_ANISO:
+        for (i = 0; i < NANISOS && s_anisos[i] != s_cfg.aniso; i++)
+            ;
+        i = i == NANISOS ? 0 : (i + dir + NANISOS) % NANISOS;
+        s_cfg.aniso = s_anisos[i];              /* the samplers remake themselves as they are used */
+        break;
     case ROW_COUNTER:
         s_cfg.counter = !s_cfg.counter;
         break;
@@ -2252,9 +2295,10 @@ static void ui_change(int row, int dir)
         break;
     }
     settings_save();
-    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter, counter %s\n",
+    fprintf(stderr, "[D3D11] settings: %dx%d internal resolution (%s), frame limit %d, vsync %s, %s filter, "
+            "anisotropy %dx, counter %s\n",
             res_width(s_cfg.height), s_cfg.height, s_cfg.wide ? "16:9" : "4:3", s_cfg.limit,
-            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_cfg.counter ? "on" : "off");
+            s_cfg.vsync ? "on" : "off", s_cfg.point ? "point" : "linear", s_cfg.aniso, s_cfg.counter ? "on" : "off");
 }
 
 /* Keys while the window has the focus, and pad 0: F1 or Back+Start opens and
@@ -2416,12 +2460,17 @@ static void ui_draw(float x0, float y0)
 
     if (s_ui.open) {
         static const char *const sharp[] = {"smooth", "sharp"}, *const onoff[] = {"off", "on"};
-        char limit[16];
+        char limit[16], aniso[16];
         if (s_cfg.limit)
             _snprintf(limit, sizeof limit, "%d fps", s_cfg.limit);
         else
             _snprintf(limit, sizeof limit, "off");
         limit[sizeof limit - 1] = 0;
+        if (s_cfg.aniso > 1)
+            _snprintf(aniso, sizeof aniso, "%dx", s_cfg.aniso);
+        else
+            _snprintf(aniso, sizeof aniso, "off");
+        aniso[sizeof aniso - 1] = 0;
         _snprintf(text, sizeof text,
                   "Settings                      %4.0f fps\n"
                   "Resolution    %dx%d%s\n"
@@ -2429,17 +2478,19 @@ static void ui_draw(float x0, float y0)
                   "Frame limit   %s\n"
                   "Vsync         %s\n"
                   "Scaling       %s\n"
+                  "Anisotropic   %s\n"
                   "FPS counter   %s\n"
                   "Boot waits    %s\n"
                   " \n"
                   "Up/Down choose, Left/Right change\n"
-                  "F1, Esc or B closes",
+                  "F1, Esc or B closes\n"
+                  "Version %s",
                   s_ui.fps, s_ui.game_pw, s_ui.game_ph,
                   s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
                   : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",
                   s_cfg.wide ? "16:9 (stretched)" : "4:3",
-                  limit, onoff[s_cfg.vsync], sharp[s_cfg.point], onoff[s_cfg.counter],
-                  s_cfg.boot ? "skip (from next start)" : "keep");
+                  limit, onoff[s_cfg.vsync], sharp[s_cfg.point], aniso, onoff[s_cfg.counter],
+                  s_cfg.boot ? "skip (from next start)" : "keep", UCC2_VERSION);
         hl = 1 + s_ui.row;
     } else if (s_cfg.counter) {
         _snprintf(text, sizeof text, "%.0f fps", s_ui.fps);

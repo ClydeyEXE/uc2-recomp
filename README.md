@@ -75,11 +75,13 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 | Frame limit | Off, 30, 60, 120, 144 or 240 fps |
 | Vsync | On or off |
 | Scaling | Smooth or sharp |
+| Anisotropic | Off, 2x, 4x, 8x or 16x: sharper floors and walls at an angle |
 | FPS counter | On or off |
 | Boot waits | Skip the 9 seconds the startup screens hold for |
 
 **Up / Down** picks a setting, **Left / Right** (or A, Enter) changes it, and **F1**, **Esc** or **B** closes the menu.
-Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`.
+Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`. The menu's bottom line shows which
+version you're running.
 
 ## Contributing
 Bug reports are welcome: include your GPU and the end of `play_log.txt` (in the folder you unzipped to), but no game files.

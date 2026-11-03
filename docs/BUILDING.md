@@ -54,8 +54,8 @@ or removing a hand-written function in `src/recomp_manual.c`.
 `Play.cmd` (`tools/play.ps1`) sets everything, and logs to `play_log.txt`. Its options: `-Software` for the old CPU
 rasteriser, `-Limit60` for flip pacing, `-Scale N` and `-Fps N` for this run only, and `-DrawLog` (see
 `docs/DEVELOPING.md`). For one run, `RECOMP_RES_SCALE`, `RECOMP_RES_HEIGHT=<lines>`, `RECOMP_WIDESCREEN=1`,
-`RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`, `RECOMP_PRESENT_FILTER=point` and `RECOMP_SKIP_BOOT_WAITS=1` override the
-settings panel's file, `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`.
+`RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`, `RECOMP_PRESENT_FILTER=point`, `RECOMP_ANISOTROPY=<1-16>` and
+`RECOMP_SKIP_BOOT_WAITS=1` override the settings panel's file, `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`.
 
 The first line of the log is the version: `git describe` at build time, with `-modified` if tracked files had changes,
 or for a source zip, `tools/version.txt`, which git fills in as it makes the zip.
