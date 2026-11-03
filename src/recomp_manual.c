@@ -364,6 +364,59 @@ void sub_00266885(void)
     sub_00266885_gen();
 }
 
+/*
+ * XACT's "is any packet of this voice still in flight", wrapping the generated
+ * body. A voice playing from a streaming wave bank (A_Weapon.xwb) has two packet
+ * slots, each filled by an overlapped disc read: state 0xAAAA while it is read
+ * or waits to go to DirectSound, read status 0x103 while the read runs. When a
+ * voice runs out of data (sub_003698E6, the call returning to 0x00369C08) XACT
+ * asks this, and if nothing is in flight it ends the stream without handing it
+ * the slots it has.
+ *
+ * A slot whose read has finished but which has not been handed over counts as
+ * done here. On the Xbox that cannot happen at this call: a sound short enough
+ * to fit one packet reaches it just after issuing its only read, which is still
+ * running. The runtime completes reads before they return, so the read was
+ * already done, the packet was dropped and nothing played: the countdown tick
+ * before a match (A_Gameplay.Countdown) and short weapon sounds such as
+ * A_Weapon.SN_Raise. At this call such a slot now counts as in flight, and is
+ * handed over as soon as XACT next services the voice, as on the Xbox. The
+ * other callers, which free a voice's buffers once nothing is in flight, keep
+ * the original answer.
+ */
+#define XACT_EOS_RET         0x00369C08u  /* after the call in sub_003698E6 */
+#define XACT_PKT_PENDING     0x8000000Au  /* slot status: not yet played */
+#define XACT_PKT_READING     0x0000AAAAu  /* slot state: read issued */
+#define XACT_PKT_END         0x0000DEADu  /* slot state: past the end of the data */
+#define XACT_READ_PENDING    0x00000103u  /* STATUS_PENDING */
+
+extern void sub_00362D65_gen(void);
+extern __declspec(thread) uint32_t g_ecx;
+
+void sub_00362D65(void)
+{
+    char *mem = (char *)g_xbox_mem_offset;
+    uint32_t *slot = (uint32_t *)(mem + g_ecx + 0x10);
+    int i;
+
+    if (*(const uint32_t *)(mem + g_esp) != XACT_EOS_RET) {
+        sub_00362D65_gen();
+        return;
+    }
+    g_eax = 0;
+    for (i = 0; i < 2; i++, slot += 8) {          /* 0x20-byte slots */
+        if (slot[2] == XACT_PKT_END)
+            continue;
+        if (slot[2] == XACT_PKT_READING && slot[3] == XACT_READ_PENDING)
+            slot[0] = XACT_PKT_PENDING;
+        if (slot[0] == XACT_PKT_PENDING) {
+            g_eax = 1;
+            break;
+        }
+    }
+    g_esp += 4; /* ret */
+}
+
 /* ── XMV colour conversion ────────────────────────────────── */
 
 /*

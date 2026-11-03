@@ -109,3 +109,12 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     address, `zeta_decode` when a depth buffer's address was last written as colour. Visibility tests were the
     first suspect (they always answered "all visible") and now return real counts too, but did not change the glow:
     the draw log showed the glow covering a pillar in front of it, which no culling decision can do.
+20. **The countdown before a match was silent.** "The match is about to begin... 3, 2, 1" plays
+    `A_Gameplay.Countdown` once a second, and the game did ask XACT for it each time, but no voice started. Its wave
+    is in `A_Weapon.xwb`, the one streaming wave bank: XACT fills each of a voice's two packets with an overlapped
+    read. The tick fits one packet, so on the second XACT finds no data left and asks `sub_00362D65` whether anything
+    is in flight before ending the stream. A packet whose read had finished but which had not gone to DirectSound
+    counted as done, so the stream was ended empty and the packet dropped. On the Xbox the read is still running at
+    that point; the runtime completes reads before they return. At that one call (returning to `0x00369C08`) such a
+    packet now counts as in flight, and XACT hands it over the next time it services the voice. Other short sounds in
+    that bank, such as `A_Weapon.SN_Raise`, were silent for the same reason.
