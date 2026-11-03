@@ -264,6 +264,10 @@ void recomp_manual_gpu_init(void)
  * froze map loading. The executor counts no pixels, so report the test as
  * finished with a full 640x480 frame visible: occlusion culling then only draws
  * more than it needs to.
+ *
+ * RECOMP_VIS_PIXELS=<n> answers n instead and logs each caller once as [VIS].
+ * 0 culls everything the game tests, which shows what it gates on these tests:
+ * characters disappear, including the player's own.
  */
 #define D3D_VISIBILITY_ALL_PIXELS (640u * 480u)
 
@@ -271,9 +275,28 @@ void sub_002043A0(void)
 {
     const char *mem = (const char *)g_xbox_mem_offset;
     uint32_t result = *(const uint32_t *)(mem + g_esp + 8);
+    static int pixels = -2;
+    static uint32_t seen[16];
 
+    if (pixels == -2) {
+        const char *e = getenv("RECOMP_VIS_PIXELS");
+        pixels = e ? atoi(e) : -1;
+    }
+    if (pixels != -1) {
+        uint32_t ret = *(const uint32_t *)(mem + g_esp);
+        for (int i = 0; i < 16; i++) {
+            if (seen[i] == ret)
+                break;
+            if (!seen[i]) {
+                seen[i] = ret;
+                fprintf(stderr, "[VIS] caller 0x%08X index %u\n", ret,
+                        *(const uint32_t *)(mem + g_esp + 4));
+                break;
+            }
+        }
+    }
     if (result)
-        *(uint32_t *)(mem + result) = D3D_VISIBILITY_ALL_PIXELS;
+        *(uint32_t *)(mem + result) = pixels >= 0 ? (uint32_t)pixels : D3D_VISIBILITY_ALL_PIXELS;
     g_eax = 1;
     g_esp += 12; /* ret 8 */
 }
