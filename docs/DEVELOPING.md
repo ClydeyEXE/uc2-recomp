@@ -46,7 +46,8 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 
 ## Notes on the toolkit's output
 - `func_id` category names are keyword guesses (for example 725 `game_vehicle`). Do not trust them.
-- `docs/functions.json` is an earlier function list from `tools/discover.py`. In `.text` the toolkit finds 10,736
-  functions, including 9,029 of its 9,317. Of the 288 only it found, 258 sit inside the toolkit's function bodies.
+- `tools/discover.py <default.xbe> build/discover` writes an earlier, independent function list. In `.text` the
+  toolkit finds 10,736 functions, including 9,029 of its 9,317. Of the 288 only it found, 258 sit inside the
+  toolkit's function bodies.
 - Assets are cooked for Xbox and read by the game itself through the runtime's file layer.
 - Vulkan was considered and set aside: D3D11 already draws on the GPU, and the remaining limits are on the CPU.

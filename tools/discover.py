@@ -23,7 +23,7 @@ from xbeinfo import Xbe  # noqa: E402
 # DOLBY has no x86 references and its bytes do not look like x86. XON_RD is only ever reached
 # through data pointers, never a direct call. Both are treated as data blobs.
 DATA_SECTIONS = {".rdata", ".data", ".data1", "$$XTIMAGE", ".XTLID", "DOLBY", "XON_RD"}
-DEF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "docs", "xboxkrnl.exe.def")
+DEF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xboxkrnl.exe.def")
 
 
 def load_kernel_names():

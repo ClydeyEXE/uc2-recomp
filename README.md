@@ -87,7 +87,7 @@ Built on [xboxrecomp](https://github.com/sp00nznet/xboxrecomp) by sp00nz, which 
 runtime. xboxrecomp is MIT licensed and includes parts of [xemu](https://github.com/xemu-project/xemu) under
 LGPL-2.1-or-later (see its `NOTICE`).
 
-The code in this repository is MIT licensed (see [LICENSE](LICENSE)), except `docs/xboxkrnl.exe.def`, which is
+The code in this repository is MIT licensed (see [LICENSE](LICENSE)), except `tools/xboxkrnl.exe.def`, which is
 CC0-1.0, © 2017 Stefan Schmidt. The patches in `patches/` modify xboxrecomp and
 fall under its licenses: the hunks for its `src/apu/` files change xemu code and are LGPL-2.1-or-later, the rest MIT.
 Unreal Championship 2 and Unreal are trademarks of Epic Games; Xbox is a trademark of Microsoft.
