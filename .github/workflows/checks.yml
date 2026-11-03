@@ -9,7 +9,7 @@ jobs:
   checks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { submodules: true }
 
       # .gitignore keeps these out locally, but not from `git add -f` or a pull request.
@@ -44,7 +44,7 @@ jobs:
           }
           exit $bad
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with: { python-version: "3.12" }
       - name: Python tools compile
         run: python -m compileall -q tools
