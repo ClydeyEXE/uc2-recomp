@@ -264,6 +264,7 @@ static struct {
     uint64_t upload_bytes;
     DWORD    last;
 } s_stats;
+static struct { uint32_t reports, zero, max_pending; } s_vis_stats;   /* visibility tests */
 
 /* ---- Frame times ---------------------------------------------------------- */
 /* One [FRAMES] line every 10 s: the spread of present-to-present times, and how
@@ -1245,6 +1246,18 @@ static int device_up(void)
         fprintf(stderr, "[D3D11] no device (0x%08lX)\n", (unsigned long)hr);
         s_failed = 1;
         return 0;
+    }
+    {   /* The default adapter: on a machine with two GPUs, say which. */
+        IDXGIDevice *dd = NULL;
+        IDXGIAdapter *ad = NULL;
+        DXGI_ADAPTER_DESC desc;
+        if (SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice, (void **)&dd))
+            && SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad))
+            && SUCCEEDED(IDXGIAdapter_GetDesc(ad, &desc)))
+            fprintf(stderr, "[D3D11] adapter: %ls (%u MB)\n", desc.Description,
+                    (unsigned)(desc.DedicatedVideoMemory >> 20));
+        if (ad) IDXGIAdapter_Release(ad);
+        if (dd) IDXGIDevice_Release(dd);
     }
     vb = compile("vs", "vs_5_0");
     pb = compile("ps", "ps_5_0");
@@ -2338,6 +2351,8 @@ static void blit_present(Target *t)
 
 /* The frame is finished: copy it to guest memory, where the window and the frame
  * dumps read it from. */
+static void vis_poll(int all);
+
 static void d3d11_present(uint32_t va, uint32_t pitch)
 {
     uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
@@ -2392,11 +2407,15 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
                 s_stats.presents, s_stats.draws, s_stats.tris, s_stats.clears, s_stats.uploads,
                 (unsigned long long)(s_stats.upload_bytes / 1024),
                 (unsigned long long)(s_tex_bytes / 1024), s_stats.hashes, s_stats.feedback);
+        fprintf(stderr, "[D3D11] visibility: %u tests, %u with no pixels, at most %u pending\n",
+                s_vis_stats.reports, s_vis_stats.zero, s_vis_stats.max_pending);
+        memset(&s_vis_stats, 0, sizeof s_vis_stats);
         memset(&s_stats, 0, sizeof s_stats);
         s_stats.last = GetTickCount();
     }
     if (!s_dev)
         return;
+    vis_poll(0);
     for (i = 0; i < MAX_TARGETS; i++)
         if (s_targets[i].va == va)
             t = &s_targets[i];
@@ -2462,10 +2481,177 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
     s_ft.present += (double)(ft_qpc() - t0) / s_ft.qms;
 }
 
+/* ---- Visibility tests ------------------------------------------------------ */
+/* D3D's Begin/EndVisibilityTest: the title draws something with pixel counting
+ * on, and GET_REPORT asks for the count. The title culls characters with these,
+ * and glows are faded by them, so a test that always passes drew glows through
+ * walls. Each stretch of counting is a D3D11 occlusion query; a report waits for
+ * its queries and is written once they finish, polled once a frame without
+ * stalling. The title asks without waiting and treats a pending test as
+ * visible, so a frame or two of latency is what it was built for. Counts are
+ * scaled from the internal resolution back to the guest's pixels. */
+#define VIS_QUERIES 4096                /* the pool: in flight, or free */
+#define VIS_REPORTS 2048
+#define VIS_PARTS   8                   /* counting stretches in one report */
+
+typedef struct {
+    uint32_t at;                        /* guest offset of the 16-byte report */
+    float    scale;                     /* host pixels per guest pixel */
+    int      n;
+    ID3D11Query *q[VIS_PARTS];
+} VisReport;
+
+static ID3D11Query *s_vis_free[VIS_QUERIES];
+static int          s_vis_nfree, s_vis_made;
+static ID3D11Query *s_vis_cur[VIS_PARTS];   /* since CLEAR_REPORT_VALUE */
+static int          s_vis_ncur;
+static ID3D11Query *s_vis_open;             /* counting now */
+static VisReport    s_vis[VIS_REPORTS];     /* a ring, oldest first */
+static int          s_vis_head, s_vis_count;
+
+static ID3D11Query *vis_get(void)
+{
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_OCCLUSION, 0 };
+    ID3D11Query *q = NULL;
+
+    if (s_vis_nfree)
+        return s_vis_free[--s_vis_nfree];
+    if (s_vis_made >= VIS_QUERIES || FAILED(ID3D11Device_CreateQuery(s_dev, &qd, &q)))
+        return NULL;
+    s_vis_made++;
+    return q;
+}
+
+static void vis_put(ID3D11Query *q)
+{
+    s_vis_free[s_vis_nfree++] = q;
+}
+
+static void vis_write(uint32_t at, uint32_t pixels)
+{
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t done = 0;
+
+    memcpy(mem + at + 8, &pixels, 4);
+    MemoryBarrier();                    /* the count before the status */
+    memcpy(mem + at + 12, &done, 4);
+}
+
+/* The stretch being counted ends, and joins the report being built. */
+static void vis_close(void)
+{
+    if (!s_vis_open)
+        return;
+    ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)s_vis_open);
+    if (s_vis_ncur < VIS_PARTS)
+        s_vis_cur[s_vis_ncur++] = s_vis_open;
+    else
+        vis_put(s_vis_open);            /* cannot happen with D3D's pairs */
+    s_vis_open = NULL;
+}
+
+static void vis_drop_cur(void)
+{
+    int i;
+    for (i = 0; i < s_vis_ncur; i++)
+        vis_put(s_vis_cur[i]);
+    s_vis_ncur = 0;
+}
+
+/* Writes every report whose queries have finished, oldest first, and stops at
+ * the first that has not: the GPU finishes them in order. With `all`, waits. */
+static void vis_poll(int all)
+{
+    while (s_vis_count) {
+        VisReport *r = &s_vis[s_vis_head];
+        UINT64 sum = 0;
+        int i;
+
+        for (i = 0; i < r->n; i++) {
+            UINT64 n = 0;
+            HRESULT hr;
+            while ((hr = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)r->q[i], &n, sizeof n,
+                                                     all ? 0 : D3D11_ASYNC_GETDATA_DONOTFLUSH)) == S_FALSE && all)
+                ;
+            if (hr != S_OK)
+                return;
+            sum += n;
+        }
+        sum = (UINT64)((double)sum / r->scale + 0.5);
+        if (!sum)
+            s_vis_stats.zero++;
+        vis_write(r->at, sum > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)sum);
+        for (i = 0; i < r->n; i++)
+            vis_put(r->q[i]);
+        s_vis_head = (s_vis_head + 1) % VIS_REPORTS;
+        s_vis_count--;
+    }
+}
+
+static void d3d11_zpass_clear(void)
+{
+    if (!s_dev)
+        return;
+    vis_close();
+    vis_drop_cur();
+}
+
+static void d3d11_zpass_enable(int on)
+{
+    if (!s_dev)
+        return;
+    if (!on) {
+        vis_close();
+        return;
+    }
+    if (s_vis_open)
+        return;
+    if (!(s_vis_open = vis_get())) {    /* pool spent: make room */
+        vis_poll(1);
+        s_vis_open = vis_get();
+    }
+    if (s_vis_open)
+        ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)s_vis_open);
+}
+
+static void d3d11_zpass_report(uint32_t at)
+{
+    VisReport *r;
+    int i, open = s_vis_open != NULL;
+
+    s_vis_stats.reports++;
+    if (!s_dev) {                       /* nothing drawn yet: call it visible */
+        vis_write(at, 640u * 480u);
+        return;
+    }
+    vis_close();
+    if (!s_vis_ncur) {                  /* nothing was counted */
+        vis_write(at, 0);
+        s_vis_stats.zero++;
+    } else {
+        if (s_vis_count == VIS_REPORTS)
+            vis_poll(1);
+        r = &s_vis[(s_vis_head + s_vis_count++) % VIS_REPORTS];
+        r->at = at;
+        r->scale = s_cur_target ? s_cur_target->sx * s_cur_target->sy : s_sx * s_sy;
+        if (r->scale <= 0.0f)
+            r->scale = 1.0f;
+        r->n = s_vis_ncur;
+        for (i = 0; i < s_vis_ncur; i++)
+            r->q[i] = s_vis_cur[i];
+        s_vis_ncur = 0;
+        if ((uint32_t)s_vis_count > s_vis_stats.max_pending)
+            s_vis_stats.max_pending = (uint32_t)s_vis_count;
+    }
+    if (open)                           /* still counting: a fresh stretch */
+        d3d11_zpass_enable(1);
+}
+
 void gpu_d3d11_register(void)
 {
     static const Nv2aBackend backend = {
-        d3d11_clear, d3d11_draw, NULL, d3d11_present, 1
+        d3d11_clear, d3d11_draw, NULL, d3d11_present, 1,
+        d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_report
     };
     const char *e = getenv("RECOMP_GPU");
 

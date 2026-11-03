@@ -21,8 +21,9 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   device. The host counters cannot see holes in the sound; the capture can.
 - `RECOMP_APU_VOICE_LOG=1` logs every voice start as `[APU-ON]` with its time, handle, format and volume. A sound that
   logs no start was never handed to the APU, so the fault is on the game's side, not in mixing.
-- `RECOMP_VIS_PIXELS=<n>` makes every visibility test report n pixels (normally a full 640x480) and logs each caller
-  as `[VIS]`. With 0, everything the game culls by these tests disappears.
+- Visibility tests are D3D11 occlusion queries, answered a frame or so later; `RECOMP_GPU_STATS=1` counts them.
+  `RECOMP_VIS_PIXELS=<n>` answers n pixels at once instead (307200, a full 640x480, was the old behaviour) and logs
+  each caller as `[VIS]`. With 0, everything the game culls by these tests disappears.
 - `RECOMP_LOG=<file>` writes the log straight to a file. Do not use `-RedirectStandardError`: its pipe slows the game.
 - `RECOMP_GPU=sw` restores the software rasteriser, and `RECOMP_GPU_STATS=1` logs renderer counts every 5 s.
 - `RECOMP_FRAME_TRACE_ALL=1` with `RECOMP_FRAME_TRACE=<flag file>` logs every frame while the file exists, including

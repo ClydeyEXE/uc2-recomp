@@ -259,22 +259,36 @@ void recomp_manual_gpu_init(void)
 
 /*
  * The game's wrapper for D3D's GetVisibilityTestResult(index, *result), replacing
- * the generated body. It reads a report the GPU writes, and the executor does not
- * write them, so a caller looping until the test completes never gets out. That
- * froze map loading. The executor counts no pixels, so report the test as
- * finished with a full 640x480 frame visible: occlusion culling then only draws
- * more than it needs to.
+ * the generated body. The result is a 16-byte report the GPU writes: the device
+ * (at 0x00393888) holds a table of report blocks at +0x7D4, one per 256 tests,
+ * and the status word at +12 stays 0xFFFFFFFF until the count at +8 is in. The
+ * D3D11 back end writes reports once its occlusion queries finish, a frame or so
+ * later (gpu_d3d11.c), and the software rasteriser at once. While one is pending
+ * this answers "not ready", as the original does: the game asks without waiting,
+ * keeps a pending test for later and treats it as visible meanwhile. The original
+ * also kicks the push buffer when the test has not been sent; the walker reads
+ * the buffer as it is written, so that is left out.
  *
- * RECOMP_VIS_PIXELS=<n> answers n instead and logs each caller once as [VIS].
- * 0 culls everything the game tests, which shows what it gates on these tests:
- * characters disappear, including the player's own.
+ * Before the back end counted pixels this answered a full 640x480 visible every
+ * time. The game culls characters with these tests and fades glows by them, so
+ * glows drew through walls.
+ *
+ * RECOMP_VIS_PIXELS=<n> answers n at once instead (640x480 is 307200), and logs
+ * each caller once as [VIS]. 0 culls everything the game tests: characters
+ * disappear, including the player's own.
  */
-#define D3D_VISIBILITY_ALL_PIXELS (640u * 480u)
+#define D3D_DEVICE_PTR       0x00393888u
+#define D3D_REPORT_BLOCKS    0x7D4u
+#define D3D_REPORT_PENDING   0xFFFFFFFFu
 
 void sub_002043A0(void)
 {
     const char *mem = (const char *)g_xbox_mem_offset;
+    uint32_t index = *(const uint32_t *)(mem + g_esp + 4);
     uint32_t result = *(const uint32_t *)(mem + g_esp + 8);
+    uint32_t dev = *(const uint32_t *)(mem + D3D_DEVICE_PTR);
+    uint32_t block = *(const uint32_t *)(mem + dev + D3D_REPORT_BLOCKS + (index >> 8) * 4);
+    uint32_t report = block + (index & 0xFF) * 16;
     static int pixels = -2;
     static uint32_t seen[16];
 
@@ -289,15 +303,22 @@ void sub_002043A0(void)
                 break;
             if (!seen[i]) {
                 seen[i] = ret;
-                fprintf(stderr, "[VIS] caller 0x%08X index %u\n", ret,
-                        *(const uint32_t *)(mem + g_esp + 4));
+                fprintf(stderr, "[VIS] caller 0x%08X index %u report 0x%08X status %08X count %u\n",
+                        ret, index, report, *(const uint32_t *)(mem + report + 12),
+                        *(const uint32_t *)(mem + report + 8));
                 break;
             }
         }
+        if (result)
+            *(uint32_t *)(mem + result) = (uint32_t)pixels;
+        g_eax = 1;
+    } else if (*(const volatile uint32_t *)(mem + report + 12) == D3D_REPORT_PENDING) {
+        g_eax = 0;
+    } else {
+        if (result)
+            *(uint32_t *)(mem + result) = *(const volatile uint32_t *)(mem + report + 8);
+        g_eax = 1;
     }
-    if (result)
-        *(uint32_t *)(mem + result) = pixels >= 0 ? (uint32_t)pixels : D3D_VISIBILITY_ALL_PIXELS;
-    g_eax = 1;
     g_esp += 12; /* ret 8 */
 }
 
