@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in the game doesn't work or looks wrong
+labels: ["bug", "needs-verification"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Please don't attach or link game files, builds of the game, or anything taken from
+        them; issues with them are closed.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: The mode, map and character, and what you did. Say if it happens every time.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The first line of `play_log.txt`, or the bottom line of the F1 settings menu.
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card
+      placeholder: NVIDIA RTX 3060
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Settings
+      description: Anything you changed in the F1 menu (resolution, aspect, frame limit, ...).
+  - type: textarea
+    id: log
+    attributes:
+      label: End of play_log.txt
+      description: The last 50 lines or so of `play_log.txt`, in the folder you unzipped to.
+      render: text
+    validations:
+      required: true

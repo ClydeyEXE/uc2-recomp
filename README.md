@@ -84,7 +84,8 @@ Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`. 
 version you're running.
 
 ## Contributing
-Bug reports are welcome: include your GPU and the end of `play_log.txt` (in the folder you unzipped to), but no game files.
+Bug reports are welcome: the [bug report form](https://github.com/ClydeyEXE/ucc2-recomp/issues/new?template=bug_report.yml)
+asks for your version, your GPU and the end of `play_log.txt` (in the folder you unzipped to). Please attach no game files.
 Code contributions aren't taken; see [CONTRIBUTING.md](CONTRIBUTING.md). For working on the code yourself,
 see [docs/BUILDING.md](docs/BUILDING.md) (the build by hand, run-time settings), [docs/DEVELOPING.md](docs/DEVELOPING.md)
 (debugging tools) and [docs/HISTORY.md](docs/HISTORY.md) (past bugs and their fixes).
