@@ -23,7 +23,8 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
 5. **Pad not seen.** `main.c` never called `xbox_OhciInit`, so `RECOMP_USB` did nothing.
 6. **Untranslated CRT x87 targets.** The table at `0x0040AAB8` has targets `0x002B7B7C` and `0x002B7C1E` that were
    never translated, because neighbouring functions started two bytes further in. Skipped calls left values on the
-   FPU stack. `recomp_lookup_manual` now supplies both. This did not fix the fatal screen, whatever commit 26d677b says.
+   FPU stack. `recomp_lookup_manual` now supplies both.
+   This did not fix the fatal screen, whatever the commit "Supply missing CRT x87 entries to reach map loading" says.
 7. **Fatal screen on Begin Match.** `RtlRaiseException` only logs and returns, so code ran on after every `throw`. Loading
    a match throws "Can't resolve package name" in normal use, and running past it ended in a garbage file name and
    `sub_00016784`'s dirty disc call. `src/recomp_manual.c` now replaces `_CxxThrowException` (`sub_002BA881`): it walks
