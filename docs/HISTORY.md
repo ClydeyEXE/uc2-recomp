@@ -99,3 +99,13 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     thread woken from its 1 ms wait into the same queue, so the thread also runs time-critical; it works for
     microseconds a vblank. With both, 15 boots in a row had no `[IRQ] wait`, no underruns, vblank gaps of 12-21 ms and
     no ack later than 7 ms, against gaps of up to 686 ms before.
+19. **Distortion effects showed through walls.** The purple barrier on Sovereign, and cloaked players, were visible
+    through anything in front of them. Both are distortion effects. A full-screen pass reads the scene's Z24S8 depth
+    buffer (`0x80620000`) as an A8R8G8B8 texture and draws it into a half-size colour surface (`0x807FA000` on
+    Sovereign, `0x8074C000` on Aqueduct); the effect's sprites then draw into the distortion map with that surface as
+    their depth buffer, so walls hide them. Depth lived only in D3D11 depth buffers and colour in render targets, so
+    the read found nothing and the sprites tested against an empty depth buffer. Depth buffers are now sampleable,
+    and two passes carry the bytes across in the console's layout: `zeta_encode` when a draw samples a depth buffer's
+    address, `zeta_decode` when a depth buffer's address was last written as colour. Visibility tests were the
+    first suspect (they always answered "all visible") and now return real counts too, but did not change the glow:
+    the draw log showed the glow covering a pillar in front of it, which no culling decision can do.

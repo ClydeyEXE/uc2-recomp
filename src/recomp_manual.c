@@ -270,8 +270,7 @@ void recomp_manual_gpu_init(void)
  * the buffer as it is written, so that is left out.
  *
  * Before the back end counted pixels this answered a full 640x480 visible every
- * time. The game culls characters with these tests and fades glows by them, so
- * glows drew through walls.
+ * time, so the game's occlusion culling of characters never culled.
  *
  * RECOMP_VIS_PIXELS=<n> answers n at once instead (640x480 is 307200), and logs
  * each caller once as [VIS]. 0 culls everything the game tests: characters

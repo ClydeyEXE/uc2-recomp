@@ -16,7 +16,11 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 
 ## Debugging tools
 - `tools/play.ps1 -DrawLog` logs one frame's draws a second, every frame while F7 is held, and F5 steps through kinds
-  of blended draw to leave out. It is the way to find out what drew a stray shape.
+  of blended draw to leave out. It is the way to find out what drew a stray shape. Each draw names its depth buffer
+  (`zeta`) and how many host pixels passed the depth and stencil tests (`passed`), so something that should be hidden
+  and is not shows there. Logged frames wait on the GPU after every draw, so they hitch.
+- `RECOMP_ZETA_COPY=0` stops carrying depth between depth buffers and colour surfaces at the same address (see
+  `zeta_encode` in `src/gpu_d3d11.c`), which brings back distortion effects drawing through walls.
 - `RECOMP_AUDIO_HOST=1` logs `[AUDIO-HOST]` starves, and `RECOMP_AUDIO_WAV=<file>` captures what the APU sends the
   device. The host counters cannot see holes in the sound; the capture can.
 - `RECOMP_APU_VOICE_LOG=1` logs every voice start as `[APU-ON]` with its time, handle, format and volume. A sound that
