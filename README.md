@@ -18,7 +18,7 @@ emulator.
 
 ### 1. Download
 Open the [latest release](https://github.com/ClydeyEXE/uc2-recomp/releases/latest) and download **Source code
-(zip)** under Assets. Unzip it somewhere with space, such as `C:\Games\ucc2`.
+(zip)** under Assets. Unzip it somewhere with space, such as `C:\Games\uc2`.
 
 ### 2. Set up
 Double-click **`Setup.cmd`**, then choose your `.iso` when it asks.
