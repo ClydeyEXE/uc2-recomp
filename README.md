@@ -17,7 +17,7 @@ emulator.
 | Frame rate | 60-130 fps in most of a match; busy scenes still drop to 35-48 |
 | Hitches | Occasional 100-160 ms pauses while the game loads files |
 | Audio | No dropouts; effects such as reverb are missing |
-| Story Mode | Cutscenes play; the rest is untested |
+| Story Mode | The first quarter plays through with no issues, cutscenes included; the rest is untested |
 | DLC | Not supported yet |
 
 What's being worked on, in order: the pinned **Roadmap** in [Issues](https://github.com/ClydeyEXE/ucc2-recomp/issues).
