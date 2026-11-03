@@ -69,6 +69,13 @@ add_executable(${PROJECT_NAME} WIN32
     ${RECOMP_GEN_SOURCES}
 )
 
+# The version the log and the settings panel show (tools/version.cmake), worked out on every build.
+add_custom_target(version_header
+    COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR} -DOUT=${CMAKE_BINARY_DIR}/version/version.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/version.cmake
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/version/version.h)
+add_dependencies(${PROJECT_NAME} version_header)
+
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 
@@ -76,6 +83,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
+    ${CMAKE_BINARY_DIR}/version
     ${XBOXRECOMP_DIR}/include
     ${XBOXRECOMP_DIR}/src
 )

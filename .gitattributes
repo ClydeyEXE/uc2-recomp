@@ -1,4 +1,6 @@
 * text=auto eol=lf
 *.cmd text eol=crlf
+# Git writes the version into this as it makes a source zip (tools/version.cmake).
+tools/version.txt export-subst
 # Applied byte for byte by git apply.
 *.patch -text

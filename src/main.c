@@ -41,6 +41,8 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 
+#include "version.h"            /* written by tools/version.cmake as the game builds */
+
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
  * the individual headers directly:
@@ -312,6 +314,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     setvbuf(stderr, NULL, _IONBF, 0);
 
     printf("=== Unreal Championship 2 - Static Recompilation ===\n");
+    /* First in the log, so a bug report says which build it came from. */
+    fprintf(stderr, "ucc2-recomp %s\n", UCC2_VERSION);
     printf("Loading XBE...\n");
 
     /* Install VEH handler (first handler in chain) */

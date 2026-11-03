@@ -57,6 +57,9 @@ rasteriser, `-Limit60` for flip pacing, `-Scale N` and `-Fps N` for this run onl
 `RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`, `RECOMP_PRESENT_FILTER=point` and `RECOMP_SKIP_BOOT_WAITS=1` override the
 settings panel's file, `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`.
 
+The first line of the log is the version: `git describe` at build time, with `-modified` if tracked files had changes,
+or for a source zip, `tools/version.txt`, which git fills in as it makes the zip.
+
 To run by hand, from the repo root because paths are
 relative, these settings are required:
 
