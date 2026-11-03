@@ -20,9 +20,6 @@ emulator.
 Open the [latest release](https://github.com/ClydeyEXE/ucc2-recomp/releases/latest) and download **Source code
 (zip)** under Assets. Unzip it somewhere with space, such as `C:\Games\ucc2`.
 
-The release is a version that has been checked. The green **Code** button gives you the newest work in progress
-instead, which may be broken.
-
 ### 2. Set up
 Double-click **`Setup.cmd`**, then choose your `.iso` when it asks.
 
