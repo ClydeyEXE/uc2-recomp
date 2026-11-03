@@ -2345,8 +2345,8 @@ static void ui_input(void)
 }
 
 /* Render the lines (separated by \n) into the bitmap and the texture, if they
- * differ from what is there. Line 0 of the panel is a title; the row the cursor
- * is on is the line hl (or none, -1). */
+ * differ from what is there. Line 0 of the panel is a title and its last line a
+ * dim footnote; the row the cursor is on is the line hl (or none, -1). */
 static int ui_text(const char *text, int hl)
 {
     char key[sizeof s_ui.text];
@@ -2416,7 +2416,7 @@ static int ui_text(const char *text, int hl)
                 DeleteObject(b);
             }
             SetTextColor(s_ui.dc, i == hl ? RGB(255, 214, 90) : i == 0 && hl >= 0 ? RGB(150, 190, 255)
-                                                                                  : RGB(230, 230, 230));
+                                  : i == lines - 1 && hl >= 0 ? RGB(120, 124, 140) : RGB(230, 230, 230));
             TextOutA(s_ui.dc, pad, y, p, n);
             if (!e) break;
             p = e + 1;
@@ -2484,7 +2484,8 @@ static void ui_draw(float x0, float y0)
                   " \n"
                   "Up/Down choose, Left/Right change\n"
                   "F1, Esc or B closes\n"
-                  "Version %s",
+                  " \n"
+                  "ucc2-recomp %s",
                   s_ui.fps, s_ui.game_pw, s_ui.game_ph,
                   s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
                   : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",
