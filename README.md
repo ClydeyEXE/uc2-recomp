@@ -30,7 +30,11 @@ What's being worked on, in order: the pinned **Roadmap** in [Issues](https://git
 - A disc image (`.iso`) of your own copy of the game
 
 ### 1. Download
-Click the green **Code** button above, then **Download ZIP**. Unzip it somewhere with space, such as `C:\Games\ucc2`.
+Open the [latest release](https://github.com/ClydeyEXE/ucc2-recomp/releases/latest) and download **Source code
+(zip)** under Assets. Unzip it somewhere with space, such as `C:\Games\ucc2`.
+
+The release is a version that has been checked. The green **Code** button gives you the newest work in progress
+instead, which may be broken.
 
 ### 2. Set up
 Double-click **`Setup.cmd`**, then choose your `.iso` when it asks.
