@@ -11,8 +11,21 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   those lists is probably a mis-named frame (the nearest symbol to an unnamed address), not real printing.
 - `python -I tools/prof.py --secs 20` profiles every thread of a live run.
 - Scripted matches are much lighter than played ones. Use a real, busy match for performance work.
-- `tools/run_match.ps1` can stop in a menu or enter Story Mode, so look at the frames before trusting a number from
-  it. With `RECOMP_SKIP_BOOT_WAITS=1` the title comes up 9 s sooner, so move every press 9 s earlier.
+- `python -I tools/drive_match.py --secs 120 --timeout 400` drives the game into a CTF-Aqueduct match by watching it:
+  each press waits for the screen it expects (file opens in the log, or the game window matched against reference
+  frames), and it backs out of a wrong menu and retries. It ends with `ROUTE reached match at <t> s` or
+  `ROUTE failed: <state>`, then runs `check_run.py`, and exits 0 only if both pass. A run's log, route and match
+  frames go in `build/runs/<name>/`. Boot waits are skipped unless `--boot-waits`; `--map` picks another CTF arena.
+  - It needs reference frames in `build/route/` (`main_menu.png`, `match.png` and others), captured on this machine
+    at 2x window scale. They come from the game, so they stay local; a new machine has to capture its own.
+  - It reads frames from the window with PrintWindow, so the window may be covered but not minimised. Do not use
+    `RECOMP_FB_DUMP` (or `--dumps`/`--no-window`) on runs whose fps matters: reading every frame back costs 10-13 ms a
+    frame, and a match drops from about 105 to 37 fps.
+- `python -I tools/check_run.py <log>` says whether a run worked: maps loaded, match reached, crash, watchdog as timer
+  or hang, untranslated instructions reached, menu and match fps (`settled` leaves out the window with the load),
+  hitches and failed opens. It exits 0 on pass, 1 on fail; `--min-fps`, `--no-expect-match` and `--json` adjust it.
+  Its tests are `python -I tools/test_check_run.py`. `[UNIMPL]` stops after 50 lines, so later addresses don't show.
+- `tools/run_match.ps1` presses on a timer and can stop in a menu or enter Story Mode; prefer `drive_match.py`.
 
 ## Debugging tools
 - `tools/play.ps1 -DrawLog` logs one frame's draws a second, every frame while F7 is held, and F5 steps through kinds

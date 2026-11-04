@@ -30,7 +30,7 @@ $settings = @{
     RECOMP_GUEST_CPUS    = "2"
     RECOMP_HEAP_RECLAIM  = "1"
     RECOMP_DISPATCH_GATE = "1"
-    RECOMP_FLIP_PACING   = "1"
+    # No RECOMP_FLIP_PACING: it pins menus to 60 fps and skews match fps (#13).
     RECOMP_USB           = "1"
     RECOMP_WATCHDOG_SECS = "$Secs"
     RECOMP_PB_REPORT_MS  = "15000"

@@ -14,7 +14,8 @@ that others post.
 ## Commands
 - Build: `tools/build.cmd` (log in `build/build.log`, ends with `BUILD_EXIT=`)
 - Play: `powershell -File tools/play.ps1`
-- Scripted match: `powershell -File tools/run_match.ps1 -Secs 300 -Log run.txt`
+- Scripted match: `python -I tools/drive_match.py --secs 120 --timeout 400` (exit 0 = reached the match and passed)
+- Check a run's log: `python -I tools/check_run.py <log>`
 - Profile a live run: `python -I tools/prof.py --secs 20`
 - Disassemble: `python -I tools/dis.py <hex va> <hex len>`, or `sections`
 - Regenerate the toolkit patch: `powershell -File tools/update_patches.ps1` (`-Check` only compares)
