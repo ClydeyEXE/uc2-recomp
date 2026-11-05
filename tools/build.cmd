@@ -10,6 +10,14 @@ for /f "usebackq delims=" %%i in (`vswhere -latest -products * -version [17.0^,1
 if not defined VSDIR for /f "usebackq delims=" %%i in (`vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSDIR=%%i"
 cd /d "%~dp0.."
 if not exist build mkdir build
+rem A running game locks the exe, and the link would fail halfway; say so instead.
+tasklist /fi "imagename eq ucc2_recomp.exe" /nh 2>nul | find /i "ucc2_recomp.exe" >nul
+if not errorlevel 1 (
+    echo The game is running: close it before building. > build\build.log
+    echo BUILD_EXIT=1 >> build\build.log
+    echo The game is running: close it before building.
+    exit /b 1
+)
 if not defined VSDIR (
     echo MSVC not found: install Visual Studio 2022 or its Build Tools with the C++ workload > build\build.log
     echo BUILD_EXIT=1 >> build\build.log
