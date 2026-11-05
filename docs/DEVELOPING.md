@@ -23,6 +23,11 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
     85.0, 82.0 and 85.9 fps (each grab takes the driver about 21 ms). Do not use
     `RECOMP_FB_DUMP` (or `--dumps`/`--no-window`) on runs whose fps matters: reading every frame back costs 10-13 ms a
     frame, and a match drops from about 105 to 37 fps.
+- `python -I tools/ab.py --runs 4 --secs 50 --a "" --b "RECOMP_X=1"` compares two settings (or two builds, with
+  `--a-exe`/`--b-exe`) over interleaved runs. An idle match's fps depends on where the player spawns (65 to 158 fps on
+  CTF-Aqueduct), so it forfeits and re-enters until the spawn looks down the long corridor (#1's heavy view, needs
+  `build/route/corridor.png`), measures only windows with nothing moving in view, and reports medians, spread and a
+  95% interval. Runs vary about 3.5% in that view, so 3 a side only detects about 10%; a run takes about 4 minutes.
 - `python -I tools/check_run.py <log>` says whether a run worked: maps loaded, match reached, crash, watchdog as timer
   or hang, untranslated instructions reached, menu and match fps (`settled` leaves out the window with the load),
   hitches and failed opens. It exits 0 on pass, 1 on fail; `--min-fps`, `--no-expect-match` and `--json` adjust it.

@@ -33,7 +33,8 @@ without it, and the window may be covered but not minimised).
 --no-window or --dumps uses RECOMP_FB_DUMP instead, and its readback halves the
 frame rate (menus 80 fps against 145, a match 37 against 105), so match numbers
 from such a run mean little. Reference screens live in build/route/ (local,
-never committed): main_menu, match and title are used, scoreboard only noted.
+never committed): main_menu, match and title are used, scoreboard only noted,
+and corridor (the spawn looking down CTF-Aqueduct's long corridor) by tools/ab.py.
 Refresh one by copying a frame from a run folder (--keep-frames) over it.
 
 Everything goes to build/runs/<name>/: log.txt, pad.txt, route.txt (each state
@@ -86,6 +87,10 @@ WHOLE = ((0, 0, 640, 480), (64, 48))
 HUD_BOXES = [(0, 0, 250, 45), (500, 0, 640, 100), (30, 290, 150, 420)]
 HUD_MIN = 0.6         # share of those pixels that match: 0.77-1.0 in a match, 0.4 or less elsewhere
 HEADER_MAX, SCORE_MAX = 9.0, 10.0
+# The scene above the player and clear of the HUD, for telling spawn views apart:
+# the same spawn measures 0-1 against its reference, any other 28 or more.
+SCENE = ((160, 50, 620, 280), (46, 23))
+SCENE_MAX = 8.0
 # Seconds to leave a screen after the last file the game opened, before pressing.
 SETTLE, SETTLE_MAX = 1.2, 3.0
 # Game type portraits, by map prefix. Only CTF has been seen; the rest are guesses.
@@ -221,7 +226,7 @@ def lit_item(im):
 
 def load_refs():
     refs = {}
-    for name in ("main_menu", "scoreboard", "match", "title", "story_menu"):
+    for name in ("main_menu", "scoreboard", "match", "title", "story_menu", "corridor"):
         p = os.path.join(ROUTE, name + ".png")
         refs[name] = Image.open(p).convert("RGB").resize((640, 480)) if os.path.exists(p) else None
     if refs["match"] is not None:
@@ -303,7 +308,8 @@ class Driver:
         env["RECOMP_LOG"] = self.log_path
         env["RECOMP_PAD_LIVE"] = self.pad_path
         open(self.pad_path, "w").close()
-        self.proc = subprocess.Popen([EXE], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+        exe = getattr(self.args, "exe", None) or EXE      # tools/ab.py can run another build
+        self.proc = subprocess.Popen([exe], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.t0 = time.time()
         self.frames = Frames(self.run, self.proc.pid, dump, self.args.keep_frames)
@@ -411,18 +417,24 @@ class Driver:
                 break
         else:
             raise Failed("Start not taken")
+        self.menus_retried()
+        self.match()
+
+    def menus_retried(self, resets=3):
+        """menus(), backing out to the main menu and starting again after a wrong turn."""
+        tries = 0
         while True:
             try:
                 self.menus()
-                break
+                return
             except Failed as e:
                 # Only a wrong turn in the menus is retried from the main menu.
-                if isinstance(e, Fatal) or self.resets >= 3:
+                if isinstance(e, Fatal) or tries >= resets:
                     raise
+                tries += 1
                 self.resets += 1
                 self.note("reset %d: %s" % (self.resets, e))
                 self.back_to_main()
-        self.match()
 
     def back_to_main(self):
         self.enter("backing")
@@ -548,6 +560,32 @@ class Driver:
         self.enter("match")
         self.reached = self.now()
         self.frames.save("match_first")
+
+    def rematch(self):
+        """Forfeit the match and drive into a new one, which spawns the player anew.
+
+        Start opens the pause menu; Forfeit Game is its fourth item and asks to be
+        confirmed, then the game type screen shows. About 33 s in all."""
+        self.enter("forfeit")
+        self.press("start", 150)
+        self.wait(1.5)
+        for _ in range(3):
+            self.press("down", 150)
+            self.wait(0.6)
+        self.press("a", 150)
+        self.wait(1.5)
+        since = self.press("a", 150)
+        if not self.wait_for(r"Portrait_GameType_\w+\.xmv$", since, 8):
+            self.frames.save("forfeit_stuck")
+            raise Failed("forfeit did not reach the game type screen")
+        self.back_to_main()
+        self.menus_retried()
+        self.match()
+
+    def in_view(self, im, name="corridor"):
+        """Whether frame im shows the scene of reference route/<name>.png, HUD up."""
+        return (im is not None and self.refs.get(name) is not None and self.is_match(im)
+                and dist(im, self.refs[name], SCENE) < SCENE_MAX)
 
 
 def stay(drv, secs):
