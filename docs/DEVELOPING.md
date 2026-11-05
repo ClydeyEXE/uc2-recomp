@@ -18,7 +18,9 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   frames go in `build/runs/<name>/`. Boot waits are skipped unless `--boot-waits`; `--map` picks another CTF arena.
   - It needs reference frames in `build/route/` (`main_menu.png`, `match.png` and others), captured on this machine
     at 2x window scale. They come from the game, so they stay local; a new machine has to capture its own.
-  - It reads frames from the window with PrintWindow, so the window may be covered but not minimised. Do not use
+  - It reads frames from the window with PrintWindow, so the window may be covered but not minimised. That costs the
+    game nothing measurable: in one match, 30 s blocks with no grabs, a grab every 5 s and a grab every 0.5 s ran
+    85.0, 82.0 and 85.9 fps (each grab takes the driver about 21 ms). Do not use
     `RECOMP_FB_DUMP` (or `--dumps`/`--no-window`) on runs whose fps matters: reading every frame back costs 10-13 ms a
     frame, and a match drops from about 105 to 37 fps.
 - `python -I tools/check_run.py <log>` says whether a run worked: maps loaded, match reached, crash, watchdog as timer
