@@ -947,13 +947,15 @@ void sub_001379C0(void)
  * it calls the script's Reset, copies the viewport's size into ClipX/ClipY
  * (canvas+0x40/0x44, floats) and SizeX/SizeY (+0x68/0x6C), and builds its
  * canvas utility's (+0xB4) matrices from ClipX: canvas-to-screen at +0x60,
- * screen-to-canvas at +0x20. In the wider view a 640x480 canvas is made
- * 480 * 16/9 wide instead and mapped onto the whole picture. The HUD and menu
- * script place things in fixed 640x480 pixels, so they keep their shape and
- * stay where the game puts them, from the left; see sub_00142960 for what
- * reaches the old right edge.
+ * screen-to-canvas at +0x20. In the wider view a 640x480 canvas is drawn
+ * 480 * 16/9 wide: its matrices map 853 canvas pixels onto the whole picture,
+ * so what the script draws keeps its shape. The script is still told 640
+ * (ClipX, SizeX): most of the HUD and menus are placed in fixed pixels, and the
+ * pop-ups that are placed from ClipX (Begin Match?) then agree with them.
+ * sub_00142960 then moves what was drawn.
  */
 extern void sub_00099350_gen(void);
+extern void gpu_wide_canvas_drawn(void);
 
 #define WIDE_CANVAS_W (480.0f * 16.0f / 9.0f)
 
@@ -961,22 +963,19 @@ void sub_00099350(void)
 {
     char *mem = (char *)g_xbox_mem_offset;
     uint32_t canvas = g_ecx, util;
-    float *clip;
-    int32_t *size;
+    const int32_t *size;
 
     sub_00099350_gen();
-    clip = (float *)(mem + canvas + 0x40);
-    size = (int32_t *)(mem + canvas + 0x68);
+    size = (const int32_t *)(mem + canvas + 0x68);
     util = *(const uint32_t *)(mem + canvas + 0xB4);
     if (!gpu_wide_view() || !util || size[0] != 640 || size[1] != 480)
         return;
     {
         float *c2s = (float *)(mem + util + 0x60), *s2c = (float *)(mem + util + 0x20);
-        clip[0] = WIDE_CANVAS_W;
-        size[0] = (int32_t)(WIDE_CANVAS_W + 0.5f);
         c2s[0] = 2.0f / WIDE_CANVAS_W;     /* x_ndc = x * c2s[0] + c2s[12] */
         s2c[0] = 1.0f / c2s[0];
         s2c[12] = -c2s[12] / c2s[0];
+        gpu_wide_canvas_drawn();
     }
 }
 
@@ -985,18 +984,25 @@ void sub_00099350(void)
  * body. Its batches are 64-byte entries at util+0xC (count at +0x10): +0 the
  * primitive type, +8 how many, +0xC/+0x10 the vertices and their count. A
  * vertex is x, y, z, colour, u, v as floats, in canvas pixels, four to a quad.
- * On a widened canvas (sub_00099350), vertices on the old right edge, x = 640,
+ * On a widened canvas (sub_00099350), vertices on the old right edge (x 639-640)
  * move to the new one: the script draws its full-width bars, fades and tints to
- * 640. The match HUD (only its flush, WIDE_HUD_FLUSH_RET) is also spread out:
+ * 640. Menus (WIDE_MENU_FLUSH_RET, and the HUD's flush while one is up, for
+ * its pop-ups) move to the middle whole, at their shape; their background and
+ * bars fill the width. The match HUD (WIDE_HUD_FLUSH_RET,
+ * and WIDE_AIM_FLUSH_RET for the first-person crosshair) is spread out instead:
  * quads that touch are one widget (a string, the health bar, the scoreboard),
  * and each widget stays on the left, moves to the middle or to the right edge
  * by which third its middle is in, so the crosshair is centred and the radar
- * sits on the right. One wider than 400 pixels (the scoreboard) is centred.
+ * sits on the right. Between the top and bottom strips a widget stays with the
+ * middle (the combo wheel by the crosshair) unless it lies wholly in an outer
+ * third. One wider than 400 pixels (the scoreboard) is centred.
  * RECOMP_WIDE_ZONES=0 leaves the HUD laid out from the left.
  */
 extern void sub_00142960_gen(void);
 
-#define WIDE_HUD_FLUSH_RET 0x00135302u   /* the flush that draws the match HUD; menus come from 0x135340 */
+#define WIDE_HUD_FLUSH_RET   0x00135302u /* the flush that draws the match HUD */
+#define WIDE_AIM_FLUSH_RET   0x0009A173u /* the first-person crosshair */
+#define WIDE_MENU_FLUSH_RET  0x00135340u /* menus, and the title screen */
 #define WIDE_MAX_QUADS 4096
 #define WIDE_TOUCH 2.0f                  /* pixels apart that still count as one widget */
 
@@ -1010,9 +1016,10 @@ static int wide_root(WideQuad *q, int i)
 }
 
 /* Move each widget of the n quads to its third of the 16:9 canvas. */
-static void wide_spread(WideQuad *q, int n)
+static void wide_spread(WideQuad *q, int n, int apply, uint32_t log_ret)
 {
-    static float bx0[WIDE_MAX_QUADS], bx1[WIDE_MAX_QUADS];
+    static float bx0[WIDE_MAX_QUADS], bx1[WIDE_MAX_QUADS], by0[WIDE_MAX_QUADS], by1[WIDE_MAX_QUADS];
+    static int cnt[WIDE_MAX_QUADS];
     const float extra = WIDE_CANVAS_W - 640.0f;
     int i, j, k;
     for (i = 0; i < n; i++)
@@ -1024,30 +1031,44 @@ static void wide_spread(WideQuad *q, int n)
                     q[a].up = b;
             }
     for (i = 0; i < n; i++) {
-        bx0[i] = 1e9f;
-        bx1[i] = -1e9f;
+        bx0[i] = by0[i] = 1e9f;
+        bx1[i] = by1[i] = -1e9f;
+        cnt[i] = 0;
     }
     for (i = 0; i < n; i++) {
         int r = wide_root(q, i);
         if (q[i].x0 < bx0[r]) bx0[r] = q[i].x0;
         if (q[i].x1 > bx1[r]) bx1[r] = q[i].x1;
+        if (q[i].y0 < by0[r]) by0[r] = q[i].y0;
+        if (q[i].y1 > by1[r]) by1[r] = q[i].y1;
+        cnt[r]++;
     }
     for (i = 0; i < n; i++) {
         int r = wide_root(q, i);
         float cx = (bx0[r] + bx1[r]) * 0.5f, dx;
         if (bx1[r] - bx0[r] > 400.0f)
             dx = extra * 0.5f;
+        else if (by0[r] >= 100.0f && by1[r] <= 420.0f)
+            /* Between the top and bottom strips: around the crosshair, so it
+             * moves with the middle, unless it lies wholly in an outer third. */
+            dx = bx1[r] <= 640.0f / 3.0f ? 0.0f : bx0[r] >= 1280.0f / 3.0f ? extra : extra * 0.5f;
         else
             dx = cx < 640.0f / 3.0f ? 0.0f : cx > 1280.0f / 3.0f ? extra : extra * 0.5f;
-        for (k = 0; k < 4; k++)
-            q[i].v[k * 6] += dx;
+        if (log_ret && r == i)
+            fprintf(stderr, "[WIDELOG] %06X widget x %.0f-%.0f y %.0f-%.0f quads %d move %.0f\n",
+                    log_ret, bx0[r], bx1[r], by0[r], by1[r], cnt[r], apply ? dx : 0.0f);
+        if (apply)
+            for (k = 0; k < 4; k++)
+                q[i].v[k * 6] += dx;
     }
 }
 
 void sub_00142960(void)
 {
     static WideQuad quads[WIDE_MAX_QUADS];
-    static int zones = -1;
+    static int zones = -1, logging = -1;
+    static uint32_t log_rets[16];
+    static ULONGLONG log_at[16];
     char *mem = (char *)g_xbox_mem_offset;
     uint32_t util = *(const uint32_t *)(mem + g_esp + 4);
     uint32_t ret = *(const uint32_t *)(mem + g_esp);
@@ -1056,11 +1077,37 @@ void sub_00142960(void)
     if (zones < 0) {
         const char *e = getenv("RECOMP_WIDE_ZONES");
         zones = !(e && *e == '0');
+        e = getenv("RECOMP_WIDE_LOG");
+        logging = e && *e ? *e - '0' : 0;   /* 1: once a second a site; 2: every flush but the menus' */
     }
     if (gpu_wide_view() && c2s[0] > 0.0f && fabsf(2.0f / c2s[0] - WIDE_CANVAS_W) < 1.0f) {
         int32_t n = *(const int32_t *)(mem + util + 0x10), e;
         uint32_t arr = *(const uint32_t *)(mem + util + 0xC);
-        int nq = 0, spread = zones && ret == WIDE_HUD_FLUSH_RET;
+        int nq = 0, r;
+        static ULONGLONG menu_ms;
+        ULONGLONG now_ms = GetTickCount64();
+        int menu_up, spread, centre;
+        if (ret == WIDE_MENU_FLUSH_RET)
+            for (e = 0; e < n; e++)
+                if (*(const int32_t *)(mem + arr + e * 64 + 0x10) > 0)
+                    menu_ms = now_ms;
+        /* While a menu is drawn, the HUD's flush carries its pop-ups (Begin
+         * Match?), which belong with the menu. */
+        menu_up = now_ms - menu_ms < 150;
+        spread = zones && !menu_up && (ret == WIDE_HUD_FLUSH_RET || ret == WIDE_AIM_FLUSH_RET);
+        centre = zones && (ret == WIDE_MENU_FLUSH_RET || (menu_up && ret == WIDE_HUD_FLUSH_RET));
+        const float half = (WIDE_CANVAS_W - 640.0f) * 0.5f;
+        uint32_t log_ret = 0;
+        if (logging) {                      /* each flush site at most once a second */
+            ULONGLONG now = GetTickCount64();
+            for (r = 0; r < 16 && log_rets[r] && log_rets[r] != ret; r++)
+                ;
+            if (r < 16 && (now - log_at[r] >= 1000 || (logging == 2 && ret != WIDE_MENU_FLUSH_RET))) {
+                log_rets[r] = ret;
+                log_at[r] = now;
+                log_ret = ret;
+            }
+        }
         for (e = 0; e < n; e++) {
             const uint32_t *en = (const uint32_t *)(mem + arr + e * 64);
             float *v = en[3] ? (float *)(mem + en[3]) : NULL;
@@ -1068,9 +1115,25 @@ void sub_00142960(void)
             if (!v || nq == WIDE_MAX_QUADS)
                 continue;
             for (i = 0; i < nv; i++)
-                if (fabsf(v[i * 6] - 640.0f) < 0.5f)
+                if (v[i * 6] >= 638.5f && v[i * 6] <= 640.5f) {   /* the old right edge */
                     v[i * 6] = WIDE_CANVAS_W;
-            if (!spread || nv % 4 != 0)
+                    if (log_ret)
+                        fprintf(stderr, "[WIDELOG] %06X full width: entry %d type %u vertex %d y %.0f u %.3f v %.3f "
+                                "colour %08X material %08X\n", log_ret, (int)e, en[0] & 0xFF, (int)i, v[i * 6 + 1],
+                                v[i * 6 + 4], v[i * 6 + 5], *(const uint32_t *)&v[i * 6 + 3], en[1]);
+                }
+            if (centre) {                   /* a menu: the whole 4:3 layout to the middle */
+                int m = nv % 4 == 0 ? 4 : nv;   /* quads, or the batch as one piece */
+                for (i = 0; i < nv; i += m) {
+                    int full = 0;
+                    for (k = 0; k < m; k++)
+                        full |= v[(i + k) * 6] > 640.5f || v[(i + k) * 6] < 0.5f;   /* on an edge: stays */
+                    if (!full)
+                        for (k = 0; k < m; k++)
+                            v[(i + k) * 6] += half;
+                }
+            }
+            if (!(spread || log_ret) || nv % 4 != 0)
                 continue;
             for (i = 0; i < nv; i += 4) {
                 WideQuad *q = &quads[nq];
@@ -1092,7 +1155,7 @@ void sub_00142960(void)
             }
         }
         if (nq)
-            wide_spread(quads, nq);
+            wide_spread(quads, nq, spread, log_ret);
     }
     sub_00142960_gen();
 }

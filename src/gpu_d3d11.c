@@ -2038,6 +2038,21 @@ static int s_view_flip_ms;
 
 /* Read by the game's threads in recomp_manual.c, each time it builds the scene's
  * projection or a canvas. */
+/* When the widened canvas was last drawn (recomp_manual.c). Full-screen movies
+ * (the boot logos, story cutscenes) are drawn without it, so a 16:9 widescreen
+ * picture with no canvas for a moment is a movie, and it is shown 4:3. */
+static volatile LONGLONG s_canvas_ms;
+
+void gpu_wide_canvas_drawn(void)
+{
+    s_canvas_ms = (LONGLONG)GetTickCount64();
+}
+
+static int movie_showing(void)
+{
+    return s_cfg.wide && s_cfg.view && (LONGLONG)GetTickCount64() - s_canvas_ms > 250;
+}
+
 int gpu_wide_view(void)
 {
     if (s_view_flip_ms > 0)
@@ -2667,6 +2682,8 @@ static void blit_present(Target *t)
         k = (float)s_bw * ah < (float)s_bh * aw ? (float)s_bw / aw : (float)s_bh / ah;
         vp.Width = aw * k;
         vp.Height = ah * k;
+        if (movie_showing())                /* a movie, pillarboxed in the 16:9 picture */
+            vp.Width *= 0.75f;
     }
     vp.TopLeftX = ((float)s_bw - vp.Width) * 0.5f;
     vp.TopLeftY = ((float)s_bh - vp.Height) * 0.5f;

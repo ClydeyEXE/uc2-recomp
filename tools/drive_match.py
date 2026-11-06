@@ -185,8 +185,9 @@ def video_setting(env, var, key, default):
 
 
 def picture_shape(env):
-    """(the shown picture's aspect, the share of its width the menus and HUD fill,
-    from the left). 16:9 widescreen lays them out at their shape in the left 3/4."""
+    """(the shown picture's aspect, the share of its width the menus fill, in the
+    middle). 16:9 widescreen keeps menus at their shape in the middle 3/4, and
+    spreads the match HUD by thirds (see Frames.grab)."""
     if not video_setting(env, "RECOMP_WIDESCREEN", "widescreen", 0):
         return 4 / 3, 1.0
     return 16 / 9, 0.75 if video_setting(env, "RECOMP_WIDE_VIEW", "wide_view", 0) else 1.0
@@ -201,7 +202,7 @@ class Frames:
         self.aspect, self.hud_share = shape
         self.hwnd = None
         self.n = 0
-        self.last = self.last_raw = None
+        self.last = self.last_raw = self.last_hud = None
         self.last_t = 0.0
 
     def grab(self, t):
@@ -223,8 +224,19 @@ class Frames:
                 raw = grab_window(self.hwnd, self.aspect)
         if raw is not None:
             # Compared where the menus and HUD are, at the references' size.
-            im = raw.crop((0, 0, int(round(raw.width * self.hud_share)), raw.height)).resize((640, 480))
-            self.last, self.last_raw, self.last_t = im, raw, t
+            cut = int(round(raw.width * (1 - self.hud_share) / 2))
+            im = raw.crop((cut, 0, raw.width - cut, raw.height)).resize((640, 480))
+            hud = im
+            if self.hud_share < 1.0:
+                # The match HUD keeps its shape in thirds of the 16:9 picture: the
+                # left third, the middle and the right third make the 4:3 layout.
+                w, h = raw.size
+                third = int(round(w * self.hud_share / 3))
+                hud = Image.new("RGB", (3 * third, h))
+                for i, x in enumerate((0, (w - third) // 2, w - third)):
+                    hud.paste(raw.crop((x, 0, x + third, h)), (i * third, 0))
+                hud = hud.resize((640, 480))
+            self.last, self.last_raw, self.last_hud, self.last_t = im, raw, hud, t
             if self.keep:
                 self.last_raw.save(os.path.join(self.run, "frames", "%05d_%06.1f.png" % (self.n, t)))
             self.n += 1
@@ -435,7 +447,8 @@ class Driver:
         return dist(im, self.refs["scoreboard"], WHOLE) < SCORE_MAX
 
     def is_match(self, im):
-        return hud_share(im, self.refs) >= HUD_MIN and not self.is_scoreboard(im)
+        hud = self.frames.last_hud if self.frames and im is self.frames.last else im
+        return hud_share(hud, self.refs) >= HUD_MIN and not self.is_scoreboard(im)
 
     # -- the route
 
