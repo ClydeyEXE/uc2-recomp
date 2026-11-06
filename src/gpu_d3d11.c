@@ -2030,7 +2030,8 @@ static int res_width(int height)
 
 static const char *aspect_name(void)
 {
-    return !s_cfg.wide ? "4:3" : s_cfg.view ? "16:9 wider view" : "16:9 stretched";
+    return !s_cfg.wide ? "4:3" : !s_cfg.view ? "16:9 stretched"
+           : s_cfg.hud ? "16:9 wider view, HUD 4:3" : "16:9 wider view, HUD stretched";
 }
 
 /* For comparing frames at one spot: RECOMP_WIDE_VIEW_FLIP=<ms> turns the wider
@@ -2330,7 +2331,9 @@ static void ui_change(int row, int dir)
         s_cfg.view = i % 3 == 2;
         res_apply();
         break;
-    case ROW_HUD:
+    case ROW_HUD:                               /* only the wider view has a choice to make */
+        if (!(s_cfg.wide && s_cfg.view))
+            return;
         s_cfg.hud = !s_cfg.hud;
         break;
     case ROW_LIMIT:
@@ -2556,7 +2559,7 @@ static void ui_draw(float x0, float y0)
                   s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
                   : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",
                   !s_cfg.wide ? "4:3" : s_cfg.view ? "16:9 (wider view)" : "16:9 (stretched)",
-                  !(s_cfg.wide && s_cfg.view) ? "with the picture" : s_cfg.hud ? "4:3 in the middle" : "full width",
+                  !(s_cfg.wide && s_cfg.view) ? "with the picture" : s_cfg.hud ? "4:3 in the middle" : "stretched",
                   limit, onoff[s_cfg.vsync], sharp[s_cfg.point], aniso, onoff[s_cfg.counter],
                   s_cfg.boot ? "skip (from next start)" : "keep", UCC2_VERSION);
         hl = 1 + s_ui.row;
