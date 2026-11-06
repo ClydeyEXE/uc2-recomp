@@ -51,7 +51,8 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 - 16:9 widescreen (#9) wraps three functions in `src/recomp_manual.c`: the scene's perspective matrix
   (`sub_001379C0`), the canvas's per-frame update (`sub_00099350`, which makes a 640x480 canvas 853 wide) and the
   canvas flush (`sub_00142960`, which stretches full-width pieces, centres menus and spreads the match HUD's
-  widgets by thirds). A moment with no canvas means a full-screen movie, which `gpu_d3d11.c` shows 4:3.
+  widgets by thirds). Full-screen movies are shown 4:3: CreateFile (`sub_00262187`) says the last `.xmv` opened was
+  from `Movies` and the decoder (`sub_00030570`) is running, or no canvas is drawn at all (boot logos, loading).
   `[WIDE]` lines log each projection once. `RECOMP_WIDE_LOG=1` logs each flush's widgets, where they sit and how
   far they moved, once a second per flush site (2: every flush but the menus'): have the owner play with it to place
   a misplaced HUD piece.

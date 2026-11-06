@@ -2038,10 +2038,29 @@ static int s_view_flip_ms;
 
 /* Read by the game's threads in recomp_manual.c, each time it builds the scene's
  * projection or a canvas. */
-/* When the widened canvas was last drawn (recomp_manual.c). Full-screen movies
- * (the boot logos, story cutscenes) are drawn without it, so a 16:9 widescreen
- * picture with no canvas for a moment is a movie, and it is shown 4:3. */
-static volatile LONGLONG s_canvas_ms;
+/* When a canvas was last drawn, and a movie frame decoded, and whether the last
+ * movie opened was a full-screen one (recomp_manual.c). A 16:9 widescreen
+ * picture is shown 4:3, pillarboxed, while a full-screen movie decodes (story
+ * cutscenes draw their letterbox bars and subtitles on a canvas meanwhile, which
+ * is then not widened, so they stay in place), or while no canvas is drawn at
+ * all (the boot logos, the loading screen). */
+static volatile LONGLONG s_canvas_ms, s_decode_ms;
+static volatile int s_movie_full;
+
+void gpu_movie_opened(int full_screen)
+{
+    s_movie_full = full_screen;
+}
+
+void gpu_movie_decoded(void)
+{
+    s_decode_ms = (LONGLONG)GetTickCount64();
+}
+
+static int movie_decoding(void)
+{
+    return s_movie_full && (LONGLONG)GetTickCount64() - s_decode_ms < 250;
+}
 
 void gpu_wide_canvas_drawn(void)
 {
@@ -2050,14 +2069,14 @@ void gpu_wide_canvas_drawn(void)
 
 static int movie_showing(void)
 {
-    return s_cfg.wide && s_cfg.view && (LONGLONG)GetTickCount64() - s_canvas_ms > 250;
+    return s_cfg.wide && s_cfg.view && ((LONGLONG)GetTickCount64() - s_canvas_ms > 250 || movie_decoding());
 }
 
 int gpu_wide_view(void)
 {
     if (s_view_flip_ms > 0)
         return s_cfg.wide && (GetTickCount64() / (ULONGLONG)s_view_flip_ms) % 2 != 0;
-    return s_cfg.wide && s_cfg.view;
+    return s_cfg.wide && s_cfg.view && !movie_decoding();
 }
 
 /* The scale on each axis from 640x480, after a change of resolution or shape. */

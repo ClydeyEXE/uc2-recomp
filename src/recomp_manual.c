@@ -26,6 +26,7 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <math.h>
+#include <ctype.h>
 
 typedef void (*recomp_func_t)(void);
 
@@ -966,6 +967,7 @@ void sub_00099350(void)
     const int32_t *size;
 
     sub_00099350_gen();
+    gpu_wide_canvas_drawn();                /* a canvas this frame, widened or not */
     size = (const int32_t *)(mem + canvas + 0x68);
     util = *(const uint32_t *)(mem + canvas + 0xB4);
     if (!gpu_wide_view() || !util || size[0] != 640 || size[1] != 480)
@@ -975,7 +977,6 @@ void sub_00099350(void)
         c2s[0] = 2.0f / WIDE_CANVAS_W;     /* x_ndc = x * c2s[0] + c2s[12] */
         s2c[0] = 1.0f / c2s[0];
         s2c[12] = -c2s[12] / c2s[0];
-        gpu_wide_canvas_drawn();
     }
 }
 
@@ -1171,6 +1172,40 @@ void sub_00142960(void)
             wide_spread(quads, nq, spread, log_ret);
     }
     sub_00142960_gen();
+}
+
+/*
+ * Full-screen movies (boot logos, the attract loop, story cutscenes) live in
+ * \Movies; those shown inside menus in \Textures\Movies. Both decode through
+ * sub_00030570, from the same callers, so the game's CreateFile (sub_00262187,
+ * the name first) says which kind was opened last, and the decoder says one
+ * is playing. gpu_d3d11.c shows a full-screen one 4:3.
+ */
+extern void gpu_movie_opened(int full_screen);
+extern void gpu_movie_decoded(void);
+extern void sub_00262187_gen(void);
+extern void sub_00030570_gen(void);
+
+void sub_00262187(void)
+{
+    const char *mem = (const char *)g_xbox_mem_offset;
+    uint32_t name = *(const uint32_t *)(mem + g_esp + 4);
+    if (name) {
+        char path[160];
+        size_t n;
+        for (n = 0; n + 1 < sizeof path && mem[name + n]; n++)
+            path[n] = (char)tolower((unsigned char)mem[name + n]);
+        path[n] = 0;
+        if (n > 4 && !strcmp(path + n - 4, ".xmv"))
+            gpu_movie_opened(strstr(path, "\\movies\\") && !strstr(path, "\\textures\\"));
+    }
+    sub_00262187_gen();
+}
+
+void sub_00030570(void)
+{
+    gpu_movie_decoded();
+    sub_00030570_gen();
 }
 
 /* ── Manual function overrides ─────────────────────────────── */
