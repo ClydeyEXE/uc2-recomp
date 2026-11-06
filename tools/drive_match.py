@@ -45,6 +45,7 @@ Exits 0 only when both pass.
 Run it with -I: without it tools/dis.py shadows the standard library's dis.
 """
 import argparse
+import configparser
 import ctypes
 import ctypes.wintypes as W
 import glob
@@ -140,8 +141,9 @@ def find_window(pid):
     return found[0] if found else None
 
 
-def grab_window(h):
-    """The window's client area, as D3D presented it, even when covered."""
+def grab_window(h, aspect=4 / 3):
+    """The window's client area, as D3D presented it, even when covered: the picture's
+    largest centred rectangle of that aspect, which the present letterboxes into it."""
     r = W.RECT()
     if not u32.GetClientRect(h, ctypes.byref(r)) or r.right <= 0 or r.bottom <= 0:
         return None
@@ -161,27 +163,58 @@ def grab_window(h):
     if not ok or got != hh:
         return None
     a = np.frombuffer(buf, np.uint8).reshape(hh, w, 4)[:, :, 2::-1]
-    return Image.fromarray(a.copy()).resize((640, 480))
+    pw, ph = (w, int(round(w / aspect))) if w / hh < aspect else (int(round(hh * aspect)), hh)
+    x0, y0 = (w - pw) // 2, (hh - ph) // 2
+    return Image.fromarray(a[y0:y0 + ph, x0:x0 + pw].copy())
+
+
+def video_setting(env, var, key, default):
+    """A setting from its RECOMP_ variable, else the settings panel's file."""
+    v = env.get(var, "")
+    if not v:
+        ini = configparser.ConfigParser()
+        try:
+            ini.read(os.path.join(env.get("LOCALAPPDATA", ""), "xboxrecomp", "ucc2_video.ini"))
+            v = ini.get("video", key, fallback=str(default))
+        except configparser.Error:
+            v = str(default)
+    try:
+        return int(v) != 0
+    except ValueError:
+        return bool(default)
+
+
+def picture_shape(env):
+    """(the shown picture's aspect, the share of its width the menus and HUD fill).
+    16:9 with the wider view and the HUD kept 4:3 puts the menus in the middle 3/4."""
+    if not video_setting(env, "RECOMP_WIDESCREEN", "widescreen", 0):
+        return 4 / 3, 1.0
+    hud43 = (video_setting(env, "RECOMP_WIDE_VIEW", "wide_view", 0)
+             and video_setting(env, "RECOMP_WIDE_HUD43", "hud_4_3", 1))
+    return 16 / 9, 0.75 if hud43 else 1.0
 
 
 class Frames:
-    """The latest frame, from the window or from RECOMP_FB_DUMP files."""
+    """The latest frame, from the window or from RECOMP_FB_DUMP files. Frames are
+    compared at 640x480, over the part the menus fill, and saved as shown (16:9 when widescreen)."""
 
-    def __init__(self, run, pid, dump_prefix, keep):
+    def __init__(self, run, pid, dump_prefix, keep, shape=(4 / 3, 1.0)):
         self.run, self.pid, self.dump_prefix, self.keep = run, pid, dump_prefix, keep
+        self.aspect, self.hud_share = shape
         self.hwnd = None
         self.n = 0
-        self.last = None
+        self.last = self.last_raw = None
         self.last_t = 0.0
 
     def grab(self, t):
-        im = None
+        im = raw = None                 # compared; as shown
         if self.dump_prefix:
             files = sorted(glob.glob(self.dump_prefix + "*.bmp"))
             # The newest may still be being written.
             for f in reversed(files[-2:]):
                 try:
-                    im = Image.open(f).convert("RGB").resize((640, 480))
+                    raw = Image.open(f).convert("RGB")
+                    raw.load()
                     break
                 except (OSError, ValueError):
                     continue
@@ -189,17 +222,20 @@ class Frames:
             if self.hwnd is None or not u32.IsWindow(self.hwnd):
                 self.hwnd = find_window(self.pid)
             if self.hwnd:
-                im = grab_window(self.hwnd)
-        if im is not None:
-            self.last, self.last_t = im, t
+                raw = grab_window(self.hwnd, self.aspect)
+        if raw is not None:
+            # Compared where the menus and HUD are, at the references' size.
+            cut = int(round(raw.width * (1 - self.hud_share) / 2))
+            im = raw.crop((cut, 0, raw.width - cut, raw.height)).resize((640, 480))
+            self.last, self.last_raw, self.last_t = im, raw, t
             if self.keep:
-                im.save(os.path.join(self.run, "frames", "%05d_%06.1f.png" % (self.n, t)))
+                self.last_raw.save(os.path.join(self.run, "frames", "%05d_%06.1f.png" % (self.n, t)))
             self.n += 1
         return im
 
     def save(self, name):
         if self.last is not None:
-            self.last.save(os.path.join(self.run, name + ".png"))
+            self.last_raw.save(os.path.join(self.run, name + ".png"))
 
 
 def thumb(im, crop, mode="L"):
@@ -312,7 +348,8 @@ class Driver:
         self.proc = subprocess.Popen([exe], cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.t0 = time.time()
-        self.frames = Frames(self.run, self.proc.pid, dump, self.args.keep_frames)
+        self.frames = Frames(self.run, self.proc.pid, dump, self.args.keep_frames,
+                             picture_shape(env))
         self.note("pid %d, frames from %s" % (self.proc.pid, "dumps" if dump else "the window"))
 
     def poll(self):

@@ -1,4 +1,4 @@
-"""Contact sheet of dumped BMP frames, and how much each differs from the last.
+"""Contact sheet of dumped BMP frames (or PNG frames kept by drive_match.py), and how much each differs from the last.
 
     python -I tools/sheet.py <folder or prefix> <out.png> [--every N] [--cols C] [--scale S]
 
@@ -24,8 +24,9 @@ def main():
     ap.add_argument("--last", type=int, default=0, help="only the last N frames")
     args = ap.parse_args()
 
-    pat = os.path.join(args.src, "*.bmp") if os.path.isdir(args.src) else args.src + "*.bmp"
-    files = sorted(glob.glob(pat))
+    # Dumps are BMP; frames kept by tools/drive_match.py are PNG.
+    pre = os.path.join(args.src, "") if os.path.isdir(args.src) else args.src
+    files = sorted(glob.glob(pre + "*.bmp") + glob.glob(pre + "*.png"))
     if args.last:
         files = files[-args.last:]
     prev = None

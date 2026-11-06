@@ -25,6 +25,7 @@
 #include <string.h>
 #include <setjmp.h>
 #include <stdlib.h>
+#include <math.h>
 
 typedef void (*recomp_func_t)(void);
 
@@ -895,6 +896,84 @@ extern void sub_000C52E0_gen(void);
 void sub_000C52E0(void) { eh_try_site(sub_000C52E0_gen); }
 extern void sub_0020BBB0_gen(void);
 void sub_0020BBB0(void) { eh_try_site(sub_0020BBB0_gen); }
+
+/* ── Native widescreen (#9) ────────────────────────────────── */
+
+/*
+ * The settings panel's "16:9 (wider view)" shows the guest's 640x480 picture
+ * stretched to 16:9, as "16:9 (stretched)" does, and narrows what the game
+ * draws across so the stretch undoes it: the horizontal field of view widens
+ * and the vertical one stays (Hor+). gpu_d3d11.c owns the setting.
+ */
+extern int gpu_wide_view(void);
+extern int gpu_wide_canvas(uint32_t ret, float w, float h);
+
+#define WIDE_SQUEEZE 0.75f   /* 4:3 over 16:9 */
+
+/*
+ * The scene's perspective matrix, (out in eax, half FOV across, half FOV up, 1,
+ * aspect, near, far), wrapping the generated body. Its only caller is the scene
+ * set-up, sub_00133600, which then inverts it, so the game's own frustum, and
+ * so its culling, follow the wider view. M[0][0] = 1/tan(half FOV across).
+ */
+extern void sub_001379C0_gen(void);
+
+void sub_001379C0(void)
+{
+    const float *arg = (const float *)((char *)g_xbox_mem_offset + g_esp + 4);
+    uint32_t out = g_eax;
+    static float seen[16];
+    static int nseen;
+    int i;
+    for (i = 0; i < nseen && seen[i] != arg[3]; i++)
+        ;
+    if (i == nseen && nseen < 16) {
+        seen[nseen++] = arg[3];
+        fprintf(stderr, "[WIDE] projection: half FOV %.2f x %.2f deg, aspect %.4f, near %g\n",
+                arg[0] * 57.29578f, arg[1] * 57.29578f, arg[3], arg[4]);
+    }
+    sub_001379C0_gen();
+    /* Only a 4:3 view: the aspect passed is its width over height times the
+     * game's pixel shape, 0x467DE4 (0.909). Square targets (a 16.5-degree view
+     * at 0.909) are left as they are. */
+    if (gpu_wide_view()) {
+        float k = *(const float *)((char *)g_xbox_mem_offset + 0x467DE4u);
+        if (k > 0.0f && fabsf(arg[3] / k - 4.0f / 3.0f) < 0.01f)
+            *(float *)((char *)g_xbox_mem_offset + out) *= WIDE_SQUEEZE;
+    }
+}
+
+/*
+ * The canvas's flush, (canvas on the stack), wrapping the generated body: it
+ * sets the canvas-to-screen matrix at canvas+0x60 (row vectors, x in column 0)
+ * as the projection and draws what the HUD, menus and scoreboard batched. Several
+ * places rebuild that matrix every frame, so it is squeezed toward the middle
+ * only for the flush, when gpu_wide_canvas() says so, which keeps those inside
+ * the 4:3 part of the stretched picture.
+ */
+extern void sub_00142960_gen(void);
+
+void sub_00142960(void)
+{
+    char *mem = (char *)g_xbox_mem_offset;
+    uint32_t ret = *(const uint32_t *)(mem + g_esp);
+    float *c2s = (float *)(mem + *(const uint32_t *)(mem + g_esp + 4) + 0x60);
+    float keep[4];
+    int i, squeeze = 0;
+
+    if (gpu_wide_view() && c2s[0] != 0.0f && c2s[5] != 0.0f
+        && gpu_wide_canvas(ret, 2.0f / c2s[0], -2.0f / c2s[5])) {
+        squeeze = 1;
+        for (i = 0; i < 4; i++) {
+            keep[i] = c2s[i * 4];
+            c2s[i * 4] *= WIDE_SQUEEZE;
+        }
+    }
+    sub_00142960_gen();
+    if (squeeze)
+        for (i = 0; i < 4; i++)
+            c2s[i * 4] = keep[i];
+}
 
 /* ── Manual function overrides ─────────────────────────────── */
 
