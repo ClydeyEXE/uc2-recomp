@@ -474,7 +474,7 @@ index 327f01d..fe9f8fc 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a513bc7..af187f1 100644
+index a513bc7..f012429 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -379,6 +379,9 @@ static float reg_f(uint32_t method)
@@ -722,7 +722,47 @@ index a513bc7..af187f1 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -2927,15 +3064,117 @@ static void xf_set_viewport(void)
+@@ -2834,12 +2971,13 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+     }
+     planes = near_z ? 2 : 1;
+     in[0] = a; in[1] = b; in[2] = c;
++    /* The test reads the vertices in place: copying all three (160 bytes each)
++     * for every triangle, when almost none need clipping, was a tenth of the
++     * walker's time in a busy view. Same arithmetic as xf_clip_dist on the copy. */
+     for (i = 0; i < 3; i++) {
+-        p0[i] = *in[i];
+-        for (j = 0; j < 3; j++)
+-            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
++        float w = in[i]->pos[3];
+         for (pl = 0; pl < planes; pl++) {
+-            float d = xf_clip_dist(&p0[i], pl);
++            float d = pl == 0 ? w - NV_CLIP_W : in[i]->pos[2] * w - s_xf_o[2] * w;
+             if (d != d || d - d != 0.0f)
+                 return;                       /* not finite: no position at all */
+             if (d < 0.0f)
+@@ -2850,6 +2988,11 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+         raster_xf_triangle(a, b, c);
+         return;
+     }
++    for (i = 0; i < 3; i++) {
++        p0[i] = *in[i];
++        for (j = 0; j < 3; j++)
++            p0[i].pos[j] = in[i]->pos[j] * in[i]->pos[3];
++    }
+     n = xf_clip_poly(p0, n, 0, p1);
+     if (planes > 1 && n)
+         n = xf_clip_poly(p1, n, 1, p0);
+@@ -2870,6 +3013,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+ /* About 7 MB, so allocated by the first batch that transforms rather than
+  * carried in every build that never turns the executor on. */
+ static Nv2aVshOutput *s_xf;
++/* The batch's vertices in index order: into s_xf, or into the deduplicated
++ * s_xf_unique, so a repeated vertex is pointed at rather than copied again. */
++static const Nv2aVshOutput *s_xp[NV_MAX_INDICES];
+ 
+ /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
+  * interpreter off (the batch then falls to the screen-space heuristics). */
+@@ -2927,15 +3073,119 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -791,9 +831,11 @@ index a513bc7..af187f1 100644
 +    nv2a_vsh_prepare();
 +    /* A program that writes constants (_CXT_WRITE_EN) depends on the order: as it was. */
 +    if (s_reg[0x1E98 / 4]) {
-+        for (i = 0; i < n; i++)
++        for (i = 0; i < n; i++) {
 +            if (!transform_vertex(s_gpu.idx[i], &s_xf[i]))
 +                return 0;
++            s_xp[i] = &s_xf[i];
++        }
 +        return 1;
 +    }
 +    if (!s_xf_unique
@@ -825,7 +867,7 @@ index a513bc7..af187f1 100644
 +        if (!transform_vertex(s_xf_unique_idx[i], &s_xf_unique[i]))
 +            return 0;                                  /* no program loaded */
 +    for (i = 0; i < n; i++)
-+        s_xf[i] = s_xf_unique[s_xf_slot_of[i]];
++        s_xp[i] = &s_xf_unique[s_xf_slot_of[i]];
 +    return 1;
 +}
 +
@@ -843,8 +885,34 @@ index a513bc7..af187f1 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3040,8 +3279,14 @@ static void raster_batch_program(void)
-             raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+@@ -2970,8 +3220,8 @@ static void raster_batch_program(void)
+                 fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
+                 fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
+                         s_gpu.idx[i], in[0], in[1], in[2], in[3],
+-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+-                        s_xf[i].pos[3]);
++                        s_xp[i]->pos[0], s_xp[i]->pos[1], s_xp[i]->pos[2],
++                        s_xp[i]->pos[3]);
+             }
+         }
+     }
+@@ -3017,8 +3267,8 @@ static void raster_batch_program(void)
+             }
+             for (i = 0; i < 3; i++)
+                 fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
+-                        s_xf[i].pos[0], s_xf[i].pos[1], s_xf[i].pos[2],
+-                        s_xf[i].pos[3]);
++                        s_xp[i]->pos[0], s_xp[i]->pos[1], s_xp[i]->pos[2],
++                        s_xp[i]->pos[3]);
+         }
+     }
+     for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+@@ -3037,27 +3287,33 @@ static void raster_batch_program(void)
+     switch (s_gpu.prim) {
+     case NV_PRIM_TRIANGLES:
+         for (i = 0; i + 2 < n; i += 3)
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++            raster_xf_clipped(s_xp[i], s_xp[i+1], s_xp[i+2]);
          break;
      case NV_PRIM_TRIANGLE_STRIP:
 -        for (i = 0; i + 2 < n; i++)
@@ -853,14 +921,35 @@ index a513bc7..af187f1 100644
 +         * goes by the order the vertices arrive in. */
 +        for (i = 0; i + 2 < n; i++) {
 +            if (i & 1)
-+                raster_xf_clipped(&s_xf[i+1], &s_xf[i], &s_xf[i+2]);
++                raster_xf_clipped(s_xp[i+1], s_xp[i], s_xp[i+2]);
 +            else
-+                raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
++                raster_xf_clipped(s_xp[i], s_xp[i+1], s_xp[i+2]);
 +        }
          break;
      case NV_PRIM_TRIANGLE_FAN:
      case NV_PRIM_POLYGON:
-@@ -3172,6 +3417,11 @@ static void raster_batch(void)
+         for (i = 1; i + 1 < n; i++)
+-            raster_xf_clipped(&s_xf[0], &s_xf[i], &s_xf[i+1]);
++            raster_xf_clipped(s_xp[0], s_xp[i], s_xp[i+1]);
+         break;
+     case NV_PRIM_QUADS:
+         for (i = 0; i + 3 < n; i += 4) {
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+2]);
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+2], &s_xf[i+3]);
++            raster_xf_clipped(s_xp[i], s_xp[i+1], s_xp[i+2]);
++            raster_xf_clipped(s_xp[i], s_xp[i+2], s_xp[i+3]);
+         }
+         break;
+     case NV_PRIM_QUAD_STRIP:
+         for (i = 0; i + 3 < n; i += 2) {
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+1], &s_xf[i+3]);
+-            raster_xf_clipped(&s_xf[i], &s_xf[i+3], &s_xf[i+2]);
++            raster_xf_clipped(s_xp[i], s_xp[i+1], s_xp[i+3]);
++            raster_xf_clipped(s_xp[i], s_xp[i+3], s_xp[i+2]);
+         }
+         break;
+     default:
+@@ -3172,6 +3428,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -872,7 +961,7 @@ index a513bc7..af187f1 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3190,8 +3440,19 @@ static void frame_trace_flip(void)
+@@ -3190,8 +3451,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -893,7 +982,7 @@ index a513bc7..af187f1 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3204,6 +3465,16 @@ static void frame_trace_flip(void)
+@@ -3204,6 +3476,16 @@ static void frame_trace_flip(void)
      }
  }
  
@@ -910,7 +999,7 @@ index a513bc7..af187f1 100644
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3239,7 +3510,8 @@ static void draw_primitive(void)
+@@ -3239,7 +3521,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -920,20 +1009,29 @@ index a513bc7..af187f1 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3248,8 +3520,11 @@ static void draw_primitive(void)
+@@ -3248,13 +3531,16 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
 +                    s_reg[0x0308 / 4], s_reg[0x039C / 4], s_reg[0x03A0 / 4], s_reg[0x032C / 4],
                      s_gpu.tris_drawn - t0,
 -                    (unsigned long long)(s_gpu.pixels - p0));
+-            if ((s_gpu.xf_mode & 3) == 2 && s_xf)
 +                    (unsigned long long)(s_gpu.pixels - p0),
 +                    s_gpu.fog_enable, s_gpu.fog_mode, s_gpu.fog_param[0], s_gpu.fog_param[1],
-+                    s_gpu.fog_color, s_xf ? s_xf[0].fog[0] : 0.0f, s_reg[0x1EA0 / 4]);
-             if ((s_gpu.xf_mode & 3) == 2 && s_xf)
++                    s_gpu.fog_color, s_xp[0] ? s_xp[0]->fog[0] : 0.0f, s_reg[0x1EA0 / 4]);
++            if ((s_gpu.xf_mode & 3) == 2 && s_xp[2])
                  fprintf(stderr, "[FTRACE]     v0 %g %g %g %g  v1 %g %g  v2 %g %g%c",
-                         s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
-@@ -3284,7 +3559,7 @@ static void draw_primitive(void)
+-                        s_xf[0].pos[0], s_xf[0].pos[1], s_xf[0].pos[2],
+-                        s_xf[0].pos[3], s_xf[1].pos[0], s_xf[1].pos[1],
+-                        s_xf[2].pos[0], s_xf[2].pos[1], 10);
++                        s_xp[0]->pos[0], s_xp[0]->pos[1], s_xp[0]->pos[2],
++                        s_xp[0]->pos[3], s_xp[1]->pos[0], s_xp[1]->pos[1],
++                        s_xp[2]->pos[0], s_xp[2]->pos[1], 10);
+             if (s_gpu.rc_seen) {
+                 int st;
+                 fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
+@@ -3284,7 +3570,7 @@ static void draw_primitive(void)
          }
      }
  
@@ -942,7 +1040,7 @@ index a513bc7..af187f1 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -3925,9 +4200,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3925,9 +4211,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
@@ -956,7 +1054,7 @@ index a513bc7..af187f1 100644
          break;
      case 0x17D0: {                                /* GET_REPORT */
          /* The GPU's answer to a visibility test: 16 bytes at the report
-@@ -3941,6 +4220,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3941,6 +4231,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          uint32_t at = dma_resolve(param & 0x00FFFFFFu);
          uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
          memcpy(mem + at, &stamp, 8);
@@ -967,7 +1065,7 @@ index a513bc7..af187f1 100644
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
          break;
-@@ -3960,7 +4243,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -3960,7 +4254,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -976,7 +1074,7 @@ index a513bc7..af187f1 100644
              zbuf_clear();
          break;
  
-@@ -4028,7 +4311,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4028,7 +4322,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -988,7 +1086,7 @@ index a513bc7..af187f1 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4102,6 +4388,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4102,6 +4399,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
