@@ -52,7 +52,8 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   (`sub_001379C0`), the canvas's per-frame update (`sub_00099350`, which makes a 640x480 canvas 853 wide) and the
   canvas flush (`sub_00142960`, which stretches full-width pieces, centres menus and spreads the match HUD's
   widgets by thirds). Full-screen movies are shown 4:3: CreateFile (`sub_00262187`) says the last `.xmv` opened was
-  from `Movies` and the decoder (`sub_00030570`) is running, or no canvas is drawn at all (boot logos, loading).
+  from the root `Movies` folder, or the boot code is playing one, while the decoder (`sub_00030570`) runs. The loading
+  screen, from `Textures/Movies`, is stretched.
   `[WIDE]` lines log each projection once. `RECOMP_WIDE_LOG=1` logs each flush's widgets, where they sit and how
   far they moved, once a second per flush site (2: every flush but the menus'): have the owner play with it to place
   a misplaced HUD piece.

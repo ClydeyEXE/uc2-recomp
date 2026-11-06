@@ -956,7 +956,6 @@ void sub_001379C0(void)
  * sub_00142960 then moves what was drawn.
  */
 extern void sub_00099350_gen(void);
-extern void gpu_wide_canvas_drawn(void);
 
 #define WIDE_CANVAS_W (480.0f * 16.0f / 9.0f)
 
@@ -967,7 +966,6 @@ void sub_00099350(void)
     const int32_t *size;
 
     sub_00099350_gen();
-    gpu_wide_canvas_drawn();                /* a canvas this frame, widened or not */
     size = (const int32_t *)(mem + canvas + 0x68);
     util = *(const uint32_t *)(mem + canvas + 0xB4);
     if (!gpu_wide_view() || !util || size[0] != 640 || size[1] != 480)
@@ -987,9 +985,10 @@ void sub_00099350(void)
  * vertex is x, y, z, colour, u, v as floats, in canvas pixels, four to a quad.
  * On a widened canvas (sub_00099350), vertices on the old right edge (x 639-640)
  * move to the new one: the script draws its full-width bars, fades and tints to
- * 640. Menus (WIDE_MENU_FLUSH_RET, and the HUD's flush while one is up, for
- * its pop-ups) move to the middle whole, at their shape; their background and
- * bars fill the width. The match HUD (WIDE_HUD_FLUSH_RET,
+ * 640; in every mode, bars on the edges reach the bottom row. Menus
+ * (WIDE_MENU_FLUSH_RET, and the HUD's flush while one is up, for its pop-ups)
+ * move to the middle whole, at their shape; their background and bars fill the
+ * width. The match HUD (WIDE_HUD_FLUSH_RET,
  * and WIDE_AIM_FLUSH_RET for the first-person crosshair) is spread out instead:
  * quads that touch are one widget (a string, the health bar, the scoreboard),
  * and each widget stays on the left, moves to the middle or to the right edge
@@ -1126,16 +1125,6 @@ void sub_00142960(void)
                                 "colour %08X material %08X\n", log_ret, (int)e, en[0] & 0xFF, (int)i, v[i * 6 + 1],
                                 v[i * 6 + 4], v[i * 6 + 5], *(const uint32_t *)&v[i * 6 + 3], en[1]);
                 }
-            if (nv % 4 == 0)                /* full-width bars down to the bottom: the game stops at 479 */
-                for (i = 0; i < nv; i += 4) {
-                    int full = 0;
-                    for (k = 0; k < 4; k++)
-                        full |= v[(i + k) * 6] > 640.5f;
-                    if (full)
-                        for (k = 0; k < 4; k++)
-                            if (v[(i + k) * 6 + 1] >= 476.0f && v[(i + k) * 6 + 1] < 480.0f)
-                                v[(i + k) * 6 + 1] = 480.0f;
-                }
             if (centre) {                   /* a menu: the whole 4:3 layout to the middle */
                 int m = nv % 4 == 0 ? 4 : nv;   /* quads, or the batch as one piece */
                 for (i = 0; i < nv; i += m) {
@@ -1171,6 +1160,27 @@ void sub_00142960(void)
         if (nq)
             wide_spread(quads, nq, spread, log_ret);
     }
+    {   /* In every mode, bars on the screen's edges down to the bottom row: the
+         * game stops them at y 479, a row a TV's overscan hid. */
+        int32_t n = *(const int32_t *)(mem + util + 0x10), e, i, k;
+        uint32_t arr = *(const uint32_t *)(mem + util + 0xC);
+        for (e = 0; e < n; e++) {
+            const uint32_t *en = (const uint32_t *)(mem + arr + e * 64);
+            float *v = en[3] ? (float *)(mem + en[3]) : NULL;
+            int32_t nv = (int32_t)en[4];
+            if (!v || nv % 4 != 0)
+                continue;
+            for (i = 0; i < nv; i += 4) {
+                int edge = 0;
+                for (k = 0; k < 4; k++)
+                    edge |= v[(i + k) * 6] <= 1.5f || v[(i + k) * 6] >= 638.5f;
+                if (edge)
+                    for (k = 0; k < 4; k++)
+                        if (v[(i + k) * 6 + 1] >= 476.0f && v[(i + k) * 6 + 1] < 480.0f)
+                            v[(i + k) * 6 + 1] = 480.0f;
+            }
+        }
+    }
     sub_00142960_gen();
 }
 
@@ -1179,10 +1189,13 @@ void sub_00142960(void)
  * \Movies; those shown inside menus in \Textures\Movies. Both decode through
  * sub_00030570, from the same callers, so the game's CreateFile (sub_00262187,
  * the name first) says which kind was opened last, and the decoder says one
- * is playing. gpu_d3d11.c shows a full-screen one 4:3.
+ * is playing. The boot logos decode from their own caller, after the loading
+ * movie has already been opened. gpu_d3d11.c shows a full-screen one 4:3.
  */
 extern void gpu_movie_opened(int full_screen);
-extern void gpu_movie_decoded(void);
+extern void gpu_movie_decoded(int boot);
+
+#define BOOT_MOVIE_DECODE_RET 0x0002EE97u   /* the boot code's player (the logos) */
 extern void sub_00262187_gen(void);
 extern void sub_00030570_gen(void);
 
@@ -1204,7 +1217,8 @@ void sub_00262187(void)
 
 void sub_00030570(void)
 {
-    gpu_movie_decoded();
+    const char *mem = (const char *)g_xbox_mem_offset;
+    gpu_movie_decoded(*(const uint32_t *)(mem + g_esp) == BOOT_MOVIE_DECODE_RET);
     sub_00030570_gen();
 }
 

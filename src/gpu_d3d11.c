@@ -2038,13 +2038,13 @@ static int s_view_flip_ms;
 
 /* Read by the game's threads in recomp_manual.c, each time it builds the scene's
  * projection or a canvas. */
-/* When a canvas was last drawn, and a movie frame decoded, and whether the last
- * movie opened was a full-screen one (recomp_manual.c). A 16:9 widescreen
- * picture is shown 4:3, pillarboxed, while a full-screen movie decodes (story
- * cutscenes draw their letterbox bars and subtitles on a canvas meanwhile, which
- * is then not widened, so they stay in place), or while no canvas is drawn at
- * all (the boot logos, the loading screen). */
-static volatile LONGLONG s_canvas_ms, s_decode_ms;
+/* When a full-screen movie frame was last decoded: one from
+ * \Movies, or from the boot code's player (recomp_manual.c). A 16:9 widescreen
+ * picture is shown 4:3, pillarboxed, while one decodes; story cutscenes draw
+ * their letterbox bars and subtitles on a canvas meanwhile, which is then not
+ * widened, so they stay in place. The loading screen's movie, from
+ * \Textures\Movies, is stretched like the menus' backgrounds. */
+static volatile LONGLONG s_decode_ms;
 static volatile int s_movie_full;
 
 void gpu_movie_opened(int full_screen)
@@ -2052,24 +2052,20 @@ void gpu_movie_opened(int full_screen)
     s_movie_full = full_screen;
 }
 
-void gpu_movie_decoded(void)
+void gpu_movie_decoded(int boot)
 {
-    s_decode_ms = (LONGLONG)GetTickCount64();
+    if (boot || s_movie_full)
+        s_decode_ms = (LONGLONG)GetTickCount64();
 }
 
 static int movie_decoding(void)
 {
-    return s_movie_full && (LONGLONG)GetTickCount64() - s_decode_ms < 250;
-}
-
-void gpu_wide_canvas_drawn(void)
-{
-    s_canvas_ms = (LONGLONG)GetTickCount64();
+    return (LONGLONG)GetTickCount64() - s_decode_ms < 250;
 }
 
 static int movie_showing(void)
 {
-    return s_cfg.wide && s_cfg.view && ((LONGLONG)GetTickCount64() - s_canvas_ms > 250 || movie_decoding());
+    return s_cfg.wide && s_cfg.view && movie_decoding();
 }
 
 int gpu_wide_view(void)
