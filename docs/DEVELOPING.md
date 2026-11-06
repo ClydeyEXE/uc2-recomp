@@ -48,10 +48,11 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 - Visibility tests are D3D11 occlusion queries, answered a frame or so later; `RECOMP_GPU_STATS=1` counts them.
   `RECOMP_VIS_PIXELS=<n>` answers n pixels at once instead (307200, a full 640x480, was the old behaviour) and logs
   each caller as `[VIS]`. With 0, everything the game culls by these tests disappears.
-- The wider view (#9) wraps the scene's perspective matrix (`sub_001379C0`) and the canvas flush
-  (`sub_00142960`) in `src/recomp_manual.c`; `[WIDE]` lines log each projection and canvas caller once.
-  `RECOMP_WIDE_VIEW_FLIP=<ms>` turns the wider view on and off every ms, so consecutive frames compare both at
-  one spot, and `RECOMP_WIDE_CANVAS_SKIP=<hex return addresses>` leaves those canvases stretched.
+- 16:9 widescreen (#9) wraps three functions in `src/recomp_manual.c`: the scene's perspective matrix
+  (`sub_001379C0`), the canvas's per-frame update (`sub_00099350`, which makes a 640x480 canvas 853 wide) and the
+  canvas flush (`sub_00142960`, which moves full-width pieces and spreads the match HUD's widgets by thirds).
+  `[WIDE]` lines log each projection once. `RECOMP_WIDE_VIEW_FLIP=<ms>` turns the wider view on and off every ms,
+  so consecutive frames compare both at one spot, and `RECOMP_WIDE_ZONES=0` leaves the HUD laid out from the left.
   `drive_match.py` saves frames as shown and compares only the middle 4:3 when the HUD is kept there.
 - `RECOMP_LOG=<file>` writes the log straight to a file. Do not use `-RedirectStandardError`: its pipe slows the game.
 - `RECOMP_GPU=sw` restores the software rasteriser, and `RECOMP_GPU_STATS=1` logs renderer counts every 5 s.

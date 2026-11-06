@@ -906,7 +906,6 @@ void sub_0020BBB0(void) { eh_try_site(sub_0020BBB0_gen); }
  * and the vertical one stays (Hor+). gpu_d3d11.c owns the setting.
  */
 extern int gpu_wide_view(void);
-extern int gpu_wide_canvas(uint32_t ret, float w, float h);
 
 #define WIDE_SQUEEZE 0.75f   /* 4:3 over 16:9 */
 
@@ -944,35 +943,158 @@ void sub_001379C0(void)
 }
 
 /*
- * The canvas's flush, (canvas on the stack), wrapping the generated body: it
- * sets the canvas-to-screen matrix at canvas+0x60 (row vectors, x in column 0)
- * as the projection and draws what the HUD, menus and scoreboard batched. Several
- * places rebuild that matrix every frame, so it is squeezed toward the middle
- * only for the flush, when gpu_wide_canvas() says so, which keeps those inside
- * the 4:3 part of the stretched picture.
+ * The canvas's per-frame update, (canvas in ecx), wrapping the generated body:
+ * it calls the script's Reset, copies the viewport's size into ClipX/ClipY
+ * (canvas+0x40/0x44, floats) and SizeX/SizeY (+0x68/0x6C), and builds its
+ * canvas utility's (+0xB4) matrices from ClipX: canvas-to-screen at +0x60,
+ * screen-to-canvas at +0x20. In the wider view a 640x480 canvas is made
+ * 480 * 16/9 wide instead and mapped onto the whole picture. The HUD and menu
+ * script place things in fixed 640x480 pixels, so they keep their shape and
+ * stay where the game puts them, from the left; see sub_00142960 for what
+ * reaches the old right edge.
+ */
+extern void sub_00099350_gen(void);
+
+#define WIDE_CANVAS_W (480.0f * 16.0f / 9.0f)
+
+void sub_00099350(void)
+{
+    char *mem = (char *)g_xbox_mem_offset;
+    uint32_t canvas = g_ecx, util;
+    float *clip;
+    int32_t *size;
+
+    sub_00099350_gen();
+    clip = (float *)(mem + canvas + 0x40);
+    size = (int32_t *)(mem + canvas + 0x68);
+    util = *(const uint32_t *)(mem + canvas + 0xB4);
+    if (!gpu_wide_view() || !util || size[0] != 640 || size[1] != 480)
+        return;
+    {
+        float *c2s = (float *)(mem + util + 0x60), *s2c = (float *)(mem + util + 0x20);
+        clip[0] = WIDE_CANVAS_W;
+        size[0] = (int32_t)(WIDE_CANVAS_W + 0.5f);
+        c2s[0] = 2.0f / WIDE_CANVAS_W;     /* x_ndc = x * c2s[0] + c2s[12] */
+        s2c[0] = 1.0f / c2s[0];
+        s2c[12] = -c2s[12] / c2s[0];
+    }
+}
+
+/*
+ * The canvas's flush, (canvas utility on the stack), wrapping the generated
+ * body. Its batches are 64-byte entries at util+0xC (count at +0x10): +0 the
+ * primitive type, +8 how many, +0xC/+0x10 the vertices and their count. A
+ * vertex is x, y, z, colour, u, v as floats, in canvas pixels, four to a quad.
+ * On a widened canvas (sub_00099350), vertices on the old right edge, x = 640,
+ * move to the new one: the script draws its full-width bars, fades and tints to
+ * 640. The match HUD (only its flush, WIDE_HUD_FLUSH_RET) is also spread out:
+ * quads that touch are one widget (a string, the health bar, the scoreboard),
+ * and each widget stays on the left, moves to the middle or to the right edge
+ * by which third its middle is in, so the crosshair is centred and the radar
+ * sits on the right. One wider than 400 pixels (the scoreboard) is centred.
+ * RECOMP_WIDE_ZONES=0 leaves the HUD laid out from the left.
  */
 extern void sub_00142960_gen(void);
 
+#define WIDE_HUD_FLUSH_RET 0x00135302u   /* the flush that draws the match HUD; menus come from 0x135340 */
+#define WIDE_MAX_QUADS 4096
+#define WIDE_TOUCH 2.0f                  /* pixels apart that still count as one widget */
+
+typedef struct { float *v; float x0, x1, y0, y1; int up; } WideQuad;
+
+static int wide_root(WideQuad *q, int i)
+{
+    while (q[i].up != i)
+        i = q[i].up = q[q[i].up].up;
+    return i;
+}
+
+/* Move each widget of the n quads to its third of the 16:9 canvas. */
+static void wide_spread(WideQuad *q, int n)
+{
+    static float bx0[WIDE_MAX_QUADS], bx1[WIDE_MAX_QUADS];
+    const float extra = WIDE_CANVAS_W - 640.0f;
+    int i, j, k;
+    for (i = 0; i < n; i++)
+        for (j = i + 1; j < n; j++)
+            if (q[i].x0 <= q[j].x1 + WIDE_TOUCH && q[j].x0 <= q[i].x1 + WIDE_TOUCH
+                && q[i].y0 <= q[j].y1 + WIDE_TOUCH && q[j].y0 <= q[i].y1 + WIDE_TOUCH) {
+                int a = wide_root(q, i), b = wide_root(q, j);
+                if (a != b)
+                    q[a].up = b;
+            }
+    for (i = 0; i < n; i++) {
+        bx0[i] = 1e9f;
+        bx1[i] = -1e9f;
+    }
+    for (i = 0; i < n; i++) {
+        int r = wide_root(q, i);
+        if (q[i].x0 < bx0[r]) bx0[r] = q[i].x0;
+        if (q[i].x1 > bx1[r]) bx1[r] = q[i].x1;
+    }
+    for (i = 0; i < n; i++) {
+        int r = wide_root(q, i);
+        float cx = (bx0[r] + bx1[r]) * 0.5f, dx;
+        if (bx1[r] - bx0[r] > 400.0f)
+            dx = extra * 0.5f;
+        else
+            dx = cx < 640.0f / 3.0f ? 0.0f : cx > 1280.0f / 3.0f ? extra : extra * 0.5f;
+        for (k = 0; k < 4; k++)
+            q[i].v[k * 6] += dx;
+    }
+}
+
 void sub_00142960(void)
 {
+    static WideQuad quads[WIDE_MAX_QUADS];
+    static int zones = -1;
     char *mem = (char *)g_xbox_mem_offset;
+    uint32_t util = *(const uint32_t *)(mem + g_esp + 4);
     uint32_t ret = *(const uint32_t *)(mem + g_esp);
-    float *c2s = (float *)(mem + *(const uint32_t *)(mem + g_esp + 4) + 0x60);
-    float keep[4];
-    int i, squeeze = 0;
+    const float *c2s = (const float *)(mem + util + 0x60);
 
-    if (gpu_wide_view() && c2s[0] != 0.0f && c2s[5] != 0.0f
-        && gpu_wide_canvas(ret, 2.0f / c2s[0], -2.0f / c2s[5])) {
-        squeeze = 1;
-        for (i = 0; i < 4; i++) {
-            keep[i] = c2s[i * 4];
-            c2s[i * 4] *= WIDE_SQUEEZE;
+    if (zones < 0) {
+        const char *e = getenv("RECOMP_WIDE_ZONES");
+        zones = !(e && *e == '0');
+    }
+    if (gpu_wide_view() && c2s[0] > 0.0f && fabsf(2.0f / c2s[0] - WIDE_CANVAS_W) < 1.0f) {
+        int32_t n = *(const int32_t *)(mem + util + 0x10), e;
+        uint32_t arr = *(const uint32_t *)(mem + util + 0xC);
+        int nq = 0, spread = zones && ret == WIDE_HUD_FLUSH_RET;
+        for (e = 0; e < n; e++) {
+            const uint32_t *en = (const uint32_t *)(mem + arr + e * 64);
+            float *v = en[3] ? (float *)(mem + en[3]) : NULL;
+            int32_t nv = (int32_t)en[4], i, k;
+            if (!v || nq == WIDE_MAX_QUADS)
+                continue;
+            for (i = 0; i < nv; i++)
+                if (fabsf(v[i * 6] - 640.0f) < 0.5f)
+                    v[i * 6] = WIDE_CANVAS_W;
+            if (!spread || nv % 4 != 0)
+                continue;
+            for (i = 0; i < nv; i += 4) {
+                WideQuad *q = &quads[nq];
+                float *p = v + i * 6;
+                q->v = p;
+                q->x0 = q->x1 = p[0];
+                q->y0 = q->y1 = p[1];
+                for (k = 1; k < 4; k++) {
+                    if (p[k * 6] < q->x0) q->x0 = p[k * 6];
+                    if (p[k * 6] > q->x1) q->x1 = p[k * 6];
+                    if (p[k * 6 + 1] < q->y0) q->y0 = p[k * 6 + 1];
+                    if (p[k * 6 + 1] > q->y1) q->y1 = p[k * 6 + 1];
+                }
+                if (q->x1 > 640.5f)          /* full width: done above */
+                    continue;
+                q->up = nq;
+                if (++nq == WIDE_MAX_QUADS)
+                    break;
+            }
         }
+        if (nq)
+            wide_spread(quads, nq);
     }
     sub_00142960_gen();
-    if (squeeze)
-        for (i = 0; i < 4; i++)
-            c2s[i * 4] = keep[i];
 }
 
 /* ── Manual function overrides ─────────────────────────────── */

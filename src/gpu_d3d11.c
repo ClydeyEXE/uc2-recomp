@@ -2007,7 +2007,6 @@ static struct {
     int wide;                   /* stretched to 16:9 */
     int view;                   /* with wide, the game's camera sees more across (#9,
                                    recomp_manual.c), so the stretch keeps its shapes */
-    int hud;                    /* with the wider view, the HUD and menus stay 4:3 */
     int limit;                  /* frame limit in fps, 0 for none */
     int vsync;
     int point;                  /* sharp pixels when scaling to the window */
@@ -2015,7 +2014,7 @@ static struct {
     int boot;                   /* skip the boot screens' fixed waits, from the next start
                                    ([game] skip_boot_waits, read by recomp_manual.c) */
     int aniso;                  /* forced anisotropy (one of s_anisos), 1 for the game's own */
-} s_cfg = {480, 0, 0, 1, 0, 0, 0, 0, 0, 1};
+} s_cfg = {480, 0, 0, 0, 0, 0, 0, 0, 1};
 
 static int cfg_aniso(void)
 {
@@ -2030,8 +2029,7 @@ static int res_width(int height)
 
 static const char *aspect_name(void)
 {
-    return !s_cfg.wide ? "4:3" : !s_cfg.view ? "16:9 stretched"
-           : s_cfg.hud ? "16:9 wider view, HUD 4:3" : "16:9 wider view, HUD stretched";
+    return !s_cfg.wide ? "4:3" : s_cfg.view ? "16:9 widescreen" : "16:9 stretched";
 }
 
 /* For comparing frames at one spot: RECOMP_WIDE_VIEW_FLIP=<ms> turns the wider
@@ -2045,35 +2043,6 @@ int gpu_wide_view(void)
     if (s_view_flip_ms > 0)
         return s_cfg.wide && (GetTickCount64() / (ULONGLONG)s_view_flip_ms) % 2 != 0;
     return s_cfg.wide && s_cfg.view;
-}
-
-/* Whether a canvas made by the call returning to ret, w x h guest pixels, is kept
- * inside the 4:3 middle of the wider view: with "HUD 4:3", those the size of the
- * screen. RECOMP_WIDE_CANVAS_SKIP=<hex return addresses> leaves some full width,
- * to find which caller draws what; each new caller is logged once. */
-int gpu_wide_canvas(uint32_t ret, float w, float h)
-{
-    static uint32_t seen[64];
-    static int nseen, ready;
-    static char skip[512];
-    char key[16];
-    int i, j;
-    if (!ready) {
-        const char *e = getenv("RECOMP_WIDE_CANVAS_SKIP");
-        _snprintf(skip, sizeof skip, ",%s,", e ? e : "");
-        skip[sizeof skip - 1] = 0;
-        ready = 1;
-    }
-    _snprintf(key, sizeof key, ",%X,", ret);
-    key[sizeof key - 1] = 0;
-    i = s_cfg.hud && fabsf(w - 640.0f) < 1.0f && fabsf(h - 480.0f) < 1.0f && !strstr(skip, key);
-    for (j = 0; j < nseen && seen[j] != ret; j++)
-        ;
-    if (j == nseen && nseen < 64) {
-        seen[nseen++] = ret;
-        fprintf(stderr, "[WIDE] canvas from 0x%08X, %.0fx%.0f, %s\n", ret, w, h, i ? "4:3" : "full width");
-    }
-    return i;
 }
 
 /* The scale on each axis from 640x480, after a change of resolution or shape. */
@@ -2114,7 +2083,6 @@ static void settings_load(void)
                                                   480 * (int)GetPrivateProfileIntA("video", "scale", 1, s_ini), s_ini);
         s_cfg.wide = (int)GetPrivateProfileIntA("video", "widescreen", 0, s_ini);
         s_cfg.view = (int)GetPrivateProfileIntA("video", "wide_view", 0, s_ini);
-        s_cfg.hud = (int)GetPrivateProfileIntA("video", "hud_4_3", 1, s_ini);
         s_cfg.limit = (int)GetPrivateProfileIntA("video", "fps_limit", 0, s_ini);
         s_cfg.vsync = (int)GetPrivateProfileIntA("video", "vsync", 0, s_ini);
         s_cfg.point = (int)GetPrivateProfileIntA("video", "sharp", 0, s_ini);
@@ -2131,7 +2099,6 @@ static void settings_load(void)
     env_int("RECOMP_WIDESCREEN", &s_cfg.wide);
     env_int("RECOMP_WIDE_VIEW", &s_cfg.view);
     env_int("RECOMP_WIDE_VIEW_FLIP", &s_view_flip_ms);
-    env_int("RECOMP_WIDE_HUD43", &s_cfg.hud);
     env_int("RECOMP_FPS_LIMIT", &s_cfg.limit);
     env_int("RECOMP_PRESENT_VSYNC", &s_cfg.vsync);
     env_int("RECOMP_ANISOTROPY", &s_cfg.aniso);
@@ -2139,7 +2106,6 @@ static void settings_load(void)
         s_cfg.point = *f == 'p' || *f == 'P';
     s_cfg.wide = s_cfg.wide != 0;
     s_cfg.view = s_cfg.view != 0;
-    s_cfg.hud = s_cfg.hud != 0;
     if (s_cfg.limit < 0) s_cfg.limit = 0;
     {
         /* The nearest offered level at or below what was asked. */
@@ -2164,7 +2130,6 @@ static void settings_save(void)
     _snprintf(v, sizeof v, "%d", s_cfg.height);  WritePrivateProfileStringA("video", "height", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.wide);    WritePrivateProfileStringA("video", "widescreen", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.view);    WritePrivateProfileStringA("video", "wide_view", v, s_ini);
-    _snprintf(v, sizeof v, "%d", s_cfg.hud);     WritePrivateProfileStringA("video", "hud_4_3", v, s_ini);
     /* The nearest whole scale, for a build from before heights. */
     _snprintf(v, sizeof v, "%d", (s_cfg.height + 240) / 480); WritePrivateProfileStringA("video", "scale", v, s_ini);
     _snprintf(v, sizeof v, "%d", s_cfg.limit);   WritePrivateProfileStringA("video", "fps_limit", v, s_ini);
@@ -2186,6 +2151,48 @@ static int make_blit_sampler(void)
     smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     smp.MaxLOD = D3D11_FLOAT32_MAX;
     return SUCCEEDED(ID3D11Device_CreateSamplerState(s_dev, &smp, &s_blit_samp));
+}
+
+/* A plain window takes the picture's shape, keeping its height (smaller if it
+ * would not fit the work area), centred where it was: it opens 4:3, and 16:9 is
+ * then letterboxed in it. Maximised, minimised and fullscreen windows are left
+ * alone. The window belongs to another thread, so the move is not waited for. */
+static void window_fit(void)
+{
+    RECT c, w, work, r;
+    LONG style;
+    int h, cw, ww, wh, x, y;
+
+    if (!s_hwnd || IsZoomed(s_hwnd) || IsIconic(s_hwnd))
+        return;
+    style = (LONG)GetWindowLongPtrA(s_hwnd, GWL_STYLE);
+    if (!(style & WS_CAPTION) || !GetClientRect(s_hwnd, &c) || !GetWindowRect(s_hwnd, &w))
+        return;
+    h = c.bottom - c.top;
+    cw = s_cfg.wide ? (h * 16 + 8) / 9 : (h * 4 + 1) / 3;
+    if (h <= 0 || cw == c.right - c.left)
+        return;
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0))
+        return;
+    for (;;) {
+        r.left = r.top = 0;
+        r.right = cw;
+        r.bottom = h;
+        AdjustWindowRect(&r, (DWORD)style, FALSE);
+        ww = r.right - r.left;
+        wh = r.bottom - r.top;
+        if (ww <= work.right - work.left || h < 240)
+            break;
+        h = h * 7 / 8;
+        cw = s_cfg.wide ? (h * 16 + 8) / 9 : (h * 4 + 1) / 3;
+    }
+    x = (w.left + w.right) / 2 - ww / 2;
+    y = (w.top + w.bottom) / 2 - wh / 2;
+    if (x + ww > work.right) x = work.right - ww;
+    if (y + wh > work.bottom) y = work.bottom - wh;
+    if (x < work.left) x = work.left;
+    if (y < work.top) y = work.top;
+    SetWindowPos(s_hwnd, NULL, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 }
 
 static void client_size(UINT *w, UINT *h)
@@ -2280,7 +2287,7 @@ static int blit_init(HWND hwnd)
  * While the panel is open the game sees its pads at rest (xbox_input_held). */
 extern volatile long xbox_input_held;          /* src/input/xinput_device.c */
 
-enum { ROW_SCALE, ROW_ASPECT, ROW_HUD, ROW_LIMIT, ROW_VSYNC, ROW_FILTER, ROW_ANISO, ROW_COUNTER, ROW_BOOT, ROWS };
+enum { ROW_SCALE, ROW_ASPECT, ROW_LIMIT, ROW_VSYNC, ROW_FILTER, ROW_ANISO, ROW_COUNTER, ROW_BOOT, ROWS };
 
 static struct {
     int open, row;
@@ -2325,16 +2332,12 @@ static void ui_change(int row, int dir)
         s_cfg.height = s_heights[i];
         res_apply();                            /* targets remake themselves as they are drawn */
         break;
-    case ROW_ASPECT:                            /* 4:3, 16:9 stretched, 16:9 wider view */
+    case ROW_ASPECT:                            /* 4:3, 16:9 stretched, 16:9 widescreen */
         i = (s_cfg.wide ? 1 + s_cfg.view : 0) + (dir < 0 ? 2 : 1);
         s_cfg.wide = i % 3 != 0;
         s_cfg.view = i % 3 == 2;
         res_apply();
-        break;
-    case ROW_HUD:                               /* only the wider view has a choice to make */
-        if (!(s_cfg.wide && s_cfg.view))
-            return;
-        s_cfg.hud = !s_cfg.hud;
+        window_fit();
         break;
     case ROW_LIMIT:
         for (i = 0; i < NLIMITS && s_limits[i] != s_cfg.limit; i++)
@@ -2543,7 +2546,6 @@ static void ui_draw(float x0, float y0)
                   "Settings                      %4.0f fps\n"
                   "Resolution    %dx%d%s\n"
                   "Aspect        %s\n"
-                  "HUD           %s\n"
                   "Frame limit   %s\n"
                   "Vsync         %s\n"
                   "Scaling       %s\n"
@@ -2558,8 +2560,7 @@ static void ui_draw(float x0, float y0)
                   s_ui.fps, s_ui.game_pw, s_ui.game_ph,
                   s_cfg.height == 720 ? "  (720p)" : s_cfg.height == 1080 ? "  (1080p)"
                   : s_cfg.height == 1440 ? "  (1440p)" : s_cfg.height == 2160 ? "  (4K)" : "",
-                  !s_cfg.wide ? "4:3" : s_cfg.view ? "16:9 (wider view)" : "16:9 (stretched)",
-                  !(s_cfg.wide && s_cfg.view) ? "with the picture" : s_cfg.hud ? "4:3 in the middle" : "stretched",
+                  !s_cfg.wide ? "4:3" : s_cfg.view ? "16:9 (widescreen)" : "16:9 (stretched)",
                   limit, onoff[s_cfg.vsync], sharp[s_cfg.point], aniso, onoff[s_cfg.counter],
                   s_cfg.boot ? "skip (from next start)" : "keep", UCC2_VERSION);
         hl = 1 + s_ui.row;
@@ -2773,8 +2774,12 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
         }
         if (direct && !s_failed_present) {
             void *hwnd = s_chain ? (void *)s_hwnd : xbox_FramebufferWindowClaim();
-            if (hwnd && !s_chain && !blit_init((HWND)hwnd))
-                s_failed_present = 1;
+            if (hwnd && !s_chain) {
+                if (blit_init((HWND)hwnd))
+                    window_fit();
+                else
+                    s_failed_present = 1;
+            }
             if (s_chain) {
                 blit_present(t);
                 if (!dumps) {

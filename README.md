@@ -55,8 +55,7 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 | Setting | Choices |
 |---|---|
 | Resolution | 640x480 (the console's) up to 4K |
-| Aspect | 4:3, 16:9 (stretched), or 16:9 (wider view): the game sees more to the sides |
-| HUD | With the wider view: kept 4:3 in the middle (the default), or stretched to the width |
+| Aspect | 4:3, 16:9 (stretched), or 16:9 (widescreen): the game sees more to the sides, and the HUD and menus keep their shape, with the HUD spread to the screen's edges |
 | Frame limit | Off, 30, 60, 120, 144 or 240 fps |
 | Vsync | On or off |
 | Scaling | Smooth or sharp |
