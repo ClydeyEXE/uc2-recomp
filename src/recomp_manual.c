@@ -995,7 +995,8 @@ void sub_00099350(void)
  * by which third its middle is in, so the crosshair is centred and the radar
  * sits on the right. Between the top and bottom strips a widget stays with the
  * middle (the combo wheel by the crosshair) unless it lies wholly in an outer
- * third. One wider than 400 pixels (the scoreboard) is centred.
+ * third. One wider than 400 pixels (the scoreboard) is centred, and a line of
+ * text ending at the right margin (x 582-600) goes to the right edge.
  * RECOMP_WIDE_ZONES=0 leaves the HUD laid out from the left.
  */
 extern void sub_00142960_gen(void);
@@ -1048,6 +1049,8 @@ static void wide_spread(WideQuad *q, int n, int apply, uint32_t log_ret)
         float cx = (bx0[r] + bx1[r]) * 0.5f, dx;
         if (bx1[r] - bx0[r] > 400.0f)
             dx = extra * 0.5f;
+        else if (by1[r] - by0[r] <= 40.0f && bx1[r] >= 582.0f && bx1[r] <= 600.0f)
+            dx = extra;                 /* a line of text set against the right margin (kill messages) */
         else if (by0[r] >= 100.0f && by1[r] <= 420.0f)
             /* Between the top and bottom strips: around the crosshair, so it
              * moves with the middle, unless it lies wholly in an outer third. */
@@ -1121,6 +1124,16 @@ void sub_00142960(void)
                         fprintf(stderr, "[WIDELOG] %06X full width: entry %d type %u vertex %d y %.0f u %.3f v %.3f "
                                 "colour %08X material %08X\n", log_ret, (int)e, en[0] & 0xFF, (int)i, v[i * 6 + 1],
                                 v[i * 6 + 4], v[i * 6 + 5], *(const uint32_t *)&v[i * 6 + 3], en[1]);
+                }
+            if (nv % 4 == 0)                /* full-width bars down to the bottom: the game stops at 479 */
+                for (i = 0; i < nv; i += 4) {
+                    int full = 0;
+                    for (k = 0; k < 4; k++)
+                        full |= v[(i + k) * 6] > 640.5f;
+                    if (full)
+                        for (k = 0; k < 4; k++)
+                            if (v[(i + k) * 6 + 1] >= 476.0f && v[(i + k) * 6 + 1] < 480.0f)
+                                v[(i + k) * 6 + 1] = 480.0f;
                 }
             if (centre) {                   /* a menu: the whole 4:3 layout to the middle */
                 int m = nv % 4 == 0 ? 4 : nv;   /* quads, or the batch as one piece */
