@@ -62,7 +62,7 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 | Scaling | Smooth or sharp |
 | Anisotropic | Off, 2x, 4x, 8x or 16x: sharper floors and walls at an angle |
 | FPS counter | On or off |
-| Boot waits | Skip the 9 seconds the startup screens hold for |
+| Boot waits | Keep, or skip the 9 seconds the startup screens hold for (from the next start) |
 
 **Up / Down** picks a setting, **Left / Right** (or A, Enter) changes it, and **F1**, **Esc** or **B** closes the menu.
 Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`. The menu's bottom line shows which
