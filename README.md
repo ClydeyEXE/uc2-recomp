@@ -14,7 +14,8 @@ emulator.
 **You need**
 - Windows 10 or 11
 - About 3 GB of free space, plus about 6 GB if setup needs to install the Visual Studio Build Tools
-- A disc image (`.iso`) of your own copy of the game
+- A disc image (`.iso`) of your own copy of the game: the USA/Europe release, which is one disc for both regions.
+  A full dump or a trimmed `.xiso.iso` both work, as setup checks the game's `default.xbe`, not the image.
 
 ### 1. Download
 Open the [latest release](https://github.com/ClydeyEXE/uc2-recomp/releases/latest) and download **Source code
