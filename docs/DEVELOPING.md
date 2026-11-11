@@ -16,6 +16,19 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   frames), and it backs out of a wrong menu and retries. It ends with `ROUTE reached match at <t> s` or
   `ROUTE failed: <state>`, then runs `check_run.py`, and exits 0 only if both pass. A run's log, route and match
   frames go in `build/runs/<name>/`. Boot waits are skipped unless `--boot-waits`; `--map` picks another CTF arena.
+  - `--direct` skips the menus: `RECOMP_CMDLINE` hands the game a start URL (`CTF-Aqueduct?Game=UCGameplay.CTFGame?
+    NumBots=0?GamepadID=0?...`), it presses A through the boot logos (any pad button ends them) and once on the
+    "press fire" scoreboard, and the match is up about 9 s after launch. `GamepadID=0` is needed: without the title's
+    Start no pad is bound to the player, who then cannot press fire, and `PlayersMustBeReady=false` does not skip that
+    screen in a standalone game. It runs 4:3 with no bots unless `--bots N`, and with `RECOMP_BENCH_SPAWN=<--seed>`.
+- `RECOMP_BENCH_SPAWN=<seed>` fixes where the player spawns. The script picks a start with `RatePlayerStart`, which
+  adds a random term through `RandRange`, so the wrapped `FRand` and `Rand` natives (`sub_0003E890`, `sub_0003D930` in
+  `src/recomp_manual.c`) return values from a private sequence when `RatePlayerStart` is one of the three script
+  frames running. It finds the caller's frame through `CallFunction`'s argument, and logs the first chains as
+  `[BENCH]`. That walk takes about 2 ms (its `VirtualQuery` checks), so it stops for the rest of the run once the
+  spawn is rated (`[BENCH] spawn chosen, hook off`); bots' first spawns are rated in the same burst, and respawns
+  are random. Script `FRand`/`Rand` run only about once a second in an idle match (`[BENCH] ... calls in 10 s`). Seed 1 is CTF-Aqueduct's corridor view; 2 spawns elsewhere and 3 one start further along the corridor.
+  A fixed `srand` would not do: every frame's emitters draw from the same `rand()` before the spawn.
   - It needs reference frames in `build/route/` (`main_menu.png`, `match.png` and others), captured on this machine
     at 2x window scale. They come from the game, so they stay local; a new machine has to capture its own.
   - It reads frames from the window with PrintWindow, so the window may be covered but not minimised. That costs the
@@ -23,11 +36,14 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
     85.0, 82.0 and 85.9 fps (each grab takes the driver about 21 ms). Do not use
     `RECOMP_FB_DUMP` (or `--dumps`/`--no-window`) on runs whose fps matters: reading every frame back costs 10-13 ms a
     frame, and a match drops from about 105 to 37 fps.
-- `python -I tools/ab.py --runs 4 --secs 50 --a "" --b "RECOMP_X=1"` compares two settings (or two builds, with
-  `--a-exe`/`--b-exe`) over interleaved runs. An idle match's fps depends on where the player spawns (65 to 158 fps on
-  CTF-Aqueduct), so it forfeits and re-enters until the spawn looks down the long corridor (#1's heavy view, needs
-  `build/route/corridor.png`), measures only windows with nothing moving in view, and reports medians, spread and a
-  95% interval. Runs vary about 3.5% in that view, so 3 a side only detects about 10%; a run takes about 4 minutes.
+- `python -I tools/ab.py --direct --runs 3 --secs 60 --a "" --b "RECOMP_X=1"` compares two settings (or two builds,
+  with `--a-exe`/`--b-exe`) over interleaved runs. An idle match's fps depends on where the player spawns (65 to 158
+  fps on CTF-Aqueduct), so `--direct` boots each run straight into the match at the spawn looking down the long
+  corridor (#1's heavy view, checked against `build/route/corridor.png`), with no bots. It measures only windows with
+  nothing moving in view and reports medians, spread and a 95% interval. A run takes about 85 s, and runs vary
+  about 1% (A/A, 85-87.5 fps), so 3 a side detects about 3%. `--bots N` adds bots for real load. Every run is 4:3
+  whatever the settings panel says, as the reference frames are. Without `--direct` it goes through the menus and
+  forfeits until the spawn is the corridor (about one spawn in ten since toolkit v0.17.0), several minutes a run.
 - `python -I tools/check_run.py <log>` says whether a run worked: maps loaded, match reached, crash, watchdog as timer
   or hang, untranslated instructions reached, menu and match fps (`settled` leaves out the window with the load),
   hitches and failed opens. It exits 0 on pass, 1 on fail; `--min-fps`, `--no-expect-match` and `--json` adjust it.

@@ -1,35 +1,50 @@
 """Compare match fps between two settings or two builds, over several interleaved runs.
 
-    python -I tools/ab.py --runs 4 --secs 60 --a "" --b "RECOMP_X=1" [--a-exe P --b-exe P]
-                          [--name ab1] [--view corridor|any] [--rerolls 15] [--quick]
+    python -I tools/ab.py --direct --runs 3 --secs 60 --a "" --b "RECOMP_X=1" [--a-exe P --b-exe P]
+                          [--name ab1] [--bots N] [--seed S]
+    python -I tools/ab.py --runs 4 --secs 60 ... [--view corridor|any] [--rerolls 15] [--quick]
 
 A and B are overrides in drive_match's --env form ("K=V;K=V"); --a-exe/--b-exe run
 another build (copy build/game/ucc2_recomp.exe aside before rebuilding; it finds
 assets/ from the repository root, so any path works). Runs go A B A B ..., so
 drift hits both sides alike, each driven into CTF-Aqueduct by tools/drive_match.py.
+Every run is 4:3 (RECOMP_WIDESCREEN=0, RECOMP_WIDE_VIEW=0, before A's or B's own
+overrides), whatever the settings panel says, as the reference frames are.
 
 Where the player spawns sets an idle match's fps: the red base has at least seven
-spawn points, from 65 to 158 fps, picked at random, and the view from each is the
-same every time. --view corridor (the default) wants the spawn that looks down the
-long corridor, the heavy view of issue #1 (63-71 fps, 10-11 ms walker cpu a frame).
-It is about one spawn in five or six, so a match spawning elsewhere is forfeited
-and entered again (Driver.rematch, about 34 s) up to --rerolls times: a run takes
-2-7 minutes, about 4 on average. Spawns are told apart by the scene above the player
-against build/route/corridor.png (local, from the game). --view any measures
-wherever the player spawned, and says which; its fps spreads over 65-158.
+spawn points, from 65 to 158 fps, and the view from each is the same every time.
+The corridor view, looking down the long corridor, is the heavy view of issue #1.
+Spawns are told apart by the scene above the player against build/route/corridor.png
+(local, from the game; same spawn 0-1, the next start along the corridor about 5).
 
-Noise floor (A/A, 12 runs in the corridor view): 63-71 fps, 3.5% standard
-deviation a run. It comes from the match, not the process (two corridor spawns in
-one process ran 64 and 71), so only more runs bring it down: 3 a side detects
-about 10% or more, 6 a side about 5% (estimates from that spread).
+--direct (use this) boots straight into the match (drive_match --direct): no menus,
+no bots unless --bots, no time limit, and RECOMP_BENCH_SPAWN=<--seed> fixing the
+spawn. Seed 1, the default, is the corridor view every time (6 of 6 in the A/A below,
+plus 9 of 9 other runs). A run with --secs 60 takes 83-85 s (the match is up 9 s
+after launch); the A/A below ran before the boot logos were skipped, at 102 s. A run that spawns elsewhere fails rather than rerolling. With no bots nothing
+crosses the view, so every window is kept, but the workload is lighter than a played
+match: --bots N puts bots back for real load (and they end the measurement when they
+reach the spawn, about a minute in).
 
-The measurement starts once the view is reached and lasts about --secs + 10 s. It
-counts only whole [FRAMES] windows (10 s each) in which the view stood still: a
-frame is looked at every second, and a window is "busy", and dropped, if any of its
-frames differs from the view (a bot running through, shots, the player hit). Bots
-reach the corridor spawn about a minute in, so 40-60 s is the useful length. Two
-misses running (the player killed, which leaves the scoreboard up) end it, and a
-run with under two still windows is excluded. Per run: fps over the still windows,
+Noise floor, --direct (A/A, 3 runs a side, 60 s, 2026-11-11, v0.17.0 toolkit): 85.0-
+87.5 fps, 1.0% standard deviation a run; B/A -0.9%, 95% CI -2.1% to +1.5%. So 3 a side
+detects about 3% or more.
+
+Without --direct, runs go through the menus and the spawn is random: --view corridor
+(the default) forfeits a match spawning elsewhere and enters again (Driver.rematch,
+about 34 s) up to --rerolls times, and since toolkit v0.17.0 the corridor is about one
+spawn in ten, so a run takes several minutes. --view any measures wherever the player
+spawned, and says which; its fps spreads over 65-158. Noise floor through the menus
+(A/A, 12 runs in the corridor view, older build, with bots): 63-71 fps, 3.5% standard
+deviation a run, so 3 a side detects about 10%, 6 a side about 5%.
+
+The measurement starts once the view is reached and has settled for 2 s, and lasts
+about --secs + 10 s. It counts only whole [FRAMES] windows (10 s each) in which the
+view stood still: a frame is looked at every second and compared with the run's own
+view at the start, and a window is "busy", and dropped, if any of its frames differs
+(a bot running through, shots, the player hit). Two misses running (the player
+killed, which leaves the scoreboard up) end it, and a run with under two still
+windows is excluded. Per run: fps over the still windows,
 p50 and p99 as the median of their values, walker cpu ms a frame, and [HITCH] lines.
 
 A run whose route fails, never finds the view, crashes, or loses the view early is
@@ -60,6 +75,7 @@ RE_HITCH = re.compile(r"^\[HITCH\] (\d+) ms frame")
 CHECK_EVERY = 1.0     # s between frames looked at while measuring; a grab costs the game nothing measurable
 CLEAN = 3.0           # scene distance under which nothing moves in the view (still view: 0-1)
 MIN_WINDOWS = 2
+BASE_ENV = "RECOMP_WIDESCREEN=0;RECOMP_WIDE_VIEW=0"
 
 
 def game_running():
@@ -103,9 +119,13 @@ def run_one(args, label, env, exe):
     run = os.path.join(args.out, label)
     os.makedirs(run)
     timeout = int(150 + 45 * args.rerolls + args.secs + 40)
+    # The references are 4:3, so every run is, whatever the settings panel says;
+    # the side's own overrides come after and win.
+    env = BASE_ENV + (";" + env if env else "")
     dargs = argparse.Namespace(secs=args.secs, timeout=timeout, map="CTF-Aqueduct", env=env, exe=exe,
                                no_window=False, dumps=False, boot_waits=False, keep_frames=False,
-                               verbose=False, min_fps=None)
+                               verbose=False, min_fps=None, direct=args.direct, bots=args.bots,
+                               seed=args.seed)
     drv = dm.Driver(dargs, run)
     rec = {"run": label, "env": env, "exe": exe, "status": "ok", "reason": "", "spawn": None, "rerolls": 0}
     t0 = time.time()
@@ -116,6 +136,10 @@ def run_one(args, label, env, exe):
         ref = drv.refs.get("corridor")
         if args.view == "corridor":
             while not drv.in_view(im):
+                if args.direct:
+                    drv.frames.save("spawn")
+                    raise dm.Failed("spawned outside the corridor (scene %.1f; seed %d)"
+                                    % (dm.dist(im, ref, dm.SCENE), args.seed))
                 if rec["rerolls"] >= args.rerolls:
                     raise dm.Failed("no corridor spawn in %d rerolls" % args.rerolls)
                 rec["rerolls"] += 1
@@ -127,7 +151,13 @@ def run_one(args, label, env, exe):
         else:
             rec["spawn"] = ("corridor" if drv.in_view(im) else
                             "other(%.0f)" % dm.dist(im, ref, dm.SCENE) if ref else "?")
-            ref = im
+        # Stillness is judged against this run's own view once the spawn has
+        # settled, not the reference: small differences between builds then
+        # do not make every window busy.
+        drv.wait(2.0)
+        im2 = drv.frame()
+        ref = im2 if im2 is not None and drv.is_match(im2) else im
+        rec["spawn_scene"] = round(dm.dist(ref, drv.refs.get("corridor"), dm.SCENE), 1)
         drv.frames.save("spawn")
 
         def scene(f):
@@ -248,8 +278,9 @@ def quartiles(v):
 def report(args, recs):
     out = []
     say = out.append
-    say("%s: %d run%s a side, %g s in the %s view" % (args.name, args.runs, "s" * (args.runs > 1), args.secs,
-                                                     "corridor" if args.view == "corridor" else "spawn"))
+    say("%s: %d run%s a side, %g s in the %s view%s" % (
+        args.name, args.runs, "s" * (args.runs > 1), args.secs, "corridor" if args.view == "corridor" else "spawn",
+        ", direct boot (seed %d, %d bots)" % (args.seed, args.bots) if args.direct else ", through the menus"))
     say('A: env "%s"%s' % (args.a, ", exe " + args.a_exe if args.a_exe else ""))
     say('B: env "%s"%s' % (args.b, ", exe " + args.b_exe if args.b_exe else ""))
     say("")
@@ -315,10 +346,14 @@ def main():
     ap.add_argument("--view", choices=["corridor", "any"], default="corridor")
     ap.add_argument("--rerolls", type=int, default=15, help="most forfeits a run spends looking for the view")
     ap.add_argument("--quick", action="store_true", help="smoke check: 1 run a side, 20 s, any view")
+    ap.add_argument("--direct", action="store_true",
+                    help="boot straight into the match at a fixed spawn (drive_match --direct), no menus or rerolls")
+    ap.add_argument("--bots", type=int, default=0, help="--direct: bots in the match (real load)")
+    ap.add_argument("--seed", type=int, default=dm.BENCH_SEED, help="--direct: spawn seed")
     args = ap.parse_args()
     if args.quick:
         args.runs, args.secs, args.view = 1, 20, "any"
-    if args.view == "any":
+    if args.view == "any" or args.direct:
         args.rerolls = 0
 
     for exe in (args.a_exe, args.b_exe, dm.EXE):

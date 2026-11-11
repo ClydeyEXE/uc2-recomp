@@ -2,7 +2,7 @@
 
     python -I tools/drive_match.py [--secs 120] [--timeout 600] [--map CTF-Aqueduct] [--name run1]
                                    [--env "K=V;K=V"] [--no-window] [--dumps] [--keep-frames]
-                                   [--boot-waits]
+                                   [--boot-waits] [--direct [--bots N] [--seed S]]
 
 Starts build/game/ucc2_recomp.exe with run_match.ps1's settings, but with no
 RECOMP_FLIP_PACING and with RECOMP_SKIP_BOOT_WAITS=1 unless --boot-waits. Follows
@@ -21,6 +21,15 @@ once the screen it is meant for is up:
     armory      A for each category, then A on "Begin Match?", until <map>.lin opens
     scoreboard  A ("press fire") every 2.5 s until the HUD shows
     match       frame: the HUD's coloured pixels match route/match.png, twice running
+
+--direct skips the menus: RECOMP_CMDLINE gives the game a start URL (see
+bench_url), so it boots straight into <map>.lin with no title or menus, and the
+route is boot (A pressed through the logos, which any button ends, until the map
+opens), then scoreboard and match as above, with no profile loaded: the match is
+up about 9 s after launch. It has no bots unless --bots, no time or score
+limit, a 4:3 picture whatever the settings panel says (RECOMP_WIDESCREEN=0,
+RECOMP_WIDE_VIEW=0), and RECOMP_BENCH_SPAWN=<--seed>, which fixes the spawn
+(src/recomp_manual.c). --env overrides any of these.
 
 Each press waits until the game has opened no file for 1.2 s, as a screen that
 is still sliding in drops input. A press that does not bring its event in a few
@@ -89,17 +98,45 @@ HUD_BOXES = [(0, 0, 250, 45), (500, 0, 640, 100), (30, 290, 150, 420)]
 HUD_MIN = 0.6         # share of those pixels that match: 0.77-1.0 in a match, 0.4 or less elsewhere
 HEADER_MAX, SCORE_MAX = 9.0, 10.0
 # The scene above the player and clear of the HUD, for telling spawn views apart:
-# the same spawn measures 0-1 against its reference, any other 28 or more.
+# at 4:3 the same spawn measures 0-1 against its reference, the next start along
+# the CTF-Aqueduct corridor about 5, any other 28 or more. SPAWN_MAX tells spawns
+# apart; SCENE_MAX is what tools/ab.py counts as the view lost (a bot or a death).
 SCENE = ((160, 50, 620, 280), (46, 23))
+SPAWN_MAX = 3.0
 SCENE_MAX = 8.0
 # Seconds to leave a screen after the last file the game opened, before pressing.
 SETTLE, SETTLE_MAX = 1.2, 3.0
+# --direct: the game class for a map prefix, and the spawn seed whose view on
+# CTF-Aqueduct is the corridor (build/route/corridor.png). Seed 2 spawns elsewhere
+# and 3 at the next start along the corridor.
+GAME_CLASSES = {"CTF": "UCGameplay.CTFGame"}
+BENCH_SEED = 1
 # Game type portraits, by map prefix. Only CTF has been seen; the rest are guesses.
 GAMETYPES = {"CTF": ["CTF"], "DM": ["DM", "DeathMatch"], "TDM": ["TDM", "TeamDeathMatch"]}
 
 RE_FILE = re.compile(r"\[FILE\] (\S+) \(disp [^)]*\) -> 0x00000000")
 RE_PORTRAIT = re.compile(r"Portrait_(GameType|Arena|Char|Armory)_(\w+)\.xmv$", re.I)
 RE_MAP = re.compile(r"XboxMaps\\([\w-]+)\.lin$", re.I)
+
+
+def bench_url(map_name, bots=0):
+    """The start URL for --direct. No spaces: the game takes the command line's first token."""
+    cls = GAME_CLASSES.get(map_name.split("-", 1)[0].upper())
+    if not cls:
+        raise ValueError("--direct knows no game class for %s" % map_name)
+    # GamepadID: the player's pad, which the title's Start would otherwise pick; with
+    # none, the player cannot press fire to join. PlayersMustBeReady=false does not
+    # skip "press fire" in a standalone game.
+    return ("%s?Game=%s?NumBots=%d%s?GamepadID=0?PlayersMustBeReady=false?TimeLimit=0?GoalScore=0"
+            % (map_name, cls, bots, "" if bots else "?VsBots=false"))
+
+
+def bench_env(map_name, bots=0, seed=BENCH_SEED):
+    """Settings for a run booted straight into a match, under any --env overrides."""
+    env = {"RECOMP_CMDLINE": bench_url(map_name, bots), "RECOMP_WIDESCREEN": "0", "RECOMP_WIDE_VIEW": "0"}
+    if seed:
+        env["RECOMP_BENCH_SPAWN"] = str(seed)
+    return env
 
 
 class Failed(Exception):
@@ -314,6 +351,7 @@ class Driver:
         want = args.map.split("-", 1)
         self.want_type = want[0].upper() if len(want) == 2 else "CTF"
         self.want_arena = want[-1]
+        self.direct = getattr(args, "direct", False)
 
     # -- plumbing
 
@@ -337,6 +375,9 @@ class Driver:
         env["RECOMP_WATCHDOG_SECS"] = str(self.args.timeout)
         if self.args.boot_waits:
             env["RECOMP_SKIP_BOOT_WAITS"] = "0"     # 0 also beats the settings panel's ini
+        if self.direct:
+            env.update(bench_env(self.args.map, getattr(self.args, "bots", 0),
+                                 getattr(self.args, "seed", BENCH_SEED)))
         dump = None
         if self.args.no_window or self.args.dumps:
             dump = os.path.join(self.run, "dump_")
@@ -455,6 +496,26 @@ class Driver:
     def drive(self):
         self.launch()
         self.enter("boot")
+        if self.direct:
+            # Every boot opens Menu.lin once early, as it does Script.lin; the menu map
+            # loading opens it again. The boot logos stop for any pad button
+            # (sub_0002E310), so A is pressed through them; the pad attaches
+            # partway into them.
+            want = r"XboxMaps\\%s\.lin$" % re.escape(self.args.map)
+            end = self.now() + 180
+            while not self.seen(want, 0):
+                if self.now() > end:
+                    raise Fatal("%s never opened: start URL not taken?" % self.args.map)
+                # Until the engine loads: Script.lin opens once with the logos, again after.
+                scripts = sum(bool(re.search(r"System\\Script\.lin$", p, re.I)) for _, p in self.events)
+                if self.seen(r"UC2_Logos\.xmv$", 0) and scripts < 2:
+                    with open(self.pad_path, "a") as f:
+                        f.write("a:150\n")
+                self.wait(1.0)
+            self.enter("loading")
+            self.note("map %s" % self.args.map)
+            self.match()
+            return
         if not self.wait_for(r"UI_Start_Movie\w*\.xmv$", 0, 180):
             raise Failed("no title movie")
         self.enter("title")
@@ -607,6 +668,8 @@ class Driver:
         self.enter("match")
         self.reached = self.now()
         self.frames.save("match_first")
+        if self.direct and sum(bool(re.search(r"XboxMaps\\Menu\.lin$", p, re.I)) for _, p in self.events) > 1:
+            raise Fatal("the menu map loaded")
 
     def rematch(self):
         """Forfeit the match and drive into a new one, which spawns the player anew.
@@ -632,7 +695,7 @@ class Driver:
     def in_view(self, im, name="corridor"):
         """Whether frame im shows the scene of reference route/<name>.png, HUD up."""
         return (im is not None and self.refs.get(name) is not None and self.is_match(im)
-                and dist(im, self.refs[name], SCENE) < SCENE_MAX)
+                and dist(im, self.refs[name], SCENE) < SPAWN_MAX)
 
 
 def stay(drv, secs):
@@ -666,12 +729,17 @@ def main():
     ap.add_argument("--boot-waits", action="store_true",
                     help="keep the title's two boot sleeps (about 9 s; skipped by default)")
     ap.add_argument("--keep-frames", action="store_true", help="keep every frame looked at")
+    ap.add_argument("--direct", action="store_true", help="boot straight into the match, no menus")
+    ap.add_argument("--bots", type=int, default=0, help="--direct: bots in the match")
+    ap.add_argument("--seed", type=int, default=BENCH_SEED, help="--direct: spawn seed, 0 for a random spawn")
     ap.add_argument("--min-fps", type=float, default=None, help="passed to check_run as min_match_fps")
     ap.add_argument("-v", "--verbose", action="store_true", help="print the route as it goes")
     args = ap.parse_args()
 
     if not os.path.exists(EXE):
         sys.exit("no %s: build first" % EXE)
+    if args.direct:
+        bench_url(args.map)        # a map with no known game class fails here
     if not os.path.exists(os.path.join(ROUTE, "main_menu.png")):
         print("warning: no reference frames in %s; menu and match screens cannot be recognised" % ROUTE)
     name = args.name or time.strftime("drive-%Y%m%d-%H%M%S")
