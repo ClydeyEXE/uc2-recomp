@@ -1,5 +1,5 @@
 diff --git a/tools/disasm/engine.py b/tools/disasm/engine.py
-index dfb23d2..5344475 100644
+index 2063a15..28789e3 100644
 --- a/tools/disasm/engine.py
 +++ b/tools/disasm/engine.py
 @@ -493,9 +493,11 @@ class DisasmEngine:
@@ -34,7 +34,7 @@ index dfb23d2..5344475 100644
                          and (not insn.eflags or any(
                              insn.eflags & flag("TEST", f) for f in pending))):
 diff --git a/tools/recomp/disasm.py b/tools/recomp/disasm.py
-index 7ef8cad..5aaa84f 100644
+index 6eeb4e3..1cbed20 100644
 --- a/tools/recomp/disasm.py
 +++ b/tools/recomp/disasm.py
 @@ -147,6 +147,28 @@ def _parse_operand(cs, cs_op, insn_obj):
@@ -66,7 +66,16 @@ index 7ef8cad..5aaa84f 100644
  class Disassembler:
      """Capstone-based x86-32 disassembler."""
  
-@@ -231,8 +253,9 @@ class Disassembler:
+@@ -181,7 +203,7 @@ class Disassembler:
+         """Instructions from `entry` up to the end of raw_bytes[:size], the way
+         Capstone's disasm walks them: it stops at the first undecodable byte."""
+         if self._cfg_cache is None:
+-            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
++            for cs_insn in decode_stream(self._cs, raw_bytes[offset:size], entry):
+                 yield self._decode_instruction(cs_insn)
+             return
+         address = entry
+@@ -269,8 +291,9 @@ class Disassembler:
              for addr in [a for a, i in decoded.items()
                           if a < point < a + i.size]:
                  del decoded[addr]
@@ -78,12 +87,3 @@ index 7ef8cad..5aaa84f 100644
                  if cs_insn.address in decoded:
                      break          # rejoined a stream we already have
                  # The misaligned stream did not only straddle `point`: until
-@@ -264,7 +287,7 @@ class Disassembler:
-             if not (start_va <= entry < end_va) or entry in decoded:
-                 continue
-             offset = entry - start_va
--            for cs_insn in self._cs.disasm(raw_bytes[offset:size], entry):
-+            for cs_insn in decode_stream(self._cs, raw_bytes[offset:size], entry):
-                 if cs_insn.address != entry and cs_insn.address in stop_addresses:
-                     break
-                 if cs_insn.address >= end_va or cs_insn.address in decoded:

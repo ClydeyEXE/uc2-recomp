@@ -20,7 +20,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 $toolkit = Join-Path $repo "third_party\xboxrecomp"
 # Keep in step with the submodule. Used when the repo came as a zip, which leaves third_party/xboxrecomp empty.
 $toolkitUrl = "https://github.com/sp00nznet/xboxrecomp.git"
-$toolkitPin = "f0f8a461496a4f23d9b0aeaa284b8d70ba7ab82b"
+$toolkitPin = "343b6d8901723b37ce568b2418c5df4e1fe1d223"
 $assets = Join-Path $repo "assets"
 $xbe = Join-Path $assets "default.xbe"
 $gen = Join-Path $repo "src\recomp\gen"

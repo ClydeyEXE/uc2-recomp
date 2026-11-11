@@ -28,7 +28,7 @@ that others post.
 - Don't build or run tests while the game is running: the build locks the exe, and tests open a window.
 - Adding or removing a hook, wrapper or hand-written function in `src/recomp_manual.c` means rerunning `tools.recomp` with
   the flags in `docs/BUILDING.md` (or `tools/setup.ps1 -Regenerate`), then a rebuild. Allow about 10 minutes.
-- `third_party/xboxrecomp` is pinned at f0f8a46 and shows as modified because `patches/` are applied in its working tree.
+- `third_party/xboxrecomp` is pinned at 343b6d8 (v0.17.0) and shows as modified because `patches/` are applied in its working tree.
   After editing it, regenerate the patch.
 
 ## Before concluding
