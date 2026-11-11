@@ -266,13 +266,14 @@ static ID3D11DeviceContext *s_ctx;
 static ID3D11VertexShader  *s_vs, *s_vs_clear;
 static ID3D11PixelShader   *s_ps, *s_ps_clear, *s_ps_zenc, *s_ps_zdec;
 static ID3D11InputLayout   *s_layout;
-static ID3D11Buffer        *s_vb, *s_cb, *s_kb;
+static ID3D11Buffer        *s_vb, *s_ib, *s_cb, *s_kb;
 static ID3D11ShaderResourceView *s_white, *s_white_cube;
-static uint32_t             s_vb_used;
+static uint32_t             s_vb_used, s_ib_used;
 static uint32_t             s_flip;
 static int                  s_failed;
 
 #define VB_BYTES (96u * 1024u * 1024u)
+#define IB_BYTES (16u * 1024u * 1024u)
 
 static struct {
     uint32_t draws, tris, clears, uploads, hashes, feedback, presents, zeta_copies;
@@ -1350,11 +1351,12 @@ static int device_up(void)
                                                     ID3D10Blob_GetBufferSize(vb), &s_layout));
     if (ok) {
         s_vb = make_buffer(VB_BYTES, D3D11_BIND_VERTEX_BUFFER);
+        s_ib = make_buffer(IB_BYTES, D3D11_BIND_INDEX_BUFFER);
         s_cb = make_buffer(sizeof(DrawConstants), D3D11_BIND_CONSTANT_BUFFER);
         s_kb = make_buffer(32, D3D11_BIND_CONSTANT_BUFFER);
         s_white = make_white(0);
         s_white_cube = make_white(1);
-        ok = s_vb && s_cb && s_kb && s_white && s_white_cube;
+        ok = s_vb && s_ib && s_cb && s_kb && s_white && s_white_cube;
     }
     if (!ok) {
         fprintf(stderr, "[D3D11] set-up failed\n");
@@ -1365,6 +1367,7 @@ static int device_up(void)
         UINT stride = sizeof(Nv2aVshOutput), off = 0;
         ID3D11DeviceContext_IASetInputLayout(s_ctx, s_layout);
         ID3D11DeviceContext_IASetVertexBuffers(s_ctx, 0, 1, &s_vb, &stride, &off);
+        ID3D11DeviceContext_IASetIndexBuffer(s_ctx, s_ib, DXGI_FORMAT_R32_UINT, 0);
         ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
         ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_cb);
@@ -1596,12 +1599,13 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     Target *t;
     Zeta *z = NULL;
     uint32_t bytes = b->count * (uint32_t)sizeof(Nv2aVshOutput), first;
+    uint32_t ibytes = b->indices ? b->index_count * (uint32_t)sizeof(uint32_t) : 0, first_index = 0;
     ID3D11ShaderResourceView *views[8];
     ID3D11SamplerState *samps[4];
     D3D11_RECT sc;
     int st, i;
 
-    if (!sh || !b->outputs || !device_up() || bytes > VB_BYTES)
+    if (!sh || !b->outputs || !device_up() || bytes > VB_BYTES || ibytes > IB_BYTES)
         return;
     t = target_for(s);
     if (!t)
@@ -1624,6 +1628,20 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
     first = s_vb_used / (uint32_t)sizeof(Nv2aVshOutput);
     s_vb_used += bytes;
+    /* Indices, when the executor sends each shared vertex once: a ring like
+     * the vertices'. */
+    if (ibytes) {
+        if (s_ib_used + ibytes > IB_BYTES) {
+            ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ib, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+            s_ib_used = 0;
+        } else {
+            ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_ib, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m);
+        }
+        memcpy((uint8_t *)m.pData + s_ib_used, b->indices, ibytes);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_ib, 0);
+        first_index = s_ib_used / (uint32_t)sizeof(uint32_t);
+        s_ib_used += ibytes;
+    }
 
     /* Textures. */
     for (st = 0; st < 4; st++) {
@@ -1760,7 +1778,9 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
         }
         if (s_drawlog && passed_q && !s_vis_open)
             ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)passed_q);
-        if (!skip)
+        if (!skip && ibytes)
+            ID3D11DeviceContext_DrawIndexed(s_ctx, b->index_count, first_index, (INT)first);
+        else if (!skip)
             ID3D11DeviceContext_Draw(s_ctx, b->count, first);
         if (s_drawlog && passed_q && !s_vis_open) {
             ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)passed_q);
@@ -1850,7 +1870,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
                     sh->rc.alpha_icw[i], sh->rc.alpha_ocw[i], sh->rc.factor0[i], sh->rc.factor1[i]);
     }
     s_stats.draws++;
-    s_stats.tris += b->count / 3;
+    s_stats.tris += (ibytes ? b->index_count : b->count) / 3;
 }
 
 static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
@@ -3029,7 +3049,7 @@ void gpu_d3d11_register(void)
 {
     static const Nv2aBackend backend = {
         d3d11_clear, d3d11_draw, NULL, d3d11_present, 1,
-        d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_report
+        d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_report, 1
     };
     const char *e = getenv("RECOMP_GPU");
 

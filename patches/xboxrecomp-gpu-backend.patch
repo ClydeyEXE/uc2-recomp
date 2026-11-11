@@ -279,7 +279,7 @@ index e92e47c..1751932 100644
                          " as on the console (RECOMP_GUEST_CPUS=%s)\n",
                  core, getenv("RECOMP_GUEST_CPUS"));
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 87788ed..a4fd527 100644
+index 87788ed..1de28cb 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,8 @@
@@ -311,7 +311,7 @@ index 87788ed..a4fd527 100644
  } Nv2aTexture;
  
  typedef struct {
-@@ -80,13 +88,38 @@ typedef struct {
+@@ -80,13 +88,44 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -347,10 +347,16 @@ index 87788ed..a4fd527 100644
 +     * when the back end asked for it (wants_outputs). */
 +    const Nv2aVshOutput *outputs;
 +    const Nv2aShading   *shading;
++    /* For a back end that set wants_indices: the triangle list as indices
++     * into outputs (index_count a multiple of 3; count is then the number of
++     * distinct vertices), so a vertex shared by several triangles arrives
++     * once. NULL otherwise, and outputs is the list itself. */
++    const uint32_t      *indices;
++    uint32_t             index_count;
  } Nv2aBatch;
  
  typedef struct {
-@@ -96,6 +129,21 @@ typedef struct {
+@@ -96,6 +135,24 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -369,10 +375,13 @@ index 87788ed..a4fd527 100644
 +    void (*zpass_clear)(void);
 +    void (*zpass_enable)(int on);
 +    void (*zpass_report)(uint32_t at);
++    /* With wants_outputs: batches may arrive indexed (Nv2aBatch.indices).
++     * RECOMP_NO_INDEXED=1 turns that off. */
++    int wants_indices;
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -127,4 +175,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+@@ -127,4 +184,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
   * the semaphore context DMA object through RAMIN. */
  void nv2a_pb_set_semaphore_target(uint32_t guest_va);
  
@@ -383,7 +392,7 @@ index 87788ed..a4fd527 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..79d1e5a 100644
+index a5ea9cc..c28d652 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -383,6 +383,9 @@ static float reg_f(uint32_t method)
@@ -459,11 +468,51 @@ index a5ea9cc..79d1e5a 100644
      default:   return fmt;                 /* already linear, or unhandled */
      }
  }
-@@ -2157,6 +2179,17 @@ static int s_xf_no_tex;
+@@ -2157,6 +2179,57 @@ static int s_xf_no_tex;
  #define NV_BACKEND_MAX_VERTS (NV_MAX_INDICES * 3)
  static Nv2aVertex *s_bverts;     /* about 5.5 MB: allocated by the first vertex */
  static uint32_t   s_bcount;
 +static Nv2aVshOutput *s_boutputs;   /* the same, for a back end that shades itself */
++
++/* Indexed hand-over (wants_indices): s_boutputs holds each vertex once and
++ * s_bidx the triangles. A transformed vertex of the batch is found again by
++ * its slot in s_xf_unique (or s_xf); clipped vertices are always new. */
++static uint32_t  *s_bidx;
++static uint32_t   s_bicount;
++static uint32_t  *s_bmap_gen, *s_bmap_val;  /* slot -> output, this hand-over */
++static uint32_t   s_bgen = 1;
++
++static int backend_indexed(void)
++{
++    static int off = -1;
++
++    if (off < 0) {
++        const char *e = getenv("RECOMP_NO_INDEXED");
++        off = e && e[0] && e[0] != '0';
++    }
++    if (off || !s_backend->wants_indices)
++        return 0;
++    if (!s_bidx) {
++        s_bidx = (uint32_t *)malloc(NV_BACKEND_MAX_VERTS * sizeof *s_bidx);
++        s_bmap_gen = (uint32_t *)calloc(2 * NV_MAX_INDICES, sizeof *s_bmap_gen);
++        s_bmap_val = (uint32_t *)malloc(2 * NV_MAX_INDICES * sizeof *s_bmap_val);
++        if (!s_bidx || !s_bmap_gen || !s_bmap_val) {
++            off = 1;
++            return 0;
++        }
++    }
++    return 1;
++}
++
++/* Three vertices just appended one after another: index them as they are. */
++static void backend_seq_indices(void)
++{
++    if (backend_indexed()) {
++        s_bidx[s_bicount++] = s_bcount - 3;
++        s_bidx[s_bicount++] = s_bcount - 2;
++        s_bidx[s_bicount++] = s_bcount - 1;
++    }
++}
 +
 +static Nv2aVshOutput *backend_output_slot(void)
 +{
@@ -477,7 +526,7 @@ index a5ea9cc..79d1e5a 100644
  
  static Nv2aVertex *backend_slot(void)
  {
-@@ -2198,10 +2231,49 @@ static void backend_flush(int textured)
+@@ -2198,10 +2271,55 @@ static void backend_flush(int textured)
          return;
      current_surface(&surf);
      current_render_state(&rs);
@@ -518,16 +567,22 @@ index a5ea9cc..79d1e5a 100644
 +        batch.vertices = NULL;
 +        batch.outputs = s_boutputs;
 +        batch.shading = &sh;
++        if (backend_indexed()) {
++            batch.indices = s_bidx;
++            batch.index_count = s_bicount;
++        }
 +        s_backend->draw(&surf, &batch);
-+        s_gpu.tris_drawn += s_bcount / 3;
++        s_gpu.tris_drawn += (batch.indices ? s_bicount : s_bcount) / 3;
 +        s_bcount = 0;
++        s_bicount = 0;
++        s_bgen++;
 +        note_drawn();
 +        return;
 +    }
      if (textured && s_gpu.texs[0].valid) {
          tex.offset = s_gpu.texs[0].offset;
          tex.width  = s_gpu.texs[0].width;
-@@ -2243,6 +2315,33 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
+@@ -2243,6 +2361,34 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
              && fetch_texcoord(i1, uv[1])
              && fetch_texcoord(i2, uv[2]);
  
@@ -556,40 +611,146 @@ index a5ea9cc..79d1e5a 100644
 +                fetch_attr(&s_gpu.attr[9 + st], ix[k], o[k].tex[st]);
 +        }
 +        s_bcount += 3;
++        backend_seq_indices();
 +        return;
 +    }
      if (backend_draws()) {                 /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          const uint32_t ix[3] = { i0, i1, i2 };
-@@ -2785,13 +2884,27 @@ static struct {
+@@ -2778,20 +2924,112 @@ static int s_raster_last_workers = 1;
+ int nv2a_raster_last_workers(void) { return s_raster_last_workers; }
+ 
+ #if defined(_WIN32)
++/* The round trip to the pool cost the executor as much as the work it spread:
++ * a UC2 match makes thousands of transform jobs a second, and for each the
++ * executor called SetEvent once per worker and then slept until the last one,
++ * however late it woke, had done its share. Spinning workers instead of
++ * parking them lost more than it saved (fifteen spinning cores slow the two
++ * that matter). So a transform job is shared out in chunks that whoever is
++ * running claims from a counter, the executor included; when no chunk is left
++ * the executor closes the job and waits only for the workers that got in, and
++ * one that wakes after that finds the job closed and goes back to sleep. Wakes
++ * fan out as a tree: the executor signals workers 0 and 1, worker k signals
++ * 2k+2 and 2k+3, so the SetEvent calls are spread over the workers.
++ * A job is published as one word, generation << 6 | 32 for a transform job |
++ * workers taking part, so a worker never pairs one job's generation with the
++ * next one's kind or size. The software rasteriser's row jobs need every
++ * worker (each owns its rows) and still wait for all of them. */
++#include <immintrin.h>
++#define XF_CHUNK 16                         /* vertices a claim takes */
++#define POOL_CLOSED 0x80000000LL
++#define POOL_XF 32
+ static struct {
+     int n;                                  /* threads incl. the caller */
+     HANDLE start[NV_RASTER_MAX_THREADS], done;
+-    volatile LONG pending;
++    volatile LONG job;                      /* generation << 6 | POOL_XF | workers */
++    volatile LONG pending;                  /* row jobs: workers still drawing */
      const XfTri *tris;
      int ntris;
      XfCount cnt[NV_RASTER_MAX_THREADS];
-+    /* Non-zero: this wake is a vertex transform job (xf_transform_batch), split
-+     * over xf_n threads. */
-+    uint32_t xf_unique;
-+    int xf_n;
++    /* Transform jobs (xf_transform_batch). gate: generation << 32, the closed
++     * bit, and how many workers got in. */
++    volatile LONG64 gate;
++    volatile LONG xf_next, xf_finished;
++    uint32_t xf_unique, xf_chunks;
 +    volatile LONG xf_failed;
  } s_pool;
  
-+static int xf_transform_share(uint32_t unique, int k, int n);
++static int xf_transform_chunks(void);
++
++/* The generation the next job gets. */
++static uint32_t pool_next_gen(void)
++{
++    return (((ULONG)s_pool.job >> 6) + 1) & 0x3FFFFFF;
++}
++
++/* Publish a job for workers 0..workers-1 (parameters already written) and
++ * wake the root of the tree. kind: 0 or POOL_XF. */
++static void pool_start(int workers, int kind)
++{
++    LONG job = (LONG)((pool_next_gen() << 6) | (ULONG)kind | (ULONG)workers);
++
++    InterlockedExchange(&s_pool.job, job);
++    SetEvent(s_pool.start[0]);
++    if (workers > 1)
++        SetEvent(s_pool.start[1]);
++}
++
++static void xf_job_join(void)
++{
++    LONG64 g = InterlockedOr64(&s_pool.gate, POOL_CLOSED);
++    LONG in = (LONG)(g & 0x7FFFFFFF);
++    int i = 0;
++
++    /* The ones that got in are at most a chunk from done. */
++    while (s_pool.xf_finished < in)
++        if (++i & 1023)
++            _mm_pause();
++        else
++            SwitchToThread();
++}
++
++static void xf_job_enter(uint32_t gen)
++{
++    LONG64 g = s_pool.gate, prev;
++
++    for (;;) {
++        if ((uint32_t)(g >> 32) != gen || (g & POOL_CLOSED))
++            return;                         /* over, or a newer one */
++        prev = InterlockedCompareExchange64(&s_pool.gate, g + 1, g);
++        if (prev == g)
++            break;
++        g = prev;
++    }
++    if (!xf_transform_chunks())
++        InterlockedExchange(&s_pool.xf_failed, 1);
++    InterlockedIncrement(&s_pool.xf_finished);
++}
 +
  static DWORD WINAPI raster_worker(LPVOID arg)
  {
      int k = (int)(intptr_t)arg;
++    LONG seen = 0, job;
      for (;;) {
++        int w;
          WaitForSingleObject(s_pool.start[k], INFINITE);
-+        if (s_pool.xf_unique) {
-+            if (!xf_transform_share(s_pool.xf_unique, k, s_pool.xf_n))
-+                InterlockedExchange(&s_pool.xf_failed, 1);
-+            if (InterlockedDecrement(&s_pool.pending) == 0)
-+                SetEvent(s_pool.done);
++        job = s_pool.job;
++        if (job == seen)
++            continue;                       /* a wake for a job already seen */
++        seen = job;
++        w = job & 31;
++        if (2 * k + 2 < w) SetEvent(s_pool.start[2 * k + 2]);
++        if (2 * k + 3 < w) SetEvent(s_pool.start[2 * k + 3]);
++        if (k >= w)
++            continue;
++        if (job & POOL_XF) {
++            xf_job_enter((uint32_t)((ULONG)job >> 6));
 +            continue;
 +        }
          memset(&s_pool.cnt[k], 0, sizeof s_pool.cnt[k]);
          xf_rows_owned(s_pool.tris, s_pool.ntris, k, s_pool.n, &s_pool.cnt[k]);
          if (InterlockedDecrement(&s_pool.pending) == 0)
-@@ -3057,7 +3170,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -2838,8 +3076,7 @@ static void xf_rows_parallel(const XfTri *T, int ntris, long px,
+     s_pool.tris = T;
+     s_pool.ntris = ntris;
+     s_pool.pending = n - 1;
+-    for (k = 0; k < n - 1; k++)
+-        SetEvent(s_pool.start[k]);
++    pool_start(n - 1, 0);
+     {
+         XfCount mine = {0, 0, 0};
+         xf_rows_owned(T, ntris, n - 1, n, &mine);
+@@ -3034,6 +3271,8 @@ static void xf_queue_push(const XfTri *T)
+     s_xfq_px += (long)(T->maxx - T->minx) * (T->maxy - T->miny);
+ }
+ 
++static long xf_shared_slot(const Nv2aVshOutput *v);
++
+ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+                                const Nv2aVshOutput *vc)
+ {
+@@ -3057,7 +3296,11 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
      v[0] = va; v[1] = vb; v[2] = vc;
      a = va->pos; b = vb->pos; c = vc->pos;
      T.a = a; T.b = b; T.c = c;
@@ -602,7 +763,7 @@ index a5ea9cc..79d1e5a 100644
          return;
      if (a[3] <= 0.0f || b[3] <= 0.0f || c[3] <= 0.0f) {
          s_gpu.tris_behind++;
-@@ -3068,6 +3185,26 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
+@@ -3068,6 +3311,46 @@ static void raster_xf_triangle(const Nv2aVshOutput *va, const Nv2aVshOutput *vb,
          s_gpu.xf_degenerate++;
          return;
      }
@@ -618,7 +779,27 @@ index a5ea9cc..79d1e5a 100644
 +                return;
 +        }
 +        o = backend_output_slot();
-+        if (o) {
++        if (o && backend_indexed()) {
++            if (s_bicount + 3 > NV_BACKEND_MAX_VERTS)
++                return;
++            /* Each vertex once: a later triangle sharing it names it again. */
++            for (k = 0; k < 3; k++) {
++                long slot = xf_shared_slot(v[k]);
++                uint32_t at;
++                if (slot >= 0 && s_bmap_gen[slot] == s_bgen) {
++                    at = s_bmap_val[slot];
++                } else {
++                    at = s_bcount++;
++                    s_boutputs[at] = *v[k];
++                    s_boutputs[at].fog[0] = fog_factor(s_boutputs[at].fog[0]);
++                    if (slot >= 0) {
++                        s_bmap_gen[slot] = s_bgen;
++                        s_bmap_val[slot] = at;
++                    }
++                }
++                s_bidx[s_bicount++] = at;
++            }
++        } else if (o) {
 +            o[0] = *va; o[1] = *vb; o[2] = *vc;
 +            for (k = 0; k < 3; k++)
 +                o[k].fog[0] = fog_factor(o[k].fog[0]);
@@ -629,7 +810,7 @@ index a5ea9cc..79d1e5a 100644
      if (backend_draws()) {                     /* a back end rasterises */
          Nv2aVertex *o = backend_slot();
          if (o) {
-@@ -3228,12 +3365,13 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -3228,12 +3511,13 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
      }
      planes = near_z ? 2 : 1;
      in[0] = a; in[1] = b; in[2] = c;
@@ -647,7 +828,7 @@ index a5ea9cc..79d1e5a 100644
              if (d != d || d - d != 0.0f)
                  return;                       /* not finite: no position at all */
              if (d < 0.0f)
-@@ -3244,6 +3382,11 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -3244,6 +3528,11 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
          raster_xf_triangle(a, b, c);
          return;
      }
@@ -659,7 +840,7 @@ index a5ea9cc..79d1e5a 100644
      n = xf_clip_poly(p0, n, 0, p1);
      if (planes > 1 && n)
          n = xf_clip_poly(p1, n, 1, p0);
-@@ -3264,6 +3407,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
+@@ -3264,6 +3553,9 @@ static void raster_xf_clipped(const Nv2aVshOutput *a, const Nv2aVshOutput *b,
  /* About 7 MB, so allocated by the first batch that transforms rather than
   * carried in every build that never turns the executor on. */
  static Nv2aVshOutput *s_xf;
@@ -669,7 +850,7 @@ index a5ea9cc..79d1e5a 100644
  
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
-@@ -3321,15 +3467,119 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3613,139 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -689,6 +870,18 @@ index a5ea9cc..79d1e5a 100644
 +static uint32_t s_xf_slot_of[NV_MAX_INDICES];       /* batch position -> unique slot */
 +static uint32_t s_xf_map_key[XF_MAP_SLOTS], s_xf_map_val[XF_MAP_SLOTS], s_xf_map_gen[XF_MAP_SLOTS];
 +static uint32_t s_xf_gen;
++
++/* A vertex of the current batch's transform (shared by the triangles that
++ * name it): its slot, 0..2*NV_MAX_INDICES; -1 for anything else (a clipped
++ * vertex on the stack). */
++static long xf_shared_slot(const Nv2aVshOutput *v)
++{
++    if (s_xf_unique && v >= s_xf_unique && v < s_xf_unique + NV_MAX_INDICES)
++        return (long)(v - s_xf_unique);
++    if (s_xf && v >= s_xf && v < s_xf + NV_MAX_INDICES)
++        return NV_MAX_INDICES + (long)(v - s_xf);
++    return -1;
++}
 +
 +static uint32_t xf_dedupe(uint32_t n)
 +{
@@ -717,15 +910,21 @@ index a5ea9cc..79d1e5a 100644
 +}
 +
 +#if defined(_WIN32)
-+/* Worker k's share of a transform job; 0 if a vertex had no program to run. */
-+static int xf_transform_share(uint32_t unique, int k, int n)
++/* A transform job's chunks, by whoever claims them; 0 if a vertex had no
++ * program to run. */
++static int xf_transform_chunks(void)
 +{
-+    uint32_t i;
++    LONG c;
 +    int ok = 1;
 +
-+    for (i = (uint32_t)k; i < unique; i += (uint32_t)n)
-+        if (!transform_vertex(s_xf_unique_idx[i], &s_xf_unique[i]))
-+            ok = 0;
++    while ((uint32_t)(c = InterlockedIncrement(&s_pool.xf_next) - 1) < s_pool.xf_chunks) {
++        uint32_t i = (uint32_t)c * XF_CHUNK, end = i + XF_CHUNK;
++        if (end > s_pool.xf_unique)
++            end = s_pool.xf_unique;
++        for (; i < end; i++)
++            if (!transform_vertex(s_xf_unique_idx[i], &s_xf_unique[i]))
++                ok = 0;
++    }
 +    return ok;
 +}
 +#endif
@@ -751,21 +950,23 @@ index a5ea9cc..79d1e5a 100644
 +    unique = xf_dedupe(n);
 +#if defined(_WIN32)
 +    if (unique >= XF_PARALLEL_MIN && raster_pool_size() > 1) {
-+        int k, pool = (int)(unique / XF_PER_THREAD), ok;
++        int pool = (int)(unique / XF_PER_THREAD), ok;
++        uint32_t gen;
 +
 +        if (pool > s_pool.n)
 +            pool = s_pool.n;
 +        if (pool < 2)
 +            pool = 2;
++        gen = pool_next_gen();
 +        s_pool.xf_unique = unique;
-+        s_pool.xf_n = pool;
++        s_pool.xf_chunks = (unique + XF_CHUNK - 1) / XF_CHUNK;
++        s_pool.xf_next = 0;
++        s_pool.xf_finished = 0;
 +        s_pool.xf_failed = 0;
-+        s_pool.pending = pool - 1;
-+        for (k = 0; k < pool - 1; k++)
-+            SetEvent(s_pool.start[k]);
-+        ok = xf_transform_share(unique, pool - 1, pool);
-+        WaitForSingleObject(s_pool.done, INFINITE);
-+        s_pool.xf_unique = 0;
++        InterlockedExchange64(&s_pool.gate, (LONG64)gen << 32);
++        pool_start(pool - 1, POOL_XF);
++        ok = xf_transform_chunks();
++        xf_job_join();
 +        if (!ok || s_pool.xf_failed)
 +            return 0;
 +    } else
@@ -792,7 +993,7 @@ index a5ea9cc..79d1e5a 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3364,8 +3614,8 @@ static void raster_batch_program(void)
+@@ -3364,8 +3780,8 @@ static void raster_batch_program(void)
                  fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
                  fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
                          s_gpu.idx[i], in[0], in[1], in[2], in[3],
@@ -803,7 +1004,7 @@ index a5ea9cc..79d1e5a 100644
              }
          }
      }
-@@ -3411,8 +3661,8 @@ static void raster_batch_program(void)
+@@ -3411,8 +3827,8 @@ static void raster_batch_program(void)
              }
              for (i = 0; i < 3; i++)
                  fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
@@ -814,7 +1015,7 @@ index a5ea9cc..79d1e5a 100644
          }
      }
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-@@ -3431,31 +3681,33 @@ static void raster_batch_program(void)
+@@ -3431,31 +3847,33 @@ static void raster_batch_program(void)
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
@@ -857,7 +1058,7 @@ index a5ea9cc..79d1e5a 100644
          }
          break;
      default:
-@@ -3575,6 +3827,11 @@ static void raster_batch(void)
+@@ -3575,6 +3993,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -869,7 +1070,7 @@ index a5ea9cc..79d1e5a 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3593,8 +3850,19 @@ static void frame_trace_flip(void)
+@@ -3593,8 +4016,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -890,7 +1091,7 @@ index a5ea9cc..79d1e5a 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3607,6 +3875,16 @@ static void frame_trace_flip(void)
+@@ -3607,6 +4041,16 @@ static void frame_trace_flip(void)
      }
  }
  
@@ -907,7 +1108,7 @@ index a5ea9cc..79d1e5a 100644
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3642,7 +3920,8 @@ static void draw_primitive(void)
+@@ -3642,7 +4086,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -917,7 +1118,7 @@ index a5ea9cc..79d1e5a 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3651,13 +3930,16 @@ static void draw_primitive(void)
+@@ -3651,13 +4096,16 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -939,7 +1140,7 @@ index a5ea9cc..79d1e5a 100644
              if (s_gpu.rc_seen) {
                  int st;
                  fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
-@@ -3687,7 +3969,7 @@ static void draw_primitive(void)
+@@ -3687,7 +4135,7 @@ static void draw_primitive(void)
          }
      }
  
@@ -948,7 +1149,7 @@ index a5ea9cc..79d1e5a 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4352,9 +4634,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4352,9 +4800,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
@@ -962,7 +1163,7 @@ index a5ea9cc..79d1e5a 100644
          break;
      case 0x17D0: {                                /* GET_REPORT */
          /* The GPU's answer to a visibility test: 16 bytes at the report
-@@ -4368,6 +4654,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4368,6 +4820,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          uint32_t at = dma_resolve(param & 0x00FFFFFFu);
          uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
          memcpy(mem + at, &stamp, 8);
@@ -973,7 +1174,7 @@ index a5ea9cc..79d1e5a 100644
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
          break;
-@@ -4387,7 +4677,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4387,7 +4843,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -982,7 +1183,7 @@ index a5ea9cc..79d1e5a 100644
              zbuf_clear();
          break;
  
-@@ -4455,7 +4745,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4455,7 +4911,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -994,7 +1195,7 @@ index a5ea9cc..79d1e5a 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4531,6 +4824,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4531,6 +4990,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
