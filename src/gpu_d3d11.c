@@ -19,7 +19,7 @@
 #define COBJMACROS
 #include <windows.h>
 #include <d3d11.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <xinput.h>
 #include <intrin.h>
@@ -291,14 +291,18 @@ static UINT64 s_passed;             /* -DrawLog: what the last draw passed */
  * calls, d3d11_present (the blit and Present, or the readback), and its other CPU time (method decode,
  * vertex programs). What is left is the walker waiting for the game. A frame over
  * 100 ms gets a [HITCH] line of its own, naming where the walker was: a thread
- * samples its instruction pointer every few ms once a frame passes 50 ms. */
-#define FT_MAX 8192
+ * samples its instruction pointer every few ms once a frame passes 50 ms.
+ * The lows are the mean time of the slowest 1% and of the slowest 0.1% of the
+ * window's frames (at least one frame each), in ms: 1000 over one is that
+ * "low" in fps. */
+#define FT_MAX 32768
 
 static struct {
     double   qms;                    /* QPC ticks per ms */
     double   tsc_ms;                 /* cycle counts per ms, measured against QPC */
     uint64_t tsc0;
     LONGLONG q0, last, report;
+    LONGLONG pq;                     /* when blit_present last called Present, after the limit's wait */
     ULONG64  cycles;                 /* the walker's cycle count at the last present */
     double   d3d, present, limit;   /* this frame, ms; limit is the frame limit's wait, in present */
     double   sum, d3d_sum, pr_sum, cpu_sum, lim_sum;
@@ -495,6 +499,13 @@ static void ft_frame(void)
     }
     if (!s_ft.tsc_ms && now - s_ft.q0 > (LONGLONG)(s_ft.qms * 1000.0))
         s_ft.tsc_ms = (double)(__rdtsc() - s_ft.tsc0) / ((double)(now - s_ft.q0) / s_ft.qms);
+    /* Presenting to the window, a frame's time is from one Present call to the
+     * next, which is what the display gets and what the frame limit paces; the
+     * walker reaches this point less evenly. This runs before the frame's own
+     * Present, so it measures the frame before, one frame late. Otherwise (the
+     * readback) it is from here to here. */
+    if (s_ft.pq && s_ft.pq != s_ft.last)
+        now = s_ft.pq;
     dt = (double)(now - s_ft.last) / s_ft.qms;
     if (s_ft.tsc_ms)
         cpu = (double)(cyc - s_ft.cycles) / s_ft.tsc_ms;
@@ -521,12 +532,20 @@ static void ft_frame(void)
     if (now - s_ft.report > (LONGLONG)(s_ft.qms * 10000.0) && s_ft.n) {
         uint32_t n = s_ft.n;
         double busy = s_ft.cpu_sum - s_ft.d3d_sum - s_ft.pr_sum;
+        double low1 = 0.0, low01 = 0.0;
+        uint32_t i, k1 = n / 100 ? n / 100 : 1, k01 = n / 1000 ? n / 1000 : 1;
         qsort(s_ft.ms, n, sizeof s_ft.ms[0], ft_cmp);
+        for (i = 0; i < k1; i++)
+            low1 += s_ft.ms[n - 1 - i];
+        for (i = 0; i < k01; i++)
+            low01 += s_ft.ms[n - 1 - i];
         fprintf(stderr, "[FRAMES] %u in %.1f s (%.1f fps): ms p50 %.1f p90 %.1f p99 %.1f max %.1f, >25 ms %u, >50 ms %u"
-                        " | per frame: d3d11 %.2f, present %.2f, other walker cpu %.2f, walker idle %.2f (limit %.2f)\n",
+                        " | per frame: d3d11 %.2f, present %.2f, other walker cpu %.2f, walker idle %.2f (limit %.2f)"
+                        " | lows: 1%% %.2f ms, 0.1%% %.2f ms\n",
                 n, s_ft.sum / 1000.0, n * 1000.0 / s_ft.sum, s_ft.ms[n / 2], s_ft.ms[n * 9 / 10],
                 s_ft.ms[n * 99 / 100], s_ft.ms[n - 1], s_ft.over25, s_ft.over50,
-                s_ft.d3d_sum / n, s_ft.pr_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n, s_ft.lim_sum / n);
+                s_ft.d3d_sum / n, s_ft.pr_sum / n, busy / n, (s_ft.sum - s_ft.cpu_sum) / n, s_ft.lim_sum / n,
+                low1 / k1, low01 / k01);
         s_ft.n = s_ft.over25 = s_ft.over50 = 0;
         s_ft.sum = s_ft.d3d_sum = s_ft.pr_sum = s_ft.cpu_sum = s_ft.lim_sum = 0.0;
         s_ft.report = now;
@@ -2647,6 +2666,13 @@ static ID3D11PixelShader      *s_ps_blit;
 static ID3D11SamplerState     *s_blit_samp;
 static UINT                    s_bw, s_bh;
 static int                     s_failed_present;
+/* With vsync off a flip-model chain in a window still waits for the display's
+ * refresh unless it may tear: DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING when the system
+ * supports it, which also lets a VRR display follow the frame rate. Then the
+ * swap chain's flags (kept for ResizeBuffers) carry it, and a present with vsync
+ * off passes DXGI_PRESENT_ALLOW_TEARING. RECOMP_PRESENT_TEARING=0 turns it off. */
+static UINT                    s_chain_flags;
+static int                     s_tearing;
 
 /* ---- Settings ------------------------------------------------------------------ */
 /* What the owner can change while playing, in the panel F1 opens (or Back+Start on
@@ -2656,6 +2682,45 @@ static int                     s_failed_present;
  * RECOMP_PRESENT_FILTER=point/linear, RECOMP_ANISOTROPY=<1, 2, 4, 8 or 16>. */
 static const int s_limits[] = {0, 30, 60, 120, 144, 240};
 #define NLIMITS ((int)(sizeof s_limits / sizeof s_limits[0]))
+/* The refresh rate of the window's display, in Hz (0 unknown), read when the
+ * presenter starts and when the frame limit is changed in the panel. The panel
+ * also offers a limit about 3% under it (160 at 165 Hz, 140 at 144 Hz, 58 at
+ * 60 Hz), which keeps a VRR display in its range without vsync's queue. */
+static int s_refresh;
+
+static int refresh_limit(void)
+{
+    return s_refresh >= 50 ? s_refresh - (s_refresh * 3 + 50) / 100 : 0;
+}
+
+static void refresh_read(HWND hwnd)
+{
+    MONITORINFOEXA mi;
+    DEVMODEA dm;
+    mi.cbSize = sizeof mi;
+    ZeroMemory(&dm, sizeof dm);
+    dm.dmSize = sizeof dm;
+    if (hwnd && GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO *)&mi)
+        && EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+        s_refresh = (int)dm.dmDisplayFrequency;
+}
+
+/* The limits the panel steps through: s_limits and refresh_limit(), in order. */
+static int limit_list(int *out)
+{
+    int i, n = 0, r = refresh_limit();
+    for (i = 0; i < NLIMITS; i++) {
+        if (r && r <= s_limits[i]) {
+            if (r < s_limits[i])
+                out[n++] = r;
+            r = 0;
+        }
+        out[n++] = s_limits[i];
+    }
+    if (r)
+        out[n++] = r;
+    return n;
+}
 /* Forced anisotropic filtering; 1 leaves the game's own filtering. */
 static const int s_anisos[] = {1, 2, 4, 8, 16};
 #define NANISOS ((int)(sizeof s_anisos / sizeof s_anisos[0]))
@@ -2920,6 +2985,7 @@ static int blit_init(HWND hwnd)
 
     s_hwnd = hwnd;
     client_size(&s_bw, &s_bh);
+    refresh_read(hwnd);
     hr = ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&dd);
     if (SUCCEEDED(hr)) {
         /* One frame queued, not three: the GPU's work is small, and a deeper
@@ -2940,6 +3006,21 @@ static int blit_init(HWND hwnd)
         sd.Scaling = DXGI_SCALING_STRETCH;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        {
+            IDXGIFactory5 *f5 = NULL;
+            BOOL allow = FALSE;
+            const char *e = getenv("RECOMP_PRESENT_TEARING");
+            if ((!e || atoi(e) != 0)
+                && SUCCEEDED(IDXGIFactory2_QueryInterface(fac, &IID_IDXGIFactory5, (void **)&f5))) {
+                if (FAILED(IDXGIFactory5_CheckFeatureSupport(f5, DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                                                             &allow, sizeof allow)))
+                    allow = FALSE;
+                IDXGIFactory5_Release(f5);
+            }
+            s_tearing = allow != FALSE;
+            s_chain_flags = s_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+            sd.Flags = s_chain_flags;
+        }
         hr = IDXGIFactory2_CreateSwapChainForHwnd(fac, (IUnknown *)s_dev, hwnd, &sd, NULL, NULL, &s_chain);
         /* Alt+Enter is the window's borderless fullscreen, not DXGI's exclusive mode. */
         if (SUCCEEDED(hr))
@@ -2969,7 +3050,8 @@ static int blit_init(HWND hwnd)
         s_chain = NULL;
         return 0;
     }
-    fprintf(stderr, "[D3D11] presenting to the window (%ux%u)\n", s_bw, s_bh);
+    fprintf(stderr, "[D3D11] presenting to the window (%ux%u, display %d Hz), tearing %s\n", s_bw, s_bh, s_refresh,
+            s_tearing ? "allowed with vsync off" : "off");
     return 1;
 }
 
@@ -3032,10 +3114,15 @@ static void ui_change(int row, int dir)
         window_fit();
         break;
     case ROW_LIMIT:
-        for (i = 0; i < NLIMITS && s_limits[i] != s_cfg.limit; i++)
-            ;
-        i = i == NLIMITS ? 0 : (i + dir + NLIMITS) % NLIMITS;
-        s_cfg.limit = s_limits[i];
+        {
+            int l[NLIMITS + 1], n;
+            refresh_read(s_hwnd);
+            n = limit_list(l);
+            for (i = 0; i < n && l[i] != s_cfg.limit; i++)
+                ;
+            i = i == n ? 0 : (i + dir + n) % n;
+            s_cfg.limit = l[i];
+        }
         break;
     case ROW_VSYNC:
         s_cfg.vsync = !s_cfg.vsync;
@@ -3223,8 +3310,10 @@ static void ui_draw(float x0, float y0)
 
     if (s_ui.open) {
         static const char *const sharp[] = {"smooth", "sharp"}, *const onoff[] = {"off", "on"};
-        char limit[16], aniso[16];
-        if (s_cfg.limit)
+        char limit[32], aniso[16];
+        if (s_cfg.limit && s_cfg.limit == refresh_limit())
+            _snprintf(limit, sizeof limit, "%d fps (%d Hz)", s_cfg.limit, s_refresh);
+        else if (s_cfg.limit)
             _snprintf(limit, sizeof limit, "%d fps", s_cfg.limit);
         else
             _snprintf(limit, sizeof limit, "off");
@@ -3346,7 +3435,7 @@ static void blit_present(Target *t)
         ID3D11RenderTargetView_Release(s_back);
         s_back = NULL;
         s_cur_target = NULL;
-        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0)) || !make_back())
+        if (FAILED(IDXGISwapChain1_ResizeBuffers(s_chain, 0, cw, ch, DXGI_FORMAT_UNKNOWN, s_chain_flags)) || !make_back())
             return;
         s_bw = cw;
         s_bh = ch;
@@ -3384,7 +3473,11 @@ static void blit_present(Target *t)
     s_cur_target = NULL;
     s_cur_zeta = NULL;
     s_ft.limit += limit_wait();
-    IDXGISwapChain1_Present(s_chain, (UINT)(s_cfg.vsync != 0), 0);
+    s_ft.pq = ft_qpc();
+    if (s_cfg.vsync)
+        IDXGISwapChain1_Present(s_chain, 1, 0);
+    else
+        IDXGISwapChain1_Present(s_chain, 0, s_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
 }
 
 /* The frame is finished: copy it to guest memory, where the window and the frame

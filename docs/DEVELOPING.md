@@ -4,10 +4,18 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 `docs/HISTORY.md`: read it when a symptom looks familiar, or before changing code a fix touched.
 
 ## Measuring
-- Every 10 s the log has a `[FRAMES]` line: p50/p90/p99 frame times and where the walker's time went. "Walker CPU"
+- Every 10 s the log has a `[FRAMES]` line: p50/p90/p99 frame times and where the walker's time went. Presenting to
+  the window, a frame's time runs from one `Present` call to the next (after the frame limit's wait), what the frame
+  limit paces; with vsync on, `Present` itself then waits for the vblank, so the times there are hand-overs, not what
+  the display shows. "Walker CPU"
   overstates work, as the ack loop polls with short sleeps and clock reads: "other walker cpu" counts that polling
   too, so in a busy match it is mostly the walker waiting for the next kick, not work. With the loop waiting
   instead (tried 2026-11-12, not kept: it cost 7% fps), it was 2.5 ms a frame with 7 bots, against 6.4 polling.
+  "d3d11" and "present" are wall times, waits included, so "other walker cpu" (the thread's CPU time less those) can
+  read negative; their sum is the walker's whole CPU time a frame, which `ab.py` reports as "walker ms". The line ends
+  with the lows: `1% X ms, 0.1% Y ms` is the mean frame time of the slowest 1% and 0.1% of the window's frames (at
+  least one frame each), so 1000 / X is the "1% low" in fps. `ab.py` reports the median of the windows' lows, and
+  `check_run.py` the worst window's.
 - Every 10 s the log also has a `[FENCE]` line: how long the title's main thread waited for the walker in D3D's
   fence wait (`sub_00386B30`), by return address. `0x003809BE` is present waiting for the frame before last, and
   `0x003870B7` a Lock waiting for the GPU to finish with a resource. The wait spins, so the main thread shows as
@@ -19,7 +27,14 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   thread). The game builds with `/Zi`, so its PDB names the generated code's static helpers too: each generated file
   has its own copy of `recomp_fp_round24` and the others, and they used to show as whatever public came before them
   (`sscanf`, `printf`). An address whose function has no name of its own is shown as `symbol+0xOFF?`; `dumpbin
-  /disasm /range` on it says what it is.
+  /disasm /range` on it says what it is. `--callers NAME` adds, for samples in a function whose name contains NAME,
+  the code addresses found in the first 4 KB of the stack, by share of those samples: a scan, not an unwind, so stale
+  return addresses show too, and sampling runs slower (about 40 sweeps a second).
+- Overlays inject into the game. With RivaTuner Statistics Server running (OSD on, no frame limit, 2026-11-12),
+  `RTSSHooks64.dll` is loaded and calls NvAPI, which calls `EnumDisplayDevicesW`: every 9 s or so a frame took about
+  235 ms, the walker inside `Present` (in `NtUserEnumDisplayDevices` or `NtGdiDdDDISetQueuedLimit`), which put up to
+  13% of the walker's samples there and the 0.1% low at 140-240 ms. None of it is the game's own: with RTSS closed
+  there were no such frames, and the corridor's 0.1% low was 9-13 ms. Close overlays before measuring.
 - `RECOMP_EXC_STATS=1` counts every exception the process takes (from 15 s after start), with an `[EXC]` line every
   10 s: the total, then the commonest by code, thread, host address (`exe+0x...`) and guest address. The APU's and the
   USB controllers' registers are trapped, so each access to them is an exception, about 1 µs each before any

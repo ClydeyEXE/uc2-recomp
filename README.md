@@ -57,8 +57,8 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 |---|---|
 | Resolution | 640x480 (the console's) up to 4K |
 | Aspect | 4:3, 16:9 (stretched), or 16:9 (widescreen): the game sees more to the sides, the HUD keeps its shape and spreads to the screen's edges, menus keep their shape in the middle, and movies and cutscenes stay 4:3 |
-| Frame limit | Off, 30, 60, 120, 144 or 240 fps |
-| Vsync | On or off |
+| Frame limit | Off, 30, 60, 120, 144 or 240 fps, or just under your display's refresh rate (160 on a 165 Hz screen), which keeps a G-Sync or FreeSync display in its range |
+| Vsync | On, or off: each frame is shown as soon as it is drawn, so with no frame limit it can tear on a display without G-Sync or FreeSync |
 | Scaling | Smooth or sharp |
 | Anisotropic | Off, 2x, 4x, 8x or 16x: sharper floors and walls at an angle |
 | FPS counter | On or off |

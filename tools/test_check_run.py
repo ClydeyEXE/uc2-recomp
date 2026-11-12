@@ -73,6 +73,15 @@ class CheckRun(unittest.TestCase):
         self.assertEqual(r["failed_opens"]["Z:\\Nope.ini"]["count"], 2)
         self.assertEqual(r["maps"][1]["t_secs"], 21.0)
 
+    def test_lows(self):
+        # Older logs have no lows; newer ones end the [FRAMES] line with them.
+        r = self.run_log(HEAD + [frames(400, 40.0) + " | lows: 1% 31.25 ms, 0.1% 48.00 ms",
+                                 "[WATCHDOG] no exit after 55s; guest esp=0x00000000"])
+        self.assertEqual(r["verdict"], "pass", r["reasons"])
+        self.assertEqual(r["frames_match"]["max_low1_ms"], 31.25)
+        self.assertEqual(r["frames_match"]["max_low01_ms"], 48.0)
+        self.assertEqual(r["frames_menu"]["max_low1_ms"], None)
+
     def test_fps_threshold(self):
         r = self.run_log(HEAD, min_match_fps=50)
         self.assertEqual(r["verdict"], "fail")

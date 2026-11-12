@@ -35,7 +35,8 @@ UNIMPL_CAP = 50   # recomp_unimpl prints the first 50 hits, then goes quiet
 RE_FRAMES = re.compile(
     r"\[FRAMES\] (\d+) in ([\d.]+) s \(([\d.]+) fps\): ms p50 ([\d.]+) p90 ([\d.]+) p99 ([\d.]+) max ([\d.]+), "
     r">25 ms (\d+), >50 ms (\d+) \| per frame: d3d11 (-?[\d.]+), present (-?[\d.]+), "
-    r"other walker cpu (-?[\d.]+), walker idle (-?[\d.]+)(?: \(limit (-?[\d.]+)\))?")
+    r"other walker cpu (-?[\d.]+), walker idle (-?[\d.]+)(?: \(limit (-?[\d.]+)\))?"
+    r"(?: \| lows: 1% ([\d.]+) ms, 0\.1% ([\d.]+) ms)?")
 RE_HITCH = re.compile(r"^\[HITCH\] (\d+) ms frame at ([\d.]+) s")
 RE_MAP = re.compile(r"\[FILE\] [A-Za-z]:\\XboxMaps\\([^\\\s]+)\.lin\b", re.I)
 RE_FAIL = re.compile(r"\[FILE\] (.+?) \(disp [^)]*\) -> (0x[0-9A-Fa-f]+) FAILED \(win32 err=(\d+)(?: (\w+))?\)")
@@ -51,14 +52,20 @@ def _frames(m, line):
     return {"line": line, "frames": int(g[0]), "secs": float(g[1]), "fps": float(g[2]),
             "p50": float(g[3]), "p90": float(g[4]), "p99": float(g[5]), "max": float(g[6]),
             "over25": int(g[7]), "over50": int(g[8]), "d3d11": float(g[9]), "present": float(g[10]),
-            "walker_cpu": float(g[11]), "walker_idle": float(g[12])}
+            "walker_cpu": float(g[11]), "walker_idle": float(g[12]),
+            # The walker thread's whole CPU time a frame: "other walker cpu" alone can read
+            # negative, as d3d11 and present are wall times that include waits.
+            "walker_total": float(g[9]) + float(g[10]) + float(g[11]),
+            # Mean ms of the slowest 1% and 0.1% of the window's frames; None in older logs.
+            "low1": float(g[14]) if g[14] else None, "low01": float(g[15]) if g[15] else None}
 
 
 def _aggregate(wins):
     if not wins:
         return {"lines": 0, "frames": 0, "secs": 0.0, "mean_fps": None, "worst_fps": None,
                 "settled_fps": None, "median_p50_ms": None, "max_p99_ms": None, "max_frame_ms": None,
-                "walker_cpu_ms": None, "d3d11_ms": None, "present_ms": None, "first_line": None}
+                "walker_cpu_ms": None, "d3d11_ms": None, "present_ms": None, "first_line": None,
+                "max_low1_ms": None, "max_low01_ms": None}
     frames = sum(w["frames"] for w in wins)
     secs = sum(w["secs"] for w in wins)
 
@@ -75,7 +82,9 @@ def _aggregate(wins):
             "max_p99_ms": max(w["p99"] for w in wins),
             "max_frame_ms": max(w["max"] for w in wins),
             "walker_cpu_ms": per_frame("walker_cpu"), "d3d11_ms": per_frame("d3d11"),
-            "present_ms": per_frame("present"), "first_line": wins[0]["line"]}
+            "present_ms": per_frame("present"), "first_line": wins[0]["line"],
+            "max_low1_ms": max((w["low1"] for w in wins if w["low1"] is not None), default=None),
+            "max_low01_ms": max((w["low01"] for w in wins if w["low01"] is not None), default=None)}
 
 
 def analyse(log_path, expect_match=True, allow_watchdog=True, min_match_fps=None):
@@ -304,10 +313,11 @@ def summary(r):
     for label, a in (("menu ", r["frames_menu"]), ("match", r["frames_match"])):
         if a["lines"]:
             out.append("%s: %d windows, %d frames, %s fps mean, %s settled, worst %s; p50 %s ms, p99 max %s, "
-                       "frame max %s; walker cpu %s ms/frame" % (
+                       "frame max %s, worst 1%%/0.1%% low %s/%s ms; walker cpu %s ms/frame" % (
                            label, a["lines"], a["frames"], _f(a["mean_fps"]), _f(a["settled_fps"]),
                            _f(a["worst_fps"]), _f(a["median_p50_ms"]), _f(a["max_p99_ms"]),
-                           _f(a["max_frame_ms"]), _f(a["walker_cpu_ms"], "%.2f")))
+                           _f(a["max_frame_ms"]), _f(a["max_low1_ms"], "%.2f"), _f(a["max_low01_ms"], "%.2f"),
+                           _f(a["walker_cpu_ms"], "%.2f")))
         else:
             out.append("%s: no [FRAMES] lines" % label)
     h = r["hitches"]

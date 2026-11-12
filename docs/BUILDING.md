@@ -57,6 +57,12 @@ rasteriser, `-Limit60` for flip pacing, `-Scale N` and `-Fps N` for this run onl
 `RECOMP_WIDE_VIEW=1` (with it, 16:9 widescreen), `RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`,
 `RECOMP_PRESENT_FILTER=point`, `RECOMP_ANISOTROPY=<1-16>` and `RECOMP_SKIP_BOOT_WAITS=1` override the settings panel's file, `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`.
 
+With vsync off the swap chain may tear (`DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`, where Windows supports it), so a window
+is not held to the display's refresh rate and a VRR display follows the game. The log's `presenting to the window` line
+says whether it is on, and gives the display's refresh rate, from which the panel offers a frame limit just under it
+(about 3% under: 160 at 165 Hz, 140 at 144 Hz). `RECOMP_PRESENT_TEARING=0` turns tearing off, which holds a
+window to the refresh rate as before.
+
 The first line of the log is the version: `git describe` at build time, with `-modified` if tracked files had changes,
 or for a source zip, `tools/version.txt`, which git fills in as it makes the zip.
 

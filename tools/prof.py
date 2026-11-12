@@ -5,6 +5,11 @@ is up names the addresses through the build's PDB. Reports each busy thread's
 share of samples and its top functions, then the same over all threads.
 
     python -I tools/prof.py --secs 30 [--wait-secs 200] [--hz 500] [--lines 12] [--out report.txt]
+                            [--callers NAME]
+
+--callers NAME lists, for the samples whose function name contains NAME, the code
+addresses found on the stack above them (a scan of the first 4 KB for values inside
+a loaded module, so stale return addresses show too): which caller each comes from.
 
 A thread sampled inside a wait still counts, under the kernel's wait function,
 so "ntdll!NtWaitForSingleObject" at the top of a thread means it is idle.
@@ -42,6 +47,8 @@ k32.ResumeThread.argtypes = [w.HANDLE]
 k32.GetThreadContext.argtypes = [w.HANDLE, ctypes.c_void_p]
 k32.GetThreadTimes.argtypes = [w.HANDLE] + [ctypes.POINTER(w.FILETIME)] * 4
 k32.CloseHandle.argtypes = [w.HANDLE]
+k32.ReadProcessMemory.argtypes = [w.HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                  ctypes.POINTER(ctypes.c_size_t)]
 dbg.SymInitialize.argtypes = [w.HANDLE, ctypes.c_char_p, w.BOOL]
 dbg.SymFromAddr.argtypes = [w.HANDLE, ctypes.c_ulonglong,
                             ctypes.POINTER(ctypes.c_ulonglong), ctypes.c_void_p]
@@ -51,6 +58,8 @@ dbg.SymLoadModuleEx.restype = ctypes.c_ulonglong
 
 CONTEXT_CONTROL_AMD64 = 0x100001
 RIP_OFFSET = 0xF8
+RSP_OFFSET = 0x98
+STACK_SCAN = 4096
 
 
 class THREADENTRY32(ctypes.Structure):
@@ -168,6 +177,7 @@ def main():
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--lines", type=int, default=12, help="functions listed per thread")
     ap.add_argument("--out")
+    ap.add_argument("--callers", help="list stack callers of the functions whose name contains this")
     args = ap.parse_args()
 
     deadline = time.time() + 900
@@ -191,6 +201,20 @@ def main():
 
     handles = {}
     samples = collections.defaultdict(collections.Counter)
+    stacks = collections.defaultdict(list)            # rip: [tuple of code addresses on the stack]
+    mods = []
+    if args.callers:
+        snap = k32.CreateToolhelp32Snapshot(0x18, pid)
+        me = MODULEENTRY32()
+        me.dwSize = ctypes.sizeof(me)
+        ok = k32.Module32First(w.HANDLE(snap), ctypes.byref(me))
+        while ok:
+            b = ctypes.cast(me.modBaseAddr, ctypes.c_void_p).value
+            mods.append((b, b + me.modBaseSize))
+            ok = k32.Module32Next(w.HANDLE(snap), ctypes.byref(me))
+        k32.CloseHandle(snap)
+    stk = ctypes.create_string_buffer(STACK_SCAN)
+    got = ctypes.c_size_t()
     start_cpu = {}
     t_end = time.time() + args.secs
     period = 1.0 / args.hz
@@ -213,6 +237,11 @@ def main():
             if k32.GetThreadContext(h, ctx):
                 rip = struct.unpack_from("<Q", (ctypes.c_char * 256).from_address(ctx), RIP_OFFSET)[0]
                 samples[tid][rip] += 1
+                if mods:
+                    rsp = struct.unpack_from("<Q", (ctypes.c_char * 256).from_address(ctx), RSP_OFFSET)[0]
+                    if k32.ReadProcessMemory(proc, ctypes.c_void_p(rsp), stk, STACK_SCAN, ctypes.byref(got)):
+                        vals = struct.unpack_from("<%dQ" % (got.value // 8), stk.raw)
+                        stacks[rip].append(tuple(v for v in vals if any(a <= v < b for a, b in mods))[:24])
             k32.ResumeThread(h)
         n += 1
         time.sleep(period)
@@ -292,6 +321,20 @@ def main():
     lines.append("all threads, by CPU time")
     for fn, t in total.most_common(args.top):
         lines.append("  %5.1f%%  %s" % (100.0 * t / max(total_cpu, 1e-9), fn))
+    if args.callers:
+        callers = collections.Counter()
+        hits = 0
+        for rip, sts in stacks.items():
+            if args.callers.lower() not in name(rip).lower():
+                continue
+            for st in sts:
+                hits += 1
+                for fn in dict.fromkeys(name(v) for v in st):   # each caller once a sample
+                    callers[fn] += 1
+        lines.append("")
+        lines.append("on the stack in %d samples in a function matching %r" % (hits, args.callers))
+        for fn, c in callers.most_common(40):
+            lines.append("  %5.1f%%  %s" % (100.0 * c / max(hits, 1), fn))
     text = "\n".join(lines)
     print(text)
     if args.out:

@@ -47,8 +47,11 @@ view stood still: a frame is looked at every second and compared with the run's 
 view at the start, and a window is "busy", and dropped, if any of its frames differs
 (a bot running through, shots, the player hit). Two misses running (the player
 killed, which leaves the scoreboard up) end it, and a run with under two still
-windows is excluded. Per run: fps over the still windows,
-p50 and p99 as the median of their values, walker cpu ms a frame, and [HITCH] lines.
+windows is excluded. Per run: fps over the still windows; p50, p99 and the 1% and
+0.1% lows (the mean frame time of the slowest 1% and 0.1% of a window's frames, so
+1000 / low is the "1% low" in fps) as the median of the windows' values; the walker
+thread's whole CPU time a frame ("walker ms": d3d11 + present + other walker cpu
+from [FRAMES]); and [HITCH] lines.
 
 A run whose route fails, never finds the view, crashes, or loses the view early is
 counted and listed, and left out. Each run keeps log.txt, route.txt and view.png
@@ -207,7 +210,8 @@ def run_one(args, label, env, exe):
                                                    if w in wins))
         rec.update(fps=frames / secs, p50=statistics.median(w["p50"] for w in wins),
                    p99=statistics.median(w["p99"] for w in wins),
-                   walker=sum(w["walker_cpu"] * w["frames"] for w in wins) / frames,
+                   walker=sum(w["walker_total"] * w["frames"] for w in wins) / frames,
+                   low1=median_or_none(w["low1"] for w in wins), low01=median_or_none(w["low01"] for w in wins),
                    hitches=hitches, windows=len(wins), window_fps=[w["fps"] for w in wins])
     except dm.Failed as e:
         rec["status"], rec["reason"] = "excluded", "%s: %s" % (drv.state, e)
@@ -278,6 +282,15 @@ def quartiles(v):
     return q[0], q[2]
 
 
+def median_or_none(vals):
+    v = [x for x in vals if x is not None]
+    return statistics.median(v) if v else None
+
+
+def _ms(v):
+    return "-" if v is None else "%.2f" % v
+
+
 def report(args, recs):
     out = []
     say = out.append
@@ -287,11 +300,13 @@ def report(args, recs):
     say('A: env "%s"%s' % (args.a, ", exe " + args.a_exe if args.a_exe else ""))
     say('B: env "%s"%s' % (args.b, ", exe " + args.b_exe if args.b_exe else ""))
     say("")
-    say("run  rerolls  spawn        fps   p50 ms  p99 ms  walker ms  hitches  busy  still windows (fps)  run s")
+    say("run  rerolls  spawn        fps   p50 ms  p99 ms  1%low ms  .1%low ms  walker ms  hitches  busy  "
+        "still windows (fps)  run s")
     for r in recs:
         if r["status"] == "ok":
-            say("%-4s %7d  %-10s %6.1f  %6.1f  %6.1f  %9.2f  %7d  %4d  %d (%s)  %d%s" % (
-                r["run"], r["rerolls"], r["spawn"][:10], r["fps"], r["p50"], r["p99"], r["walker"], r["hitches"],
+            say("%-4s %7d  %-10s %6.1f  %6.1f  %6.1f  %8s  %9s  %9.2f  %7d  %4d  %d (%s)  %d%s" % (
+                r["run"], r["rerolls"], r["spawn"][:10], r["fps"], r["p50"], r["p99"], _ms(r.get("low1")),
+                _ms(r.get("low01")), r["walker"], r["hitches"],
                 r["busy"], r["windows"], " ".join("%.0f" % f for f in r["window_fps"]), r["secs_total"],
                 "  (" + r["reason"] + ")" if r["reason"] else ""))
         else:
@@ -304,10 +319,11 @@ def report(args, recs):
     say("")
     say("%-10s %-30s %-30s" % ("", "A median [IQR] (min-max)", "B median [IQR] (min-max)"))
     for key, name, fmt in (("fps", "fps", "%.1f"), ("p50", "p50 ms", "%.1f"), ("p99", "p99 ms", "%.1f"),
+                           ("low1", "1%low ms", "%.2f"), ("low01", ".1%low ms", "%.2f"),
                            ("walker", "walker ms", "%.2f"), ("hitches", "hitches", "%.0f")):
         cells = []
         for s in "AB":
-            v = [r[key] for r in side[s]]
+            v = [r[key] for r in side[s] if r.get(key) is not None]
             if not v:
                 cells.append("-")
                 continue
