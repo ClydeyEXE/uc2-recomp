@@ -68,6 +68,10 @@ Open it with **F1**, or **Back + Start** on a controller. The game pauses its in
 Settings are saved, along with your game saves, in `%LOCALAPPDATA%\xboxrecomp`. The menu's bottom line shows which
 version you're running.
 
+If the game hitches for about a quarter of a second every 9 seconds or so, check for RivaTuner Statistics Server: its
+overlay hook stalls the game even with its frame limit off. Set the game's detection level to None in RivaTuner, or
+close it, and use the frame limit above instead.
+
 ## Contributing
 Bug reports are welcome: the [bug report form](https://github.com/ClydeyEXE/uc2-recomp/issues/new?template=bug_report.yml)
 asks for your version, your GPU and the end of `play_log.txt` (in the folder you unzipped to). Please attach no game files.
