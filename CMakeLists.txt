@@ -120,6 +120,29 @@ if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /Zi)
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+    # MSVC stops optimizing a function past a size limit (warning C4883, off at
+    # the default level) and compiles it as if with /Od: every guest register
+    # and flag through memory, the TLS block looked up again on every access.
+    # 34 generated functions were past it, among them several of the game
+    # thread's hottest (sub_000FF840, sub_0014B0C0, sub_00188300), and with 7
+    # bots lifting the limit took a match from 113-121 to 144 fps. The two
+    # largest (sub_001BBD30, sub_001E6070, over 10,000 instructions) would then
+    # take an hour to compile, so tools.recomp leaves those unoptimized with a
+    # pragma and says so in recomp_funcs.h. Code generated before that has no
+    # pragma, so the limit stays until it is regenerated.
+    set(_recomp_funcs_h "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp/gen/recomp_funcs.h")
+    set(_recomp_size_limit "")
+    if(EXISTS "${_recomp_funcs_h}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_recomp_funcs_h}")
+        file(STRINGS "${_recomp_funcs_h}" _recomp_size_limit
+             REGEX "^#define RECOMP_UNOPTIMIZED_INSNS" LIMIT_COUNT 1)
+    endif()
+    if(_recomp_size_limit)
+        target_compile_options(${PROJECT_NAME} PRIVATE /d2OptimizeHugeFunctions)
+    else()
+        message(STATUS "Generated code predates RECOMP_UNOPTIMIZED_INSNS: its largest functions stay "
+                       "unoptimized. Regenerate (tools/setup.ps1 -Regenerate) for about 20% more fps.")
+    endif()
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

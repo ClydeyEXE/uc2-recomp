@@ -2282,3 +2282,52 @@ index a5b912c..7327b25 100644
  
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
+index 21600d3..3962ec8 100644
+--- a/tools/recomp/translator.py
++++ b/tools/recomp/translator.py
+@@ -514,6 +514,11 @@ def _mark_back_edges(bb, stmts):
+     return stmts if out is None else out
+ 
+ 
++# Functions with more guest instructions than this are compiled without
++# optimization under MSVC (FunctionTranslator.translate_function).
++UNOPTIMIZED_INSNS = 10000
++
++
+ class FunctionTranslator:
+     """Translates individual x86 functions to C source code."""
+ 
+@@ -3501,6 +3506,20 @@ class FunctionTranslator:
+         lines.append(f"}}")
+         lines.append(f"")
+ 
++        # MSVC gives up optimizing a function past a size limit (C4883) and
++        # compiles it as with /Od, which is slow code for the functions that
++        # are hot; a title builds with /d2OptimizeHugeFunctions to lift that.
++        # The very largest then take most of an hour each to compile (a
++        # 26,666-instruction one held its file for 62 minutes) and are left
++        # as they were: unoptimized, but in seconds.
++        if len(instructions) > UNOPTIMIZED_INSNS:
++            lines[:0] = ["#if defined(_MSC_VER) && !defined(__clang__)",
++                         '#pragma optimize("", off)  /* too large to optimize in reasonable time */',
++                         "#endif"]
++            lines[-1:-1] = ["#if defined(_MSC_VER) && !defined(__clang__)",
++                            '#pragma optimize("", on)',
++                            "#endif"]
++
+         return "\n".join(lines)
+ 
+     def _find_used_registers(self, instructions):
+@@ -3922,6 +3941,11 @@ class BatchTranslator:
+             "",
+             '#include "recomp_types.h"',
+             "",
++            # Says the functions above this size carry #pragma optimize off,
++            # so a build may lift MSVC's size limit (/d2OptimizeHugeFunctions)
++            # without spending an hour on them. A title's CMakeLists looks for it.
++            f"#define RECOMP_UNOPTIMIZED_INSNS {UNOPTIMIZED_INSNS}",
++            "",
+         ]
+         for addr, name, _ in translations:
+             decl = self._make_declaration(addr, name)
