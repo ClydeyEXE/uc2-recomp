@@ -116,6 +116,56 @@ extern volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset);
 
 #define NV2A_USER_DMA_GET 0x800044u
 
+/*
+ * Time the title spends here, by return address, logged every 10 s as [FENCE]:
+ * how long the game waits for the GPU (the walker) a second. Present waits for
+ * the frame before last (return 0x0038097E or 0x003809BE); Lock waits when a
+ * resource the GPU still reads is locked (0x003870A0 for the newest fence,
+ * 0x003870B7 for the resource's own). Only waits that loop are counted.
+ */
+#define FENCE_SITES 8
+static struct { uint32_t ret, calls, waits; LONGLONG ticks; } s_fence[FENCE_SITES];
+static LONGLONG s_fence_window, s_fence_freq;
+
+static void fence_account(uint32_t ret, int waited, LONGLONG t0, LONGLONG t1)
+{
+    int i;
+
+    for (i = 0; i < FENCE_SITES - 1 && s_fence[i].ret && s_fence[i].ret != ret; i++)
+        ;
+    s_fence[i].ret = ret;
+    s_fence[i].calls++;
+    if (waited) {
+        s_fence[i].waits++;
+        s_fence[i].ticks += t1 - t0;
+    }
+    if (!s_fence_freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        s_fence_freq = f.QuadPart;
+        s_fence_window = t1;
+        return;
+    }
+    if (t1 - s_fence_window >= 10 * s_fence_freq) {
+        char line[512];
+        int n = 0;
+        double span = (double)(t1 - s_fence_window) / s_fence_freq, all = 0;
+
+        for (i = 0; i < FENCE_SITES && s_fence[i].ret; i++) {
+            double ms = 1000.0 * s_fence[i].ticks / s_fence_freq;
+            all += ms;
+            n += snprintf(line + n, sizeof line - n, " | 0x%08X %u calls, %u waits, %.0f ms",
+                          s_fence[i].ret, s_fence[i].calls, s_fence[i].waits, ms);
+            if (n >= (int)sizeof line)
+                n = (int)sizeof line - 1;
+        }
+        fprintf(stderr, "[FENCE] %.1f s: waited %.0f ms (%.1f%%)%s\n", span, all,
+                100.0 * all / (1000.0 * span), line);
+        memset(s_fence, 0, sizeof s_fence);
+        s_fence_window = t1;
+    }
+}
+
 void sub_00386B30(void)
 {
     const char *mem = (const char *)g_xbox_mem_offset;
@@ -128,14 +178,18 @@ void sub_00386B30(void)
     const volatile uint32_t *get = xbox_Nv2aRegPtr(NV2A_USER_DMA_GET);
     uint32_t last_get = get ? *get : 0;
     ULONGLONG start = 0;
-    int kicked = 0;
+    int kicked = 0, waited = 0;
+    uint32_t ret = *(const uint32_t *)(mem + g_esp);
+    LARGE_INTEGER t0, t1;
 
+    QueryPerformanceCounter(&t0);
     if (fence == *seq) {
         g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0;
         g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0x00386B5Fu;
         sub_00386840();
     }
     while (*seq - fence < *seq - *sem) {
+        waited = 1;
         if (get && *get != last_get) {
             last_get = *get;
             start = 0;
@@ -162,6 +216,8 @@ void sub_00386B30(void)
         }
         SwitchToThread();
     }
+    QueryPerformanceCounter(&t1);
+    fence_account(ret, waited, t0.QuadPart, t1.QuadPart);
     g_esp += 12; /* ret 8 */
 }
 

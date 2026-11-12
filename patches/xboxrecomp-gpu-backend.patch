@@ -26,6 +26,22 @@ index bd36f2a..4ac79ef 100644
      if (s_dsp_ack_auto) {
          uint32_t *slot = dsp_ack_auto_slot(d);
          if (slot && *slot) {
+diff --git a/src/apu/apu_mmio_hook.c b/src/apu/apu_mmio_hook.c
+index aecce6a..ee56da7 100644
+--- a/src/apu/apu_mmio_hook.c
++++ b/src/apu/apu_mmio_hook.c
+@@ -103,7 +103,10 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
+      * a title that waits on one waits forever, and the only way to work out
+      * what it is waiting for is to see the register traffic that precedes the
+      * wait. */
+-    if (apu_env_on("RECOMP_APU_TRACE")) {
++    static int trace = -1;   /* read once: DirectSound faults in here on every register access */
++    if (trace < 0)
++        trace = apu_env_on("RECOMP_APU_TRACE");
++    if (trace) {
+         static unsigned n;
+         if (n++ < 400) {
+             /* The value as well as the offset: finding which register carries
 diff --git a/src/apu/apu_vp.c b/src/apu/apu_vp.c
 index 94e57da..2bb3b9f 100644
 --- a/src/apu/apu_vp.c

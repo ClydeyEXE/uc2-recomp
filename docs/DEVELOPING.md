@@ -6,6 +6,10 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 ## Measuring
 - Every 10 s the log has a `[FRAMES]` line: p50/p90/p99 frame times and where the walker's time went. "Walker CPU"
   overstates work, as the ack loop polls with short sleeps and clock reads.
+- Every 10 s the log also has a `[FENCE]` line: how long the title's main thread waited for the walker in D3D's
+  fence wait (`sub_00386B30`), by return address. `0x003809BE` is present waiting for the frame before last, and
+  `0x003870B7` a Lock waiting for the GPU to finish with a resource. The wait spins, so the main thread shows as
+  busy in a profile while it waits: its work a frame is the frame time less this.
 - A frame over 100 ms gets a `[HITCH]` line naming where the walker and the title's main thread were. The sampler
   unwinds 10 frames, so a "game thread, inclusive" line counts every function on its sampled stacks. `printf` in
   those lists is probably a mis-named frame (the nearest symbol to an unnamed address), not real printing.
