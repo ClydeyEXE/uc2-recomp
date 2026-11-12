@@ -118,3 +118,11 @@ Read this when a symptom looks familiar, or before changing the code a fix touch
     that point; the runtime completes reads before they return. At that one call (returning to `0x00369C08`) such a
     packet now counts as in flight, and XACT hands it over the next time it services the voice. Other short sounds in
     that bank, such as `A_Weapon.SN_Raise`, were silent for the same reason.
+21. **Game clock 0.2-0.4% off real time, different every boot.** The main loop (`sub_0001A310`) times frames with
+    `rdtsc` times seconds per cycle (`0x0040C590`), which `sub_00068010` calibrates at boot by counting cycles while
+    `KeTickCount` moves 200 ms. The runtime wrote `KeTickCount` from `GetTickCount()`, which moves in steps of about
+    15.6 ms, so the calibration came out 0.996-1.002x the emulated clock's 733 MHz rate and the level clock and match
+    timer ran that much off (#20). `KeTickCount` now counts milliseconds from the performance counter
+    (`patches/xboxrecomp-gpu-backend.patch`), and the calibration comes out exact. The frame rate never mattered: the
+    delta is unclamped up to the level's 0.0005-0.4 s, and `tools/tick_rates.py` measured the same movement, fire and
+    timers at 60, 144, 240 and no limit.

@@ -2138,10 +2138,39 @@ index 8acb0af..5b0b9c3 100644
  /* Direct access, for the self-test. */
  void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 7ade793..af35ad4 100644
+index 7ade793..03d92dc 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -1556,26 +1556,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1449,6 +1449,28 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
+     return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
+ }
+ 
++/* KeTickCount's value: milliseconds from the performance counter, starting
++ * from GetTickCount() at the first call so it carries on from the value init
++ * wrote. */
++static uint32_t xbox_tick_count_ms(void)
++{
++    static LARGE_INTEGER freq, q0;
++    static uint32_t base;
++    LARGE_INTEGER now;
++    uint64_t d;
++
++    if (!freq.QuadPart) {
++        if (!QueryPerformanceFrequency(&freq) || !freq.QuadPart)
++            return GetTickCount();
++        QueryPerformanceCounter(&q0);
++        base = GetTickCount();
++    }
++    QueryPerformanceCounter(&now);
++    d = (uint64_t)(now.QuadPart - q0.QuadPart);
++    return base + (uint32_t)((d / (uint64_t)freq.QuadPart) * 1000u
++                             + (d % (uint64_t)freq.QuadPart) * 1000u / (uint64_t)freq.QuadPart);
++}
++
+ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)param;
+@@ -1556,26 +1578,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                              nv2a_pb_scan(put);
                      } else {
                          /* The segment scan, the default: the bytes between
@@ -2173,7 +2202,27 @@ index 7ade793..af35ad4 100644
                      }
                      /* Periodic, because what the title submits at init is not
                       * what it submits once it is drawing a menu, and the
-@@ -4230,9 +4215,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
+@@ -1645,10 +1652,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+          * which silently breaks every timeout that polls it: Halo's DHCP setup
+          * waits on a tick deadline that never arrives and spins forever bringing
+          * up XNet. A live clock is also just the truth -- KeTickCount ticks on
+-         * hardware whether or not anyone is asleep. GetTickCount() shares the
+-         * millisecond unit, so the rate matches. */
++         * hardware whether or not anyone is asleep.
++         *
++         * In 1 ms steps, as on hardware, from the performance counter:
++         * GetTickCount() moves in steps of about 15.6 ms. A title timing its
++         * CPU clock against KeTickCount got the wrong rate from those steps:
++         * Unreal Championship 2 counts rdtsc cycles while KeTickCount moves
++         * 200 ms at boot (0x00068010), and its game clock then ran 0.2-0.4%
++         * off real time, a different amount every boot. */
+         *(volatile uint32_t *)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT)
+-                               + g_memory_offset) = GetTickCount();
++                               + g_memory_offset) = xbox_tick_count_ms();
+ 
+         Sleep(0);  /* yield; the waiter is spinning on another core */
+     }
+@@ -4230,9 +4243,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
      }
      contig_unlock();
  
