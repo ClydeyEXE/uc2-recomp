@@ -691,6 +691,396 @@ void sub_0003D930(void)            /* UObject::execRand(FFrame &Stack, int *Resu
 }
 
 /*
+ * A per-tick probe of game state, for checking that the game's logic runs the
+ * same at any frame rate (#20): UGameEngine::Tick(float DeltaSeconds), engine
+ * in ecx, wrapping the generated body. Off unless RECOMP_TICK_PROBE=<file>.
+ *
+ * After each tick it writes a CSV line: the host time, the DeltaSeconds the
+ * main loop passed, the level's TimeSeconds and TimeDilation, the local
+ * player's pawn (Location, Velocity, Physics) and any further properties named
+ * in RECOMP_TICK_PROBE_FIELDS, comma separated as <obj>.<Property>, where obj
+ * is L (LevelInfo), C (the PlayerController), P (its Pawn), W (the pawn's
+ * Weapon), G (Level.Game), R (the game's GameReplicationInfo) or X (the
+ * newest Projectile among the last TP_PROJ_SCAN entries of the level's actor
+ * list, where spawned actors are added; X.Name gives its name, so a new shot
+ * shows as a new name).
+ *
+ * Properties are found by name through the classes' reflection data, whose
+ * layout is worked out at the first tick from the LevelInfo, whose
+ * TimeDilation and TimeSeconds are known to sit at +0x2AC and +0x2B0 (ULevel::
+ * Tick, sub_000E30D0). The layout found, and each class's property list, go to
+ * <file>.props.
+ */
+#define TP_ENGINE_LEVEL    0x13Cu       /* UGameEngine: GLevel (+0x4C is the client) */
+#define TP_LEVEL_ACTORS    0x30u        /* ULevel: Actors data; [0] is the LevelInfo, count at +4 */
+#define TP_PROJ_SCAN       48
+#define TP_SECONDS_PER_CYCLE 0x0040C590u /* float, calibrated at boot (sub_00068010) */
+#define TP_TIMEDILATION    0x2ACu       /* LevelInfo */
+#define TP_TIMESECONDS     0x2B0u
+
+extern void sub_000C91B0_gen(void);
+extern __declspec(thread) uint32_t g_ecx;
+
+static FILE *tp_out, *tp_props;
+static int tp_state = -1;               /* -1 unread, 0 off, 1 on, 2 layout failed */
+static uint32_t tp_class_off, tp_super_off, tp_next_off, tp_children_off, tp_propoff_off;
+static LARGE_INTEGER tp_freq, tp_t0;
+
+/* Guest reads, checked against a small cache of 64 KB regions seen committed. */
+static int tp_ok(uint32_t va)
+{
+    static uint32_t good[64];
+    static int ngood, rr;
+    uint32_t r = va >> 16;
+    int i;
+
+    if (va < 0x10000u || va >= 0x7FFD0000u)
+        return 0;
+    for (i = 0; i < ngood; i++)
+        if (good[i] == r)
+            return 1;
+    if (!bench_readable(r << 16, 0x10000u))
+        return 0;
+    if (ngood < 64)
+        good[ngood++] = r;
+    else
+        good[rr++ & 63] = r;
+    return 1;
+}
+
+static uint32_t tp_rd(uint32_t va)
+{
+    return tp_ok(va) && tp_ok(va + 3) ? *(const uint32_t *)((const char *)g_xbox_mem_offset + va) : 0;
+}
+
+static const char *tp_name(uint32_t obj)
+{
+    uint32_t names = tp_rd(GNAMES_DATA_VA), index, entry;
+
+    if (!obj || !tp_ok(obj) || !names)
+        return "";
+    index = tp_rd(obj + UOBJECT_NAME);
+    if (index >= tp_rd(GNAMES_NUM_VA) || !(entry = tp_rd(names + 4u * index)))
+        return "";
+    return (const char *)g_xbox_mem_offset + entry + FNAMEENTRY_TEXT;
+}
+
+static const char *tp_class_name(uint32_t obj)
+{
+    return obj ? tp_name(tp_rd(obj + tp_class_off)) : "";
+}
+
+static int tp_ends(const char *s, const char *tail)
+{
+    size_t a = strlen(s), b = strlen(tail);
+    return a >= b && strcmp(s + a - b, tail) == 0;
+}
+
+/* A UField: what a class's Children list holds. */
+static int tp_is_field(uint32_t obj)
+{
+    const char *k = tp_class_name(obj);
+    return tp_ends(k, "Property") || !strcmp(k, "Function") || !strcmp(k, "State") ||
+           !strcmp(k, "Const") || !strcmp(k, "Enum") || !strcmp(k, "Struct");
+}
+
+static uint32_t tp_field(uint32_t cls, const char *name)
+{
+    int depth, n;
+    uint32_t f;
+
+    for (depth = 0; cls && depth < 32; depth++, cls = tp_rd(cls + tp_super_off))
+        for (f = tp_rd(cls + tp_children_off), n = 0; f && n < 4096; f = tp_rd(f + tp_next_off), n++)
+            if (!strcmp(tp_name(f), name) && tp_ends(tp_class_name(f), "Property"))
+                return f;
+    return 0;
+}
+
+/* Works out the reflection layout from the LevelInfo. */
+static int tp_layout(uint32_t li)
+{
+    uint32_t off, cls, f, p;
+
+    for (off = 0x1C; off <= 0x40 && !tp_class_off; off += 4)
+        if (!strcmp(tp_name(tp_rd(li + off)), "LevelInfo"))
+            tp_class_off = off;
+    if (!tp_class_off)
+        return 0;
+    cls = tp_rd(li + tp_class_off);
+    for (off = 0x28; off <= 0x80 && !tp_super_off; off += 4)
+        if (!strcmp(tp_name(tp_rd(cls + off)), "ZoneInfo"))
+            tp_super_off = off;
+    if (!tp_super_off)
+        return 0;
+    tp_next_off = tp_super_off + 4;
+    for (off = tp_super_off + 8; off <= 0x100 && !tp_children_off; off += 4) {
+        f = tp_rd(cls + off);
+        if (f && tp_is_field(f) && (!tp_rd(f + tp_next_off) || tp_is_field(tp_rd(f + tp_next_off))))
+            tp_children_off = off;
+    }
+    if (!tp_children_off)
+        return 0;
+    p = tp_field(cls, "TimeDilation");
+    for (off = 0x2C; p && off <= 0x80 && !tp_propoff_off; off += 4)
+        if (tp_rd(p + off) == TP_TIMEDILATION)
+            tp_propoff_off = off;
+    if (!tp_propoff_off || tp_rd(tp_field(cls, "TimeSeconds") + tp_propoff_off) != TP_TIMESECONDS)
+        return 0;
+    fprintf(tp_props, "layout: class +0x%X, super +0x%X, next +0x%X, children +0x%X, property offset +0x%X\n",
+            tp_class_off, tp_super_off, tp_next_off, tp_children_off, tp_propoff_off);
+    return 1;
+}
+
+/* Lists a class's properties once, with its supers'. */
+static void tp_list(uint32_t cls)
+{
+    static uint32_t done[32];
+    static int ndone;
+    int i, depth, n;
+    uint32_t c, f;
+
+    if (!cls || ndone >= 32)
+        return;
+    for (i = 0; i < ndone; i++)
+        if (done[i] == cls)
+            return;
+    done[ndone++] = cls;
+    fprintf(tp_props, "class %s\n", tp_name(cls));
+    for (depth = 0, c = cls; c && depth < 32; depth++, c = tp_rd(c + tp_super_off)) {
+        fprintf(tp_props, "  from %s\n", tp_name(c));
+        for (f = tp_rd(c + tp_children_off), n = 0; f && n < 4096; f = tp_rd(f + tp_next_off), n++)
+            if (tp_ends(tp_class_name(f), "Property"))
+                fprintf(tp_props, "    +0x%03X %-16s %s\n", tp_rd(f + tp_propoff_off), tp_class_name(f), tp_name(f));
+    }
+    fflush(tp_props);
+}
+
+/* A property's offset in an object, cached per class and name; -1 if none. */
+static int tp_off(uint32_t obj, const char *name, const char **kind)
+{
+    static struct { uint32_t cls; const char *name; int off; const char *kind; } cache[128];
+    static int n;
+    uint32_t cls, f;
+    int i;
+
+    if (!obj || !(cls = tp_rd(obj + tp_class_off)))
+        return -1;
+    for (i = 0; i < n; i++)
+        if (cache[i].cls == cls && cache[i].name == name) {
+            if (kind)
+                *kind = cache[i].kind;
+            return cache[i].off;
+        }
+    f = tp_field(cls, name);
+    if (n < 128) {
+        cache[n].cls = cls;
+        cache[n].name = name;
+        cache[n].off = f ? (int)tp_rd(f + tp_propoff_off) : -1;
+        cache[n].kind = f ? _strdup(tp_class_name(f)) : "";
+        n++;
+    }
+    if (kind)
+        *kind = f ? cache[n - 1].kind : "";
+    return f ? (int)tp_rd(f + tp_propoff_off) : -1;
+}
+
+static uint32_t tp_obj(uint32_t obj, const char *name)
+{
+    int off = tp_off(obj, name, NULL);
+    return off < 0 ? 0 : tp_rd(obj + (uint32_t)off);
+}
+
+static int tp_is_a(uint32_t obj, const char *cls_name)
+{
+    uint32_t c = obj ? tp_rd(obj + tp_class_off) : 0;
+    int depth;
+
+    for (depth = 0; c && depth < 32; depth++, c = tp_rd(c + tp_super_off))
+        if (!strcmp(tp_name(c), cls_name))
+            return 1;
+    return 0;
+}
+
+/* The fields asked for in RECOMP_TICK_PROBE_FIELDS. */
+static struct { char obj; char name[48]; } tp_fields[24];
+static int tp_nfields;
+
+static void tp_value(uint32_t obj, const char *name)
+{
+    const char *kind = "";
+    int off;
+    const char *p;
+
+    if (!strcmp(name, "Name")) {
+        fprintf(tp_out, ",%s", obj ? tp_name(obj) : "");
+        return;
+    }
+    off = tp_off(obj, name, &kind);
+
+    if (off < 0 || !tp_ok(obj + (uint32_t)off + 11)) {
+        fputs(",", tp_out);
+        return;
+    }
+    p = (const char *)g_xbox_mem_offset + obj + (uint32_t)off;
+    if (!strcmp(kind, "FloatProperty"))
+        fprintf(tp_out, ",%.6g", *(const float *)p);
+    else if (!strcmp(kind, "IntProperty"))
+        fprintf(tp_out, ",%d", *(const int32_t *)p);
+    else if (!strcmp(kind, "ByteProperty"))
+        fprintf(tp_out, ",%u", *(const uint8_t *)p);
+    else if (!strcmp(kind, "StructProperty") && strstr(name, "Rotation"))     /* a Rotator: ints */
+        fprintf(tp_out, ",%d;%d;%d", ((const int32_t *)p)[0], ((const int32_t *)p)[1], ((const int32_t *)p)[2]);
+    else if (!strcmp(kind, "StructProperty"))
+        fprintf(tp_out, ",%.3f;%.3f;%.3f", ((const float *)p)[0], ((const float *)p)[1], ((const float *)p)[2]);
+    else if (!strcmp(kind, "ObjectProperty") || !strcmp(kind, "ClassProperty"))
+        fprintf(tp_out, ",%s", tp_name(*(const uint32_t *)p));
+    else
+        fprintf(tp_out, ",0x%X", *(const uint32_t *)p);
+}
+
+static uint32_t tp_projectile(uint32_t level)
+{
+    uint32_t data = tp_rd(level + TP_LEVEL_ACTORS), count = tp_rd(level + TP_LEVEL_ACTORS + 4), i, a;
+
+    for (i = count; data && i > 0 && count - i < TP_PROJ_SCAN; i--)
+        if ((a = tp_rd(data + 4u * (i - 1))) && tp_is_a(a, "Projectile"))
+            return a;
+    return 0;
+}
+
+static void tp_open(void)
+{
+    const char *path = getenv("RECOMP_TICK_PROBE"), *fields = getenv("RECOMP_TICK_PROBE_FIELDS");
+    char buf[MAX_PATH + 8];
+    int i;
+
+    tp_state = 0;
+    if (!path || !*path)
+        return;
+    _snprintf(buf, sizeof buf, "%s.props", path);
+    buf[sizeof buf - 1] = 0;
+    tp_out = fopen(path, "w");
+    tp_props = fopen(buf, "w");
+    if (!tp_out || !tp_props)
+        return;
+    setvbuf(tp_out, NULL, _IOFBF, 1 << 16);
+    QueryPerformanceFrequency(&tp_freq);
+    QueryPerformanceCounter(&tp_t0);
+    fputs("t,dt,level_time,dilation,pawn,x,y,z,vx,vy,vz,phys", tp_out);
+    while (fields && *fields && tp_nfields < 24) {
+        const char *end = strchr(fields, ','), *dot = strchr(fields, '.');
+        size_t len = end ? (size_t)(end - fields) : strlen(fields);
+        if (dot && dot < fields + len && dot == fields + 1 && len - 2 < sizeof tp_fields[0].name) {
+            tp_fields[tp_nfields].obj = fields[0];
+            memcpy(tp_fields[tp_nfields].name, dot + 1, len - 2);
+            tp_fields[tp_nfields].name[len - 2] = 0;
+            fprintf(tp_out, ",%c.%s", fields[0], tp_fields[tp_nfields].name);
+            tp_nfields++;
+        }
+        fields += len + (end ? 1 : 0);
+    }
+    fputc('\n', tp_out);
+    for (i = 0; i < tp_nfields; i++)
+        tp_fields[i].name[sizeof tp_fields[0].name - 1] = 0;
+    fprintf(stderr, "[PROBE] per-tick state to %s, %d extra fields\n", path, tp_nfields);
+    {
+        float spc;
+        memcpy(&spc, (const char *)g_xbox_mem_offset + TP_SECONDS_PER_CYCLE, 4);
+        fprintf(stderr, "[PROBE] seconds per cycle %.6e, %.5f x the emulated clock's\n", spc, spc * 733333333.0);
+    }
+    tp_state = 1;
+}
+
+static void tp_tick(uint32_t engine, float dt, double t)
+{
+    static double last_flush;
+    uint32_t level = tp_rd(engine + TP_ENGINE_LEVEL), li, c, pc = 0, pawn = 0, obj;
+    const char *mem = (const char *)g_xbox_mem_offset;
+    int i, n, off;
+
+    if (!level || !(li = tp_rd(tp_rd(level + TP_LEVEL_ACTORS))) || !tp_ok(li + TP_TIMESECONDS + 3))
+        return;
+    if (!tp_propoff_off && !tp_layout(li)) {
+        uint32_t objs[3], off, w;
+        objs[0] = li;
+        objs[1] = tp_class_off ? tp_rd(li + tp_class_off) : 0;
+        objs[2] = objs[1] && tp_children_off ? tp_rd(objs[1] + tp_children_off) : 0;
+        for (i = 0; i < 3; i++) {
+            fprintf(tp_props, "object %d at 0x%08X (%s)\n", i, objs[i], tp_name(objs[i]));
+            for (off = 0; objs[i] && off < 0x100; off += 4) {
+                w = tp_rd(objs[i] + off);
+                fprintf(tp_props, "  +0x%02X 0x%08X %s\n", off, w, w >= 0x10000u ? tp_name(w) : "");
+            }
+        }
+        fprintf(tp_props, "found: class +0x%X super +0x%X children +0x%X propoff +0x%X\n",
+                tp_class_off, tp_super_off, tp_children_off, tp_propoff_off);
+        fclose(tp_props);
+        fprintf(stderr, "[PROBE] reflection layout not found; probe off\n");
+        tp_state = 2;
+        return;
+    }
+    for (c = tp_obj(li, "ControllerList"), n = 0; c && n < 64; c = tp_obj(c, "nextController"), n++)
+        if (tp_is_a(c, "PlayerController")) {
+            pc = c;
+            break;
+        }
+    pawn = tp_obj(pc, "Pawn");
+    fprintf(tp_out, "%.6f,%.6f,%.6f,%.4f", t, dt, *(const float *)(mem + li + TP_TIMESECONDS),
+            *(const float *)(mem + li + TP_TIMEDILATION));
+    off = tp_off(pawn, "Location", NULL);
+    if (pawn && off >= 0 && tp_ok(pawn + (uint32_t)off)) {
+        const float *loc = (const float *)(mem + pawn + (uint32_t)off);
+        int voff = tp_off(pawn, "Velocity", NULL), poff = tp_off(pawn, "Physics", NULL);
+        const float *vel = voff >= 0 ? (const float *)(mem + pawn + (uint32_t)voff) : NULL;
+        fprintf(tp_out, ",%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%u", tp_class_name(pawn), loc[0], loc[1], loc[2],
+                vel ? vel[0] : 0.0f, vel ? vel[1] : 0.0f, vel ? vel[2] : 0.0f,
+                poff >= 0 ? *(const uint8_t *)(mem + pawn + (uint32_t)poff) : 0u);
+        tp_list(tp_rd(pawn + tp_class_off));
+        tp_list(tp_rd(pc + tp_class_off));
+    } else {
+        fputs(",,,,,,,,", tp_out);
+    }
+    for (i = 0; i < tp_nfields; i++) {
+        switch (tp_fields[i].obj) {
+        case 'L': obj = li; break;
+        case 'C': obj = pc; break;
+        case 'P': obj = pawn; break;
+        case 'W': obj = tp_obj(pawn, "Weapon"); break;
+        case 'G': obj = tp_obj(li, "Game"); break;
+        case 'R': obj = tp_obj(tp_obj(li, "Game"), "GameReplicationInfo"); break;
+        case 'X': obj = tp_projectile(level); break;
+        default: obj = 0;
+        }
+        if (obj && tp_fields[i].obj != 'L' && tp_fields[i].obj != 'C' && tp_fields[i].obj != 'P')
+            tp_list(tp_rd(obj + tp_class_off));
+        tp_value(obj, tp_fields[i].name);
+    }
+    fputc('\n', tp_out);
+    if (t - last_flush > 1.0) {
+        fflush(tp_out);
+        last_flush = t;
+    }
+}
+
+void sub_000C91B0(void)            /* UGameEngine::Tick(float DeltaSeconds) */
+{
+    uint32_t engine = g_ecx;
+    float dt;
+    LARGE_INTEGER now;
+
+    if (tp_state < 0)
+        tp_open();
+    if (tp_state != 1) {
+        sub_000C91B0_gen();
+        return;
+    }
+    memcpy(&dt, (const char *)g_xbox_mem_offset + g_esp + 4, 4);
+    sub_000C91B0_gen();
+    QueryPerformanceCounter(&now);
+    tp_tick(engine, dt, (double)(now.QuadPart - tp_t0.QuadPart) / (double)tp_freq.QuadPart);
+}
+
+/*
  * XACT's "is any packet of this voice still in flight", wrapping the generated
  * body. A voice playing from a streaming wave bank (A_Weapon.xwb) has two packet
  * slots, each filled by an overlapped disc read: state 0xAAAA while it is read

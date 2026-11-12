@@ -82,6 +82,21 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   about 1% (A/A, 85-87.5 fps), so 3 a side detects about 3%. `--bots N` adds bots for real load. Every run is 4:3
   whatever the settings panel says, as the reference frames are. Without `--direct` it goes through the menus and
   forfeits until the spawn is the corridor (about one spawn in ten since toolkit v0.17.0), several minutes a run.
+- `python -I tools/tick_rates.py --rates 60,144,240,0 --runs 2` checks that the game's logic runs the same at any
+  frame rate (#20). Each run boots like `ab.py --direct` with `RECOMP_FPS_LIMIT=<rate>`, plays a fixed pad sequence
+  (standing jumps, a turn, running, dodges, fire) and prints a table by rate: ticks a second and the frame delta, the
+  level clock against the host's, jump apex and air time, run speed, dodge speed and distance, yaw rate, shots a
+  second and projectile speed. About 50 s a run. `--menu` instead holds down in Instant Action's game type list and
+  counts the steps (menu key repeat). `--analyse build/runs/<name>` redoes the table.
+  - It reads `RECOMP_TICK_PROBE=<file>`: a wrapper on `UGameEngine::Tick` (`sub_000C91B0`) writes a CSV line every
+    tick with the delta the main loop passed, the level's `TimeSeconds`, and the local player's pawn (Location,
+    Velocity, Physics), plus any `RECOMP_TICK_PROBE_FIELDS` such as `C.Rotation,W.LastFireTime,X.Location`
+    (L LevelInfo, C PlayerController, P pawn, W weapon, G game, R GameReplicationInfo, X the newest projectile).
+    Properties are found by name in the classes' reflection data; the layout used and each class's property list go
+    to `<file>.props`. Off, the wrapper only checks a flag.
+  - The main loop (`sub_0001A310`) passes `GEngine->Tick` the `rdtsc` time since the last frame, unclamped and with
+    no tick-rate cap; `ULevel::Tick` (`sub_000E30D0`) scales it by `TimeDilation` and clamps it to 0.0005-0.4 s.
+    Seconds per cycle (0x0040C590) is calibrated at boot against `KeTickCount` (`sub_00068010`), which the probe logs.
 - `python -I tools/check_run.py <log>` says whether a run worked: maps loaded, match reached, crash, watchdog as timer
   or hang, untranslated instructions reached, menu and match fps (`settled` leaves out the window with the load),
   hitches and failed opens. It exits 0 on pass, 1 on fail; `--min-fps`, `--no-expect-match` and `--json` adjust it.
