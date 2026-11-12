@@ -5,15 +5,26 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
 
 ## Measuring
 - Every 10 s the log has a `[FRAMES]` line: p50/p90/p99 frame times and where the walker's time went. "Walker CPU"
-  overstates work, as the ack loop polls with short sleeps and clock reads.
+  overstates work, as the ack loop polls with short sleeps and clock reads: "other walker cpu" counts that polling
+  too, so in a busy match it is mostly the walker waiting for the next kick, not work. With the loop waiting
+  instead (tried 2026-11-12, not kept: it cost 7% fps), it was 2.5 ms a frame with 7 bots, against 6.4 polling.
 - Every 10 s the log also has a `[FENCE]` line: how long the title's main thread waited for the walker in D3D's
   fence wait (`sub_00386B30`), by return address. `0x003809BE` is present waiting for the frame before last, and
   `0x003870B7` a Lock waiting for the GPU to finish with a resource. The wait spins, so the main thread shows as
   busy in a profile while it waits: its work a frame is the frame time less this.
 - A frame over 100 ms gets a `[HITCH]` line naming where the walker and the title's main thread were. The sampler
-  unwinds 10 frames, so a "game thread, inclusive" line counts every function on its sampled stacks. `printf` in
-  those lists is probably a mis-named frame (the nearest symbol to an unnamed address), not real printing.
-- `python -I tools/prof.py --secs 20` profiles every thread of a live run.
+  unwinds 10 frames, so a "game thread, inclusive" line counts every function on its sampled stacks. Builds before
+  the game had `/Zi` named unnamed addresses after the nearest public, so `printf` there was `recomp_fp_round24`.
+- `python -I tools/prof.py --secs 20` profiles every thread of a live run (`--lines N` lists more functions per
+  thread). The game builds with `/Zi`, so its PDB names the generated code's static helpers too: each generated file
+  has its own copy of `recomp_fp_round24` and the others, and they used to show as whatever public came before them
+  (`sscanf`, `printf`). An address whose function has no name of its own is shown as `symbol+0xOFF?`; `dumpbin
+  /disasm /range` on it says what it is.
+- `RECOMP_EXC_STATS=1` counts every exception the process takes (from 15 s after start), with an `[EXC]` line every
+  10 s: the total, then the commonest by code, thread, host address (`exe+0x...`) and guest address. The APU's and the
+  USB controllers' registers are trapped, so each access to them is an exception, about 1 µs each before any
+  handler runs: with 7 bots, 12,000-19,000 a second, most of them DirectSound's voice-processor writes on the game
+  thread.
 - Scripted matches are much lighter than played ones. Use a real, busy match for performance work.
 - `python -I tools/drive_match.py --secs 120 --timeout 400` drives the game into a CTF-Aqueduct match by watching it:
   each press waits for the screen it expects (file opens in the log, or the game window matched against reference

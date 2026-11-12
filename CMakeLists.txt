@@ -112,6 +112,12 @@ if(MSVC)
     # Names for the runtime's statics in profiles.
     target_compile_options(xbox_kernel PRIVATE /Zi)
     target_compile_options(xbox_video PRIVATE /Zi)
+    # And for this project's own sources and the generated code: its PDB then
+    # names every function, not only the publics. Each generated file has its
+    # own copy of recomp_types.h's static helpers (recomp_fp_round24 and the
+    # rest), and without names a profile put those under whatever public came
+    # before them ("sscanf"). Code generation is the same either way.
+    target_compile_options(${PROJECT_NAME} PRIVATE /Zi)
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
 endif()

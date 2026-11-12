@@ -222,6 +222,79 @@ typedef struct MCPXAPUState MCPXAPUState;
 extern MCPXAPUState *mcpx_apu_init_standalone(uint8_t *ram_ptr);
 extern MCPXAPUState *g_apu_state;
 
+/* RECOMP_EXC_STATS=1: every exception the process takes, counted. Each one is
+ * a trip through the kernel and every vectored handler, and the APU's and the
+ * AC'97 page's registers are reached that way, so a title's audio code can
+ * spend real time here. The handler goes in front of the others 15 s after
+ * start (they are installed during init and would see the faults first), and
+ * every 10 s prints an [EXC] line: the count, then the commonest (exception
+ * code, thread, host address relative to the exe, guest VA for an access
+ * violation in guest memory). It counts and declines, so behaviour is
+ * unchanged. tools/prof.py's names apply to the addresses. */
+#define EXC_SLOTS 64
+static struct { DWORD code, tid; uintptr_t rip; uint32_t va; LONG n; } s_exc[EXC_SLOTS];
+static volatile LONG s_exc_total, s_exc_lock;
+static ULONGLONG s_exc_t0;
+
+static LONG CALLBACK exc_stats_veh(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode, tid = GetCurrentThreadId();
+    uintptr_t rip = (uintptr_t)ep->ContextRecord->Rip;
+    uint32_t va = 0;
+    ULONGLONG now = GetTickCount64();
+    int i;
+
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        uintptr_t f = (uintptr_t)ep->ExceptionRecord->ExceptionInformation[1];
+        uintptr_t b = (uintptr_t)g_xbox_mem_offset;
+        if (f >= b && f - b < 0x100000000ull)
+            va = (uint32_t)(f - b);
+    }
+    InterlockedIncrement(&s_exc_total);
+    if (InterlockedExchange(&s_exc_lock, 1))
+        return EXCEPTION_CONTINUE_SEARCH;
+    for (i = 0; i < EXC_SLOTS; i++) {
+        if (!s_exc[i].n || (s_exc[i].code == code && s_exc[i].tid == tid && s_exc[i].rip == rip
+                            && (s_exc[i].va & ~0xFFu) == (va & ~0xFFu))) {
+            s_exc[i].code = code; s_exc[i].tid = tid; s_exc[i].rip = rip; s_exc[i].va = va;
+            s_exc[i].n++;
+            break;
+        }
+    }
+    if (now - s_exc_t0 >= 10000) {
+        uintptr_t base = (uintptr_t)GetModuleHandleW(NULL);
+        fprintf(stderr, "[EXC] %.1f s: %ld exceptions", (now - s_exc_t0) / 1000.0, s_exc_total);
+        for (int k = 0; k < 12; k++) {
+            int best = -1;
+            for (i = 0; i < EXC_SLOTS; i++)
+                if (s_exc[i].n > 0 && (best < 0 || s_exc[i].n > s_exc[best].n))
+                    best = i;
+            if (best < 0)
+                break;
+            fprintf(stderr, " | %ld x %08lX tid %lu exe+0x%llX va 0x%08X", s_exc[best].n,
+                    s_exc[best].code, s_exc[best].tid,
+                    (unsigned long long)(s_exc[best].rip - base), s_exc[best].va);
+            s_exc[best].n = -s_exc[best].n;
+        }
+        fprintf(stderr, "\n");
+        memset(s_exc, 0, sizeof s_exc);
+        InterlockedExchange(&s_exc_total, 0);
+        s_exc_t0 = now;
+    }
+    InterlockedExchange(&s_exc_lock, 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+static DWORD WINAPI exc_stats_arm(LPVOID unused)
+{
+    (void)unused;
+    Sleep(15000);
+    s_exc_t0 = GetTickCount64();
+    AddVectoredExceptionHandler(1, exc_stats_veh);
+    fprintf(stderr, "[EXC] counting exceptions (RECOMP_EXC_STATS)\n");
+    return 0;
+}
+
 static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -325,6 +398,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
     SymInitialize(GetCurrentProcess(), NULL, TRUE);
     AddVectoredExceptionHandler(1, veh_handler);
+    if (getenv("RECOMP_EXC_STATS"))
+        CloseHandle(CreateThread(NULL, 0, exc_stats_arm, NULL, 0, NULL));
 
     /* Step 1: Load XBE */
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
