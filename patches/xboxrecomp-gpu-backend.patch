@@ -295,7 +295,7 @@ index e92e47c..1751932 100644
                          " as on the console (RECOMP_GUEST_CPUS=%s)\n",
                  core, getenv("RECOMP_GUEST_CPUS"));
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 87788ed..e0750fd 100644
+index 87788ed..d35c088 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,8 @@
@@ -445,7 +445,7 @@ index 87788ed..e0750fd 100644
 +     * (Nv2aProgramDraw says how to number it), b->count the vertex count.
 +     * Returns 0, having drawn nothing, when it cannot (the program's shader is
 +     * not ready, say); the executor then transforms the batch on the CPU.
-+     * May be NULL. RECOMP_GPU_VSH=0 keeps every batch on the CPU. */
++     * May be NULL. Used whenever set; RECOMP_GPU_VSH=0 keeps every batch on the CPU. */
 +    int (*draw_program)(const Nv2aSurface *s, const Nv2aBatch *b);
  } Nv2aBackend;
  
@@ -461,7 +461,7 @@ index 87788ed..e0750fd 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..229d5b6 100644
+index a5ea9cc..78dacee 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -383,6 +383,9 @@ static float reg_f(uint32_t method)
@@ -970,7 +970,7 @@ index a5ea9cc..229d5b6 100644
  
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
-@@ -3321,15 +3639,468 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3639,470 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1111,7 +1111,7 @@ index a5ea9cc..229d5b6 100644
 + * Stays on the CPU: fixed-function and screen-space batches, programs that
 + * write constants (_CXT_WRITE_EN: their result depends on vertex order), and
 + * any batch the back end turns down (its shader is still compiling, say).
-+ * RECOMP_GPU_VSH=1 turns it on; RECOMP_GPU_VSH=0 keeps every batch on the CPU. */
++ * On whenever the back end offers it; RECOMP_GPU_VSH=0 keeps every batch on the CPU. */
 +static uint32_t *s_gidx;                       /* the triangle list, from first */
 +static uint64_t  s_gpu_vsh_batches, s_gpu_vsh_fallback;
 +
@@ -1126,11 +1126,13 @@ index a5ea9cc..229d5b6 100644
 +    if (on < 0) {
 +        const char *e = getenv("RECOMP_GPU_VSH");
 +        const char *f = getenv("RECOMP_GPU_VSH_FLIP");
-+        on = e && e[0] == '1';
++        on = !(e && e[0] == '0');
 +        flip_ms = f ? (unsigned)atoi(f) : 0;
-+        if (on)
-+            fprintf(stderr, "[PB] vertex programs run on the GPU (RECOMP_GPU_VSH=1)%s\n",
-+                    flip_ms ? ", alternating with the CPU" : "");
++        if (on && flip_ms)
++            fprintf(stderr, "[PB] vertex programs alternate between the GPU and the CPU every %u ms\n", flip_ms);
++        else
++            fprintf(stderr, "[PB] vertex programs run on the %s (RECOMP_GPU_VSH=0 for the CPU)\n",
++                    on ? "GPU when the back end can" : "CPU");
 +    }
 +#if defined(_WIN32)
 +    if (on && flip_ms)
@@ -1442,7 +1444,7 @@ index a5ea9cc..229d5b6 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3364,8 +4135,8 @@ static void raster_batch_program(void)
+@@ -3364,8 +4137,8 @@ static void raster_batch_program(void)
                  fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
                  fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
                          s_gpu.idx[i], in[0], in[1], in[2], in[3],
@@ -1453,7 +1455,7 @@ index a5ea9cc..229d5b6 100644
              }
          }
      }
-@@ -3411,8 +4182,8 @@ static void raster_batch_program(void)
+@@ -3411,8 +4184,8 @@ static void raster_batch_program(void)
              }
              for (i = 0; i < 3; i++)
                  fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
@@ -1464,7 +1466,7 @@ index a5ea9cc..229d5b6 100644
          }
      }
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-@@ -3431,31 +4202,33 @@ static void raster_batch_program(void)
+@@ -3431,31 +4204,33 @@ static void raster_batch_program(void)
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
@@ -1507,7 +1509,7 @@ index a5ea9cc..229d5b6 100644
          }
          break;
      default:
-@@ -3575,6 +4348,11 @@ static void raster_batch(void)
+@@ -3575,6 +4350,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -1519,7 +1521,7 @@ index a5ea9cc..229d5b6 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3593,8 +4371,19 @@ static void frame_trace_flip(void)
+@@ -3593,8 +4373,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -1540,7 +1542,7 @@ index a5ea9cc..229d5b6 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3607,6 +4396,16 @@ static void frame_trace_flip(void)
+@@ -3607,6 +4398,16 @@ static void frame_trace_flip(void)
      }
  }
  
@@ -1557,7 +1559,7 @@ index a5ea9cc..229d5b6 100644
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3642,7 +4441,8 @@ static void draw_primitive(void)
+@@ -3642,7 +4443,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -1567,7 +1569,7 @@ index a5ea9cc..229d5b6 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3651,13 +4451,16 @@ static void draw_primitive(void)
+@@ -3651,13 +4453,16 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -1589,7 +1591,7 @@ index a5ea9cc..229d5b6 100644
              if (s_gpu.rc_seen) {
                  int st;
                  fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
-@@ -3687,7 +4490,7 @@ static void draw_primitive(void)
+@@ -3687,7 +4492,7 @@ static void draw_primitive(void)
          }
      }
  
@@ -1598,7 +1600,7 @@ index a5ea9cc..229d5b6 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4352,9 +5155,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4352,9 +5157,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
@@ -1612,7 +1614,7 @@ index a5ea9cc..229d5b6 100644
          break;
      case 0x17D0: {                                /* GET_REPORT */
          /* The GPU's answer to a visibility test: 16 bytes at the report
-@@ -4368,6 +5175,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4368,6 +5177,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          uint32_t at = dma_resolve(param & 0x00FFFFFFu);
          uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
          memcpy(mem + at, &stamp, 8);
@@ -1623,7 +1625,7 @@ index a5ea9cc..229d5b6 100644
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
          break;
-@@ -4387,7 +5198,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4387,7 +5200,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -1632,7 +1634,7 @@ index a5ea9cc..229d5b6 100644
              zbuf_clear();
          break;
  
-@@ -4455,7 +5266,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4455,7 +5268,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -1644,7 +1646,7 @@ index a5ea9cc..229d5b6 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4531,6 +5345,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4531,6 +5347,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -1653,7 +1655,7 @@ index a5ea9cc..229d5b6 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-@@ -4916,6 +5732,9 @@ void nv2a_pb_exec_report(void)
+@@ -4916,6 +5734,9 @@ void nv2a_pb_exec_report(void)
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                      " %u triangles dropped behind the eye\n",
              s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
