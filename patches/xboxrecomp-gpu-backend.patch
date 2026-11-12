@@ -2283,10 +2283,10 @@ index a5b912c..7327b25 100644
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 21600d3..3962ec8 100644
+index 21600d3..0dbacde 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -514,6 +514,11 @@ def _mark_back_edges(bb, stmts):
+@@ -514,6 +514,20 @@ def _mark_back_edges(bb, stmts):
      return stmts if out is None else out
  
  
@@ -2294,11 +2294,33 @@ index 21600d3..3962ec8 100644
 +# optimization under MSVC (FunctionTranslator.translate_function).
 +UNOPTIMIZED_INSNS = 10000
 +
++# After a chunk file's includes: guest memory accesses use the function's own
++# copy of the memory base (FunctionTranslator.translate_function) instead of
++# the global. The runtime header's inline helpers, compiled before this, keep
++# the global.
++MEMORY_BASE_LOCAL = [
++    "#undef XBOX_PTR",
++    "#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + _recomp_mb)",
++]
++
 +
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -3501,6 +3506,20 @@ class FunctionTranslator:
+@@ -3062,6 +3076,12 @@ class FunctionTranslator:
+         # Function signature
+         lines.append(f"{ret_type} {name}({param_str})")
+         lines.append(f"{{")
++        # The guest memory base, read once. XBOX_PTR in the chunk files uses
++        # this copy (MEMORY_BASE_LOCAL): the global was loaded again after
++        # every guest store, since as far as the compiler knew any store could
++        # have changed it, which was one load per memory access. Nothing
++        # changes it once guest code runs.
++        lines.append("    const uintptr_t _recomp_mb = (uintptr_t)g_xbox_mem_offset; (void)_recomp_mb;")
+         if func_addr in ENTRY_HOOKS:
+             lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
+             lines.append(f"    sub_{func_addr:08X}_enter();")
+@@ -3501,6 +3521,20 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -2319,7 +2341,7 @@ index 21600d3..3962ec8 100644
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3922,6 +3941,11 @@ class BatchTranslator:
+@@ -3922,6 +3956,11 @@ class BatchTranslator:
              "",
              '#include "recomp_types.h"',
              "",
@@ -2331,3 +2353,12 @@ index 21600d3..3962ec8 100644
          ]
          for addr, name, _ in translations:
              decl = self._make_declaration(addr, name)
+@@ -4028,7 +4067,7 @@ class BatchTranslator:
+                 f'#include "{header_name}"',
+                 '#include <math.h>',
+                 "",
+-            ]
++            ] + MEMORY_BASE_LOCAL + [""]
+             for addr, name, code in chunk:
+                 c_lines.append(code)
+ 
