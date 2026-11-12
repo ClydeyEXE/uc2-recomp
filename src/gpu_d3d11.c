@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <stdarg.h>
 
 #include "kernel/nv2a_backend.h"
 #include "d3d/d3d8_swizzle.h"
@@ -1431,29 +1432,10 @@ static const char s_vsh_prelude[] =
 "uint ld16(uint a) { return ld8(a) | (ld8(a + 1u) << 8); }\n"
 "uint ld32(uint a) { return (a & 3u) != 0u ? (ld16(a) | (ld16(a + 2u) << 16)) : vb.Load(a); }\n"
 "float s16(uint u) { return (float)((int)(u << 16) >> 16); }\n"
-"float4 vin(uint i, uint vid) {\n"
-"  uint4 d = va[i];\n"
-"  uint kind = (d.z >> 8) & 3u, type = d.z & 15u, size = min((d.z >> 4) & 15u, 4u);\n"
-"  float4 r = float4(0, 0, 0, 1);\n"
-"  if (kind == 1u) return vimm[i];\n"
-"  if (kind != 2u) return r;\n"
-"  uint a = d.x + vid * d.y;\n"
-"  if (type == 0u) { uint u = ld32(a);\n"
-"    return float4((u >> 16) & 255u, (u >> 8) & 255u, u & 255u, u >> 24) / 255.0; }\n"
-"  if (type == 6u) { uint u = ld32(a);\n"
-"    return float4((float)((int)(u << 21) >> 21) / 1023.0, (float)((int)(u << 10) >> 21) / 1023.0,\n"
-"                  (float)((int)u >> 22) / 511.0, 1); }\n"
-"  [unroll] for (uint k = 0; k < 4u; k++) {\n"
-"    if (k < size) {\n"
-"      float f;\n"
-"      if (type == 2u) f = asfloat(ld32(a + k * 4u));\n"
-"      else if (type == 4u) f = (float)ld8(a + k) / 255.0;\n"
-"      else if (type == 1u) f = s16(ld16(a + k * 2u)) / 32767.0;\n"
-"      else f = s16(ld16(a + k * 2u));\n"
-"      r[k] = f;\n"
-"    }\n"
-"  }\n"
-"  return r;\n"
+"float4 cbgra(uint u) { return float4((u >> 16) & 255u, (u >> 8) & 255u, u & 255u, u >> 24) / 255.0; }\n"
+"float4 cmp3(uint u) {\n"
+"  return float4((float)((int)(u << 21) >> 21) / 1023.0, (float)((int)(u << 10) >> 21) / 1023.0,\n"
+"                (float)((int)u >> 22) / 511.0, 1);\n"
 "}\n"
 "uint cidx(int i) { return (i < 0 || i >= 192) ? 0u : (uint)i; }\n"
 "float4 vmin(float4 a, float4 b) {\n"
@@ -1504,19 +1486,11 @@ static const char s_vsh_main[] =
 "  return o;\n"
 "}\n";
 
-typedef struct {
-    uint64_t hash;
-    ID3D11VertexShader *vs;
-    int state;                             /* 0 free, 1 ready, 2 failed */
-} ProgShader;
-
-#define PROG_SHADERS 1024                  /* a power of two */
-static ProgShader s_prog[PROG_SHADERS];
 static ID3D11Buffer *s_raw, *s_pcb;
 static ID3D11ShaderResourceView *s_raw_srv;
 static uint32_t s_raw_used;
 static int s_prog_failed;                  /* no raw buffers: everything stays on the CPU */
-static struct { uint32_t shaders, failed; double compile_ms; uint64_t draws, raw_bytes; } s_pstats;
+static struct { uint32_t shaders, loaded, failed; double compile_ms; uint64_t draws, raw_bytes, waits; } s_pstats;
 
 static int prog_up(void)
 {
@@ -1560,18 +1534,290 @@ static int prog_up(void)
     return 1;
 }
 
-/* The program's shader: compiled the first time it is seen. NULL if it does
- * not compile (that program then stays on the CPU). */
-static ID3D11VertexShader *prog_shader(uint64_t hash)
+/* The shader cache.
+ *
+ * A shader is one program with its inputs' formats: the attribute fetch is
+ * written out per format (an aligned float3 is one Load3), which keeps a
+ * shader a few KB and FXC at 15-20 ms a program, where one fetch that decoded
+ * every format made 20-30 KB shaders and 70-120 ms compiles.
+ *
+ * Compiles run on a thread of their own, below normal priority; until a
+ * program's shader is ready its batches take the CPU path, so a new program
+ * costs no stall. Compiled shaders are kept in %LOCALAPPDATA%\xboxrecomp\vsh,
+ * named by a hash of their whole source (so a change to the generator makes new
+ * names), and a later run loads them at once. RECOMP_GPU_VSH_CACHE=0 keeps no
+ * files; RECOMP_GPU_VSH_SYNC=1 compiles on the walker, for tests that must see
+ * every batch on the GPU. */
+typedef struct {
+    uint64_t key;                          /* program hash and its inputs' formats */
+    ID3D11VertexShader *volatile vs;
+    volatile LONG state;                   /* 0 free, 1 ready, 2 failed, 3 compiling */
+} ProgShader;
+
+typedef struct ProgJob {
+    struct ProgJob *next;
+    ProgShader *e;
+    char *src;
+    size_t len;
+    uint64_t srchash;
+} ProgJob;
+
+#define PROG_SHADERS 4096                  /* a power of two */
+static ProgShader s_prog[PROG_SHADERS];
+static CRITICAL_SECTION s_job_lock;
+static HANDLE s_job_event;
+static ProgJob *s_job_head, *s_job_tail;
+static int s_job_mode = -1;                /* 0 sync, 1 a compile thread */
+static char s_vsh_dir[MAX_PATH];           /* "": no disk cache */
+
+/* An attribute's format as its fetch is written: kind, and for an array the
+ * type, size and whether every element is 4-byte aligned. Ranges start 4-byte
+ * aligned and land 16-byte aligned in the ring, so the offset's alignment is
+ * the element's. */
+static uint32_t attr_code(const Nv2aAttrib *d)
+{
+    uint32_t size = d->size > 4 ? 4 : d->size;
+    if (d->kind != 2)
+        return d->kind;
+    return 2u | d->type << 2 | size << 5 | (uint32_t)(!(d->offset & 3) && !(d->stride & 3)) << 8;
+}
+
+static uint64_t prog_key(const Nv2aProgramDraw *pd)
+{
+    uint64_t k = pd->hash;
+    uint32_t i;
+
+    for (i = 0; i < NV2A_VSH_INPUTS; i++)
+        if (pd->inputs >> i & 1)
+            k = (k ^ ((uint64_t)attr_code(&pd->attr[i]) << 4 | i)) * 1099511628211ull;
+    return k;
+}
+
+static uint64_t fnv64(const char *p, size_t n)
+{
+    uint64_t h = 1469598103934665603ull;
+    while (n--)
+        h = (h ^ (uint8_t)*p++) * 1099511628211ull;
+    return h;
+}
+
+typedef struct { char *p; size_t n, cap; } Txt;
+
+static void tx(Txt *t, const char *fmt, ...)
+{
+    va_list ap;
+    int w;
+
+    if (t->n >= t->cap)
+        return;
+    va_start(ap, fmt);
+    w = vsnprintf(t->p + t->n, t->cap - t->n, fmt, ap);
+    va_end(ap);
+    t->n = (w < 0 || (size_t)w >= t->cap - t->n) ? t->cap : t->n + (size_t)w;
+}
+
+/* One component k (of size) of an array element at `a`, or its default. */
+static void tx_comp(Txt *t, const Nv2aAttrib *d, uint32_t k, int aligned)
+{
+    uint32_t size = d->size > 4 ? 4 : d->size;
+
+    if (k >= size) {
+        tx(t, k == 3 ? "1" : "0");
+        return;
+    }
+    switch (d->type) {
+    case 2:                                                         /* float */
+        tx(t, aligned ? "asfloat(vb.Load(a + %uu))" : "asfloat(ld32(a + %uu))", k * 4);
+        break;
+    case 4:                                                         /* ubyte, normalised */
+        if (aligned)
+            tx(t, "(float)((u0 >> %uu) & 255u) / 255.0", k * 8);
+        else
+            tx(t, "(float)ld8(a + %uu) / 255.0", k);
+        break;
+    case 1: case 5:                                                 /* short, normalised or not */
+        if (aligned)
+            tx(t, "s16(u%u >> %uu)", k / 2, (k & 1) * 16);
+        else
+            tx(t, "s16(ld16(a + %uu))", k * 2);
+        if (d->type == 1)
+            tx(t, " / 32767.0");
+        break;
+    default:
+        tx(t, k == 3 ? "1" : "0");
+        break;
+    }
+}
+
+/* float4 vin(uint i, uint vid): the program's inputs, each in its own format. */
+static void tx_fetch(Txt *t, const Nv2aProgramDraw *pd)
+{
+    uint32_t i, k;
+
+    tx(t, "float4 vin(uint i, uint vid) {\n");
+    for (i = 0; i < NV2A_VSH_INPUTS; i++) {
+        const Nv2aAttrib *d = &pd->attr[i];
+        int aligned = (attr_code(d) >> 8) & 1;
+
+        if (!(pd->inputs >> i & 1))
+            continue;
+        tx(t, "  if (i == %uu) {", i);
+        if (d->kind == 1) {
+            tx(t, " return vimm[%u]; }\n", i);
+            continue;
+        }
+        if (d->kind != 2 || d->type > 6 || d->type == 3) {
+            tx(t, " return float4(0, 0, 0, 1); }\n");
+            continue;
+        }
+        tx(t, " uint a = va[%u].x + vid * va[%u].y;", i, i);
+        if (d->type == 0) {
+            tx(t, " return cbgra(%s); }\n", aligned ? "vb.Load(a)" : "ld32(a)");
+            continue;
+        }
+        if (d->type == 6) {
+            tx(t, " return cmp3(%s); }\n", aligned ? "vb.Load(a)" : "ld32(a)");
+            continue;
+        }
+        if (aligned && d->type == 4)
+            tx(t, " uint u0 = vb.Load(a);");
+        if (aligned && (d->type == 1 || d->type == 5)) {
+            tx(t, " uint u0 = vb.Load(a);");
+            if (d->size > 2)
+                tx(t, " uint u1 = vb.Load(a + 4u);");
+        }
+        tx(t, "\n    return float4(");
+        for (k = 0; k < 4; k++) {
+            if (k)
+                tx(t, ", ");
+            tx_comp(t, d, k, aligned);
+        }
+        tx(t, "); }\n");
+    }
+    tx(t, "  return float4(0, 0, 0, 1);\n}\n");
+}
+
+static void vsh_cache_path(char *out, size_t n, uint64_t srchash)
+{
+    snprintf(out, n, "%s\\%016llX.cso", s_vsh_dir, (unsigned long long)srchash);
+}
+
+static void prog_compiled(ProgShader *e, ID3D11VertexShader *vs, double ms, int from_disk)
+{
+    EnterCriticalSection(&s_job_lock);
+    if (vs) {
+        if (from_disk)
+            s_pstats.loaded++;
+        else
+            s_pstats.shaders++;
+    } else {
+        s_pstats.failed++;
+    }
+    s_pstats.compile_ms += ms;
+    LeaveCriticalSection(&s_job_lock);
+    e->vs = vs;
+    InterlockedExchange(&e->state, vs ? 1 : 2);
+    if (!vs)
+        fprintf(stderr, "[D3D11] vertex program %016llX did not compile: it stays on the CPU\n",
+                (unsigned long long)e->key);
+}
+
+static void prog_compile(ProgShader *e, const char *src, size_t len, uint64_t srchash)
+{
+    LARGE_INTEGER t0, t1, f;
+    ID3D11VertexShader *vs = NULL;
+    ID3DBlob *code;
+
+    QueryPerformanceCounter(&t0);
+    code = compile_from(src, len, "main", "vs_5_0");
+    if (code) {
+        const void *p = ID3D10Blob_GetBufferPointer(code);
+        SIZE_T n = ID3D10Blob_GetBufferSize(code);
+        if (FAILED(ID3D11Device_CreateVertexShader(s_dev, p, n, NULL, &vs)))
+            vs = NULL;
+        if (vs && s_vsh_dir[0]) {
+            char path[MAX_PATH], tmp[MAX_PATH + 16];
+            FILE *fp;
+            vsh_cache_path(path, sizeof path, srchash);
+            snprintf(tmp, sizeof tmp, "%s.%lu", path, GetCurrentThreadId());
+            if ((fp = fopen(tmp, "wb")) != NULL) {
+                int ok = fwrite(p, 1, n, fp) == n;
+                ok = fclose(fp) == 0 && ok;
+                if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                    DeleteFileA(tmp);
+            }
+        }
+        ID3D10Blob_Release(code);
+    }
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    prog_compiled(e, vs, (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart, 0);
+}
+
+static DWORD WINAPI prog_compiler(LPVOID unused)
+{
+    (void)unused;
+    for (;;) {
+        WaitForSingleObject(s_job_event, INFINITE);
+        for (;;) {
+            ProgJob *j;
+            EnterCriticalSection(&s_job_lock);
+            j = s_job_head;
+            if (j && !(s_job_head = j->next))
+                s_job_tail = NULL;
+            LeaveCriticalSection(&s_job_lock);
+            if (!j)
+                break;
+            prog_compile(j->e, j->src, j->len, j->srchash);
+            free(j->src);
+            free(j);
+        }
+    }
+}
+
+static void prog_cache_init(void)
+{
+    const char *sync = getenv("RECOMP_GPU_VSH_SYNC"), *cache = getenv("RECOMP_GPU_VSH_CACHE");
+    const char *base = getenv("LOCALAPPDATA");
+
+    InitializeCriticalSection(&s_job_lock);
+    s_job_mode = !(sync && sync[0] == '1');
+    if (s_job_mode) {
+        HANDLE th;
+        s_job_event = CreateEventA(NULL, FALSE, FALSE, NULL);
+        th = s_job_event ? CreateThread(NULL, 0, prog_compiler, NULL, 0, NULL) : NULL;
+        if (th) {
+            SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);
+            CloseHandle(th);
+        } else {
+            s_job_mode = 0;
+        }
+    }
+    if (!(cache && cache[0] == '0') && base && base[0]) {
+        char dir[MAX_PATH];
+        snprintf(dir, sizeof dir, "%s\\xboxrecomp", base);
+        CreateDirectoryA(dir, NULL);
+        snprintf(s_vsh_dir, sizeof s_vsh_dir, "%s\\xboxrecomp\\vsh", base);
+        if (!CreateDirectoryA(s_vsh_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+            s_vsh_dir[0] = 0;
+    }
+}
+
+/* The batch's shader, or NULL: still compiling (the batch then takes the CPU
+ * path), or it failed to compile. */
+static ID3D11VertexShader *prog_shader(const Nv2aProgramDraw *pd)
 {
     static char *src;
     static const size_t cap = 256 * 1024;
-    uint32_t h = (uint32_t)(hash ^ (hash >> 32)) & (PROG_SHADERS - 1), probe;
+    uint64_t key = prog_key(pd), srchash;
+    uint32_t h = (uint32_t)(key ^ (key >> 32)) & (PROG_SHADERS - 1), probe;
     ProgShader *e = NULL;
+    Txt t;
+    size_t body;
 
     for (probe = 0; probe < PROG_SHADERS; probe++) {
         ProgShader *p = &s_prog[(h + probe) & (PROG_SHADERS - 1)];
-        if (p->state && p->hash == hash)
+        if (p->state && p->key == key)
             return p->state == 1 ? p->vs : NULL;
         if (!p->state) {
             e = p;
@@ -1580,49 +1826,83 @@ static ID3D11VertexShader *prog_shader(uint64_t hash)
     }
     if (!e)
         return NULL;                        /* full */
-    e->hash = hash;
-    e->state = 2;
-    if (!src && !(src = (char *)malloc(cap)))
+    if (s_job_mode < 0)
+        prog_cache_init();
+    e->key = key;
+    e->state = 3;
+    if (!src && !(src = (char *)malloc(cap))) {
+        e->state = 2;
         return NULL;
-    {
-        size_t pre = sizeof s_vsh_prelude - 1, body, len;
-        LONGLONG t0 = ft_qpc();
-        ID3DBlob *code;
-
-        memcpy(src, s_vsh_prelude, pre);
-        body = nv2a_vsh_emit_hlsl(src + pre, cap - pre - sizeof s_vsh_main);
-        if (!body)
-            return NULL;
-        len = pre + body;
-        memcpy(src + len, s_vsh_main, sizeof s_vsh_main);   /* with its NUL */
-        len += sizeof s_vsh_main - 1;
-        code = compile_from(src, len, "main", "vs_5_0");
-        if (getenv("RECOMP_GPU_VSH_DUMP")) {
-            char name[64];
-            FILE *f;
-            snprintf(name, sizeof name, "vsh_%016llX.hlsl", (unsigned long long)hash);
-            if ((f = fopen(name, "wb")) != NULL) {
-                fwrite(src, 1, len, f);
-                fclose(f);
-            }
-        }
-        if (code) {
-            if (SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
-                                                          ID3D10Blob_GetBufferSize(code), NULL, &e->vs)))
-                e->state = 1;
-            ID3D10Blob_Release(code);
-        }
-        if (s_ft.qms)
-            s_pstats.compile_ms += (double)(ft_qpc() - t0) / s_ft.qms;
-        if (e->state == 1)
-            s_pstats.shaders++;
-        else {
-            s_pstats.failed++;
-            fprintf(stderr, "[D3D11] vertex program %016llX did not compile: it stays on the CPU\n",
-                    (unsigned long long)hash);
+    }
+    t.p = src; t.n = 0; t.cap = cap;
+    tx(&t, "%s", s_vsh_prelude);
+    tx_fetch(&t, pd);
+    body = t.n < t.cap ? nv2a_vsh_emit_hlsl(src + t.n, t.cap - t.n) : 0;
+    if (!body) {
+        e->state = 2;
+        return NULL;
+    }
+    t.n += body;
+    tx(&t, "%s", s_vsh_main);
+    if (t.n >= t.cap) {
+        e->state = 2;
+        return NULL;
+    }
+    srchash = fnv64(src, t.n);
+    if (getenv("RECOMP_GPU_VSH_DUMP")) {
+        char name[64];
+        FILE *f;
+        snprintf(name, sizeof name, "vsh_%016llX.hlsl", (unsigned long long)key);
+        if ((f = fopen(name, "wb")) != NULL) {
+            fwrite(src, 1, t.n, f);
+            fclose(f);
         }
     }
-    return e->state == 1 ? e->vs : NULL;
+    if (s_vsh_dir[0]) {                     /* compiled in an earlier run */
+        char path[MAX_PATH];
+        FILE *f;
+        vsh_cache_path(path, sizeof path, srchash);
+        if ((f = fopen(path, "rb")) != NULL) {
+            static uint8_t buf[256 * 1024];
+            size_t n = fread(buf, 1, sizeof buf, f);
+            ID3D11VertexShader *vs = NULL;
+            fclose(f);
+            if (n && n < sizeof buf
+                && SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, buf, n, NULL, &vs))) {
+                prog_compiled(e, vs, 0.0, 1);
+                return vs;
+            }
+        }
+    }
+    if (!s_job_mode) {
+        prog_compile(e, src, t.n, srchash);
+        return e->state == 1 ? e->vs : NULL;
+    }
+    {
+        ProgJob *j = (ProgJob *)malloc(sizeof *j);
+        char *copy = (char *)malloc(t.n + 1);
+        if (!j || !copy) {
+            free(j);
+            free(copy);
+            e->state = 2;
+            return NULL;
+        }
+        memcpy(copy, src, t.n + 1);
+        j->next = NULL;
+        j->e = e;
+        j->src = copy;
+        j->len = t.n;
+        j->srchash = srchash;
+        EnterCriticalSection(&s_job_lock);
+        if (s_job_tail)
+            s_job_tail->next = j;
+        else
+            s_job_head = j;
+        s_job_tail = j;
+        LeaveCriticalSection(&s_job_lock);
+        SetEvent(s_job_event);
+    }
+    return NULL;
 }
 
 /* The batch's attribute bytes into the raw ring and its constants into s_pcb.
@@ -1912,7 +2192,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     if (!sh || (!b->outputs && !b->program) || !device_up() || bytes > VB_BYTES || ibytes > IB_BYTES)
         return;
     if (b->program) {
-        if (!ibytes || !prog_up() || !(pvs = prog_shader(b->program->hash)))
+        if (!ibytes || !prog_up() || !(pvs = prog_shader(b->program)))
             return;
         /* Culled here from the projected winding, as the executor does for what
          * it transforms: front_face 0x0900 is clockwise on screen. */
@@ -2233,8 +2513,12 @@ static int d3d11_draw_program(const Nv2aSurface *s, const Nv2aBatch *b)
         if (((b->program->hash & mask) != sel_val) != sel_not)
             return 0;
     }
-    if (!device_up() || !prog_up() || !prog_shader(b->program->hash))
+    if (!device_up() || !prog_up())
         return 0;
+    if (!prog_shader(b->program)) {
+        s_pstats.waits++;
+        return 0;
+    }
     d3d11_draw(s, b);
     return 1;
 }
@@ -3163,11 +3447,12 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
                 (unsigned long long)(s_tex_bytes / 1024), s_stats.hashes, s_stats.feedback, s_stats.zeta_copies);
         fprintf(stderr, "[D3D11] visibility: %u tests, %u with no pixels, at most %u pending\n",
                 s_vis_stats.reports, s_vis_stats.zero, s_vis_stats.max_pending);
-        if (s_pstats.draws || s_pstats.shaders || s_pstats.failed)
-            fprintf(stderr, "[D3D11] vertex programs: %llu GPU draws, %llu KB inputs; %u shaders (%u failed) in %.0f ms\n",
+        if (s_pstats.draws || s_pstats.shaders || s_pstats.loaded || s_pstats.failed)
+            fprintf(stderr, "[D3D11] vertex programs: %llu GPU draws, %llu KB inputs, %llu batches on the CPU while compiling; shaders %u compiled (%.0f ms), %u from the cache, %u failed\n",
                     (unsigned long long)s_pstats.draws, (unsigned long long)(s_pstats.raw_bytes / 1024),
-                    s_pstats.shaders, s_pstats.failed, s_pstats.compile_ms);
-        s_pstats.draws = s_pstats.raw_bytes = 0;
+                    (unsigned long long)s_pstats.waits, s_pstats.shaders, s_pstats.compile_ms, s_pstats.loaded,
+                    s_pstats.failed);
+        s_pstats.draws = s_pstats.raw_bytes = s_pstats.waits = 0;
         memset(&s_vis_stats, 0, sizeof s_vis_stats);
         memset(&s_stats, 0, sizeof s_stats);
         s_stats.last = GetTickCount();

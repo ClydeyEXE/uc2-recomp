@@ -295,7 +295,7 @@ index e92e47c..1751932 100644
                          " as on the console (RECOMP_GUEST_CPUS=%s)\n",
                  core, getenv("RECOMP_GUEST_CPUS"));
 diff --git a/src/kernel/nv2a_backend.h b/src/kernel/nv2a_backend.h
-index 87788ed..ce473f2 100644
+index 87788ed..e0750fd 100644
 --- a/src/kernel/nv2a_backend.h
 +++ b/src/kernel/nv2a_backend.h
 @@ -28,6 +28,8 @@
@@ -327,7 +327,7 @@ index 87788ed..ce473f2 100644
  } Nv2aTexture;
  
  typedef struct {
-@@ -80,15 +88,89 @@ typedef struct {
+@@ -80,15 +88,90 @@ typedef struct {
       * that ignores these draws that pass over the whole surface. */
      uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
      uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
@@ -402,6 +402,7 @@ index 87788ed..ce473f2 100644
 +
 +typedef struct Nv2aProgramDraw {
 +    uint64_t           hash;            /* nv2a_vsh_program_hash */
++    uint32_t           inputs;          /* nv2a_vsh_program_inputs: the attributes it reads */
 +    const float      (*constants)[4];   /* c[0..NV2A_VSH_CONSTANTS) */
 +    Nv2aRange          ranges[NV2A_VSH_INPUTS];
 +    uint32_t           nranges;
@@ -417,7 +418,7 @@ index 87788ed..ce473f2 100644
  typedef struct {
      /* flags: CLEAR_SURFACE bits (Z 0x1, stencil 0x2, colour 0xF0).
       * zstencil: SET_ZSTENCIL_CLEAR_VALUE (depth in the top 24 bits for Z24S8). */
-@@ -96,6 +178,31 @@ typedef struct {
+@@ -96,6 +179,31 @@ typedef struct {
                    uint32_t flags, uint32_t argb, uint32_t zstencil);
      void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
      void (*flip)(void);
@@ -449,7 +450,7 @@ index 87788ed..ce473f2 100644
  } Nv2aBackend;
  
  /* Register (or, with NULL, remove) the back end. Call before the title starts
-@@ -127,4 +234,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+@@ -127,4 +235,9 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
   * the semaphore context DMA object through RAMIN. */
  void nv2a_pb_set_semaphore_target(uint32_t guest_va);
  
@@ -460,7 +461,7 @@ index 87788ed..ce473f2 100644
 +
  #endif /* NV2A_BACKEND_H */
 diff --git a/src/kernel/nv2a_pb_exec.c b/src/kernel/nv2a_pb_exec.c
-index a5ea9cc..398d1b6 100644
+index a5ea9cc..229d5b6 100644
 --- a/src/kernel/nv2a_pb_exec.c
 +++ b/src/kernel/nv2a_pb_exec.c
 @@ -383,6 +383,9 @@ static float reg_f(uint32_t method)
@@ -969,7 +970,7 @@ index a5ea9cc..398d1b6 100644
  
  /* Does this batch run the title's vertex program? RECOMP_NO_VSH turns the
   * interpreter off (the batch then falls to the screen-space heuristics). */
-@@ -3321,15 +3639,467 @@ static void xf_set_viewport(void)
+@@ -3321,15 +3639,468 @@ static void xf_set_viewport(void)
      s_xf_o[2] = of[2];
  }
  
@@ -1381,6 +1382,7 @@ index a5ea9cc..398d1b6 100644
 +    if (!icount)
 +        return 1;
 +    pd.constants = (const float (*)[4])nv2a_vsh_constant(0);
++    pd.inputs = nv2a_vsh_program_inputs();
 +    pd.first = lo;
 +    pd.vertex_count = hi - lo + 1;
 +    pd.aa[0] = s_gpu.aa_sx;
@@ -1440,7 +1442,7 @@ index a5ea9cc..398d1b6 100644
      xf_set_viewport();
      {
          const VertexAttr *tc = texcoord_attr();
-@@ -3364,8 +4134,8 @@ static void raster_batch_program(void)
+@@ -3364,8 +4135,8 @@ static void raster_batch_program(void)
                  fetch_attr(&s_gpu.attr[0], s_gpu.idx[i], in);
                  fprintf(stderr, "  [FFP]   v%u (%g %g %g %g) -> (%g %g %g, w %g)\n",
                          s_gpu.idx[i], in[0], in[1], in[2], in[3],
@@ -1451,7 +1453,7 @@ index a5ea9cc..398d1b6 100644
              }
          }
      }
-@@ -3411,8 +4181,8 @@ static void raster_batch_program(void)
+@@ -3411,8 +4182,8 @@ static void raster_batch_program(void)
              }
              for (i = 0; i < 3; i++)
                  fprintf(stderr, "[VTRACE]   out%u pos %g %g %g %g\n", i,
@@ -1462,7 +1464,7 @@ index a5ea9cc..398d1b6 100644
          }
      }
      for (i = 0; i < NV2A_VSH_INPUTS; i++) {
-@@ -3431,31 +4201,33 @@ static void raster_batch_program(void)
+@@ -3431,31 +4202,33 @@ static void raster_batch_program(void)
      switch (s_gpu.prim) {
      case NV_PRIM_TRIANGLES:
          for (i = 0; i + 2 < n; i += 3)
@@ -1505,7 +1507,7 @@ index a5ea9cc..398d1b6 100644
          }
          break;
      default:
-@@ -3575,6 +4347,11 @@ static void raster_batch(void)
+@@ -3575,6 +4348,11 @@ static void raster_batch(void)
   * blend and depth state, and how many pixels it actually wrote. "The frame
   * is black" has many causes and this is what tells them apart. */
  
@@ -1517,7 +1519,7 @@ index a5ea9cc..398d1b6 100644
  static void frame_trace_flip(void)
  {
      static const char *flag = (const char *)-1;
-@@ -3593,8 +4370,19 @@ static void frame_trace_flip(void)
+@@ -3593,8 +4371,19 @@ static void frame_trace_flip(void)
          return;
      }
      if (s_ftrace == 2) {
@@ -1538,7 +1540,7 @@ index a5ea9cc..398d1b6 100644
          return;
      }
      if (s_ftrace == 0) {
-@@ -3607,6 +4395,16 @@ static void frame_trace_flip(void)
+@@ -3607,6 +4396,16 @@ static void frame_trace_flip(void)
      }
  }
  
@@ -1555,7 +1557,7 @@ index a5ea9cc..398d1b6 100644
  static void draw_primitive(void)
  {
      float v[4];
-@@ -3642,7 +4440,8 @@ static void draw_primitive(void)
+@@ -3642,7 +4441,8 @@ static void draw_primitive(void)
          if (s_ftrace == 2) {
              fprintf(stderr, "[FTRACE] %s prim %u n %u surf %08X %ux%u+%u+%u"
                      " pitch %u | tex %s %08X %ux%u fmt %02X | blend %u %X/%X"
@@ -1565,7 +1567,7 @@ index a5ea9cc..398d1b6 100644
                      (s_gpu.xf_mode & 3) == 2 ? "PRG" : "FIX", s_gpu.prim,
                      s_gpu.idx_count, s_gpu.color_offset, s_gpu.clip_w,
                      s_gpu.clip_h, s_gpu.clip_x, s_gpu.clip_y, s_gpu.pitch,
-@@ -3651,13 +4450,16 @@ static void draw_primitive(void)
+@@ -3651,13 +4451,16 @@ static void draw_primitive(void)
                      s_gpu.blend_enable, s_gpu.blend_sfactor,
                      s_gpu.blend_dfactor, s_gpu.blend_equation,
                      s_gpu.depth_test, s_gpu.depth_func, s_gpu.depth_mask,
@@ -1587,7 +1589,7 @@ index a5ea9cc..398d1b6 100644
              if (s_gpu.rc_seen) {
                  int st;
                  fprintf(stderr, "[FTRACE]     rc stages %u ctl %08X prog %05X fin %08X %08X",
-@@ -3687,7 +4489,7 @@ static void draw_primitive(void)
+@@ -3687,7 +4490,7 @@ static void draw_primitive(void)
          }
      }
  
@@ -1596,7 +1598,7 @@ index a5ea9cc..398d1b6 100644
          static int shown;
          if (shown++ < 6) {
              fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
-@@ -4352,9 +5154,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4352,9 +5155,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case 0x09C4: memcpy(&s_gpu.fog_param[1], &param, 4); break;
      case 0x17C8:                                  /* CLEAR_REPORT_VALUE */
          s_gpu.zpass_count = 0;
@@ -1610,7 +1612,7 @@ index a5ea9cc..398d1b6 100644
          break;
      case 0x17D0: {                                /* GET_REPORT */
          /* The GPU's answer to a visibility test: 16 bytes at the report
-@@ -4368,6 +5174,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4368,6 +5175,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          uint32_t at = dma_resolve(param & 0x00FFFFFFu);
          uint64_t stamp = (uint64_t)s_gpu.reports++ * 1000u;
          memcpy(mem + at, &stamp, 8);
@@ -1621,7 +1623,7 @@ index a5ea9cc..398d1b6 100644
          memcpy(mem + at + 8, &s_gpu.zpass_count, 4);
          memset(mem + at + 12, 0, 4);
          break;
-@@ -4387,7 +5197,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4387,7 +5198,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      param, s_gpu.color_offset, s_gpu.clip_w, s_gpu.clip_h,
                      s_gpu.clear_color, 10);
          clear_surface(param);
@@ -1630,7 +1632,7 @@ index a5ea9cc..398d1b6 100644
              zbuf_clear();
          break;
  
-@@ -4455,7 +5265,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4455,7 +5266,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
      case NV097_NO_OPERATION:
          /* Non-zero, it is one of D3D's software methods, which the GPU traps
           * to D3D's interrupt handler on the console. Only the swap's interval
@@ -1642,7 +1644,7 @@ index a5ea9cc..398d1b6 100644
          if (!nv2a_pb_exec_flip_pacing()) {
              if (!imm_vertex_method(method, param))
                  note_unhandled(method, param);   /* as before the hold */
-@@ -4531,6 +5344,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
+@@ -4531,6 +5345,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                                                 : s_gpu.color_offset;
              uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch
                                                  : s_gpu.pitch;
@@ -1651,7 +1653,7 @@ index a5ea9cc..398d1b6 100644
              if (done) {
                  xbox_FramebufferWindowSet(dma_resolve(done), pitch);
                  xbox_FramebufferWindowSetAA(s_gpu.aa_sy > 1.5f ? 2 : 1);
-@@ -4916,6 +5731,9 @@ void nv2a_pb_exec_report(void)
+@@ -4916,6 +5732,9 @@ void nv2a_pb_exec_report(void)
      fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                      " %u triangles dropped behind the eye\n",
              s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
@@ -1830,7 +1832,7 @@ index 5fab4c3..d09e366 100644
  {
      uint32_t words, jumps = 0, unknown = 0;
 diff --git a/src/kernel/nv2a_vsh_interp.c b/src/kernel/nv2a_vsh_interp.c
-index c7fd25d..1694a9a 100644
+index c7fd25d..c5af285 100644
 --- a/src/kernel/nv2a_vsh_interp.c
 +++ b/src/kernel/nv2a_vsh_interp.c
 @@ -30,6 +30,7 @@
@@ -1913,7 +1915,7 @@ index c7fd25d..1694a9a 100644
      if (mode == 1)
          return vsh_run_decoded(in, out);
      if (mode == 2 && !s_cxt_write) {
-@@ -707,3 +733,162 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
+@@ -707,3 +733,184 @@ static int vsh_run_fields(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out
      }
      return 0;
  }
@@ -1995,6 +1997,32 @@ index c7fd25d..1694a9a 100644
 +    return s_dec_final;
 +}
 +
++/* The inputs the program reads, bit i for v[i]. */
++static uint32_t dec_inputs(void)
++{
++    uint32_t i, used = 0;
++    int k;
++
++    for (i = 0; i < s_dec_count; i++)
++        for (k = 0; k < 3; k++)
++            if ((s_dec[i].reads >> k & 1) && s_dec[i].src[k].mux == DEC_INPUT)
++                used |= 1u << s_dec[i].src[k].idx;
++    return used;
++}
++
++uint32_t nv2a_vsh_program_inputs(void)
++{
++    static uint32_t rev = ~0u, used;
++
++    if (!nv2a_vsh_program_hash(NULL))
++        return 0;
++    if (rev != s_dec_rev) {
++        used = dec_inputs();
++        rev = s_dec_rev;
++    }
++    return used;
++}
++
 +size_t nv2a_vsh_emit_hlsl(char *buf, size_t cap)
 +{
 +    static const char *const mac_expr[16] = {
@@ -2008,17 +2036,13 @@ index c7fd25d..1694a9a 100644
 +        "ilu_exp(C.x)", "ilu_log(C.x)", "ilu_lit(C)"
 +    };
 +    Emit e;
-+    uint32_t i, used = 0;
-+    int k;
++    uint32_t i, used;
 +
 +    if (!buf || !cap || !nv2a_vsh_program_hash(NULL))
 +        return 0;
 +    e.p = buf; e.n = 0; e.cap = cap;
 +    buf[0] = 0;
-+    for (i = 0; i < s_dec_count; i++)
-+        for (k = 0; k < 3; k++)
-+            if ((s_dec[i].reads >> k & 1) && s_dec[i].src[k].mux == DEC_INPUT)
-+                used |= 1u << s_dec[i].src[k].idx;
++    used = dec_inputs();
 +
 +    em(&e, "void vsh(uint vid, out float4 P, out float4 O[13]) {\n");
 +    em(&e, "  float4 R0 = 0, R1 = 0, R2 = 0, R3 = 0, R4 = 0, R5 = 0;\n"
@@ -2077,7 +2101,7 @@ index c7fd25d..1694a9a 100644
 +    return e.n < e.cap ? e.n : 0;
 +}
 diff --git a/src/kernel/nv2a_vsh_interp.h b/src/kernel/nv2a_vsh_interp.h
-index 8acb0af..ddbe364 100644
+index 8acb0af..5b0b9c3 100644
 --- a/src/kernel/nv2a_vsh_interp.h
 +++ b/src/kernel/nv2a_vsh_interp.h
 @@ -20,6 +20,7 @@
@@ -2088,7 +2112,7 @@ index 8acb0af..ddbe364 100644
  #include <stdint.h>
  
  #define NV2A_VSH_SLOTS      136     /* program memory, 128-bit instructions */
-@@ -49,6 +50,20 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+@@ -49,6 +50,22 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
   * FINAL flag within program memory), which the caller treats as "cannot
   * transform this batch" rather than drawing garbage. */
  int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
@@ -2105,6 +2129,8 @@ index 8acb0af..ddbe364 100644
 + * there is no program or `cap` is too small. Both decode first if needed, so
 + * call them on the executor thread. */
 +int    nv2a_vsh_program_hash(uint64_t *hash);
++/* The inputs it reads: bit i for v[i]. */
++uint32_t nv2a_vsh_program_inputs(void);
 +size_t nv2a_vsh_emit_hlsl(char *buf, size_t cap);
  
  /* Direct access, for the self-test. */
