@@ -204,7 +204,7 @@ static const char s_hlsl[] =
 "    t2 = t2_.SampleGrad(s2_, uv, ddx(uv), ddy(uv));\n"
 "  }\n"
 "  if (flags.x) {\n"
-"    c = combine(i.d0, i.d1, i.fog, t0, t1, t2, t3);\n"
+"    c = combine(i.d0, i.d1, saturate(i.fog), t0, t1, t2, t3);\n"   /* arrives unclamped */
 "  } else {\n"
 "    c = i.d0;\n"
 "    if (flags.y) c *= t0_.Sample(s0_, i.t0.xy / (i.t0.w != 0 ? i.t0.w : 1) * ts[0].xy);\n"
@@ -973,14 +973,14 @@ static ID3D11ShaderResourceView *tex_lookup(const Nv2aTexture *t, const uint8_t 
 typedef struct { uint32_t key[6]; ID3D11SamplerState *s; } SamplerEntry;
 typedef struct { uint32_t key[6]; ID3D11BlendState *s; } BlendEntry;
 typedef struct { uint32_t key[10]; ID3D11DepthStencilState *s; } DepthEntry;
-typedef struct { float slope; ID3D11RasterizerState *s; } RasterEntry;
+typedef struct { float slope; int cull, ccw; ID3D11RasterizerState *s; } RasterEntry;
 
 static SamplerEntry s_samplers[CACHE_MAX]; static int s_nsamplers;
 static int          s_sampler_aniso;    /* the forced anisotropy the samplers were made for */
 static int cfg_aniso(void);
 static BlendEntry   s_blends[CACHE_MAX];   static int s_nblends;
 static DepthEntry   s_depths[CACHE_MAX];   static int s_ndepths;
-static RasterEntry  s_rasters[32];         static int s_nrasters;
+static RasterEntry  s_rasters[64];         static int s_nrasters;
 
 static D3D11_TEXTURE_ADDRESS_MODE address_mode(uint32_t m, int border)
 {
@@ -1189,27 +1189,43 @@ static ID3D11DepthStencilState *depth_for(const Nv2aRenderState *r)
     }
 }
 
-static ID3D11RasterizerState *raster_for(float slope)
+/* cull: D3D11_CULL_*; the executor culls what it hands over itself, so only
+ * GPU vertex-program draws (which it does not see transformed) pass one. */
+static ID3D11RasterizerState *raster_cull(float slope, int cull, int ccw)
 {
     int i;
+    if (cull == D3D11_CULL_NONE)
+        ccw = 0;                          /* no face is culled: either reads the same */
     for (i = 0; i < s_nrasters; i++)
-        if (s_rasters[i].slope == slope)
+        if (s_rasters[i].slope == slope && s_rasters[i].cull == cull && s_rasters[i].ccw == ccw)
             return s_rasters[i].s;
-    if (s_nrasters == 32)
+    if (s_nrasters == 64) {
+        static int told;
+        if (!told++)
+            fprintf(stderr, "[D3D11] rasterizer states full: a depth bias is drawn with another's\n");
         return s_rasters[0].s;
+    }
     {
         D3D11_RASTERIZER_DESC d;
         ZeroMemory(&d, sizeof d);
         d.FillMode = D3D11_FILL_SOLID;
-        d.CullMode = D3D11_CULL_NONE;     /* culled by the executor */
+        d.CullMode = (D3D11_CULL_MODE)cull;
+        d.FrontCounterClockwise = ccw;
         d.DepthClipEnable = FALSE;        /* window z is compared as it is */
         d.ScissorEnable = TRUE;
         d.SlopeScaledDepthBias = slope;
         s_rasters[s_nrasters].slope = slope;
+        s_rasters[s_nrasters].cull = cull;
+        s_rasters[s_nrasters].ccw = ccw;
         if (FAILED(ID3D11Device_CreateRasterizerState(s_dev, &d, &s_rasters[s_nrasters].s)))
             return NULL;
         return s_rasters[s_nrasters++].s;
     }
+}
+
+static ID3D11RasterizerState *raster_for(float slope)
+{
+    return raster_cull(slope, D3D11_CULL_NONE, 0);
 }
 
 /* ---- Set-up -------------------------------------------------------------- */
@@ -1374,6 +1390,291 @@ static int device_up(void)
     }
     fprintf(stderr, "[D3D11] renderer up, shaders compiled in %lu ms\n",
             (unsigned long)(GetTickCount() - t0));
+    return 1;
+}
+
+/* ---- Vertex programs on the GPU (RECOMP_GPU_VSH=1) ----------------------- *
+ *
+ * The executor hands over a program batch untransformed (Nv2aBatch.program):
+ * the title's vertex program, its constants, the attribute arrays as raw bytes
+ * and a triangle list. Each program becomes a vertex shader, cached by the
+ * program's hash: the text nv2a_vsh_emit_hlsl prints, between a prelude that
+ * fetches attributes from the raw bytes as the executor's fetch_attr does and
+ * an epilogue that does to the outputs what the CPU path does before it hands
+ * vertices to d3d11_draw (Nv2aProgramDraw lists it). Clipping is the GPU's:
+ * the w = 1e-3 and near planes as clip distances, everything else by its own
+ * clipper, whose interpolation in clip space is what the CPU's clip does.
+ *
+ * The generated text keeps to HLSL that DXC also compiles to SPIR-V
+ * (ByteAddressBuffer, cbuffers, scalar ?:), for a later Vulkan back end. */
+#define RAW_BYTES (32u * 1024u * 1024u)
+
+typedef struct {
+    float    c[NV2A_VSH_CONSTANTS][4];
+    uint32_t va[NV2A_VSH_INPUTS][4];       /* address of vertex 0, stride, type | size << 4 | kind << 8 */
+    float    imm[NV2A_VSH_INPUTS][4];
+    float    aa[4];                        /* aa x, aa y, near-plane clip on */
+    float    fogp[4];
+    uint32_t fogm[4];                      /* fog mode, fog enabled */
+} ProgConstants;
+
+static const char s_vsh_prelude[] =
+"cbuffer C : register(b0) { float4 rt; };\n"
+"cbuffer V : register(b2) {\n"
+"  float4 c[192]; uint4 va[16]; float4 vimm[16]; float4 aa; float4 fogp; uint4 fogm;\n"
+"};\n"
+"ByteAddressBuffer vb : register(t0);\n"
+"struct VO { float4 p : SV_Position; float4 d0 : COLOR0; float4 d1 : COLOR1; float fog : FOG;\n"
+"            float4 t0 : TEXCOORD0; float4 t1 : TEXCOORD1; float4 t2 : TEXCOORD2; float4 t3 : TEXCOORD3;\n"
+"            float2 cd : SV_ClipDistance0; };\n"
+"uint ld8(uint a) { return (vb.Load(a & ~3u) >> ((a & 3u) * 8u)) & 0xFFu; }\n"
+"uint ld16(uint a) { return ld8(a) | (ld8(a + 1u) << 8); }\n"
+"uint ld32(uint a) { return (a & 3u) != 0u ? (ld16(a) | (ld16(a + 2u) << 16)) : vb.Load(a); }\n"
+"float s16(uint u) { return (float)((int)(u << 16) >> 16); }\n"
+"float4 vin(uint i, uint vid) {\n"
+"  uint4 d = va[i];\n"
+"  uint kind = (d.z >> 8) & 3u, type = d.z & 15u, size = min((d.z >> 4) & 15u, 4u);\n"
+"  float4 r = float4(0, 0, 0, 1);\n"
+"  if (kind == 1u) return vimm[i];\n"
+"  if (kind != 2u) return r;\n"
+"  uint a = d.x + vid * d.y;\n"
+"  if (type == 0u) { uint u = ld32(a);\n"
+"    return float4((u >> 16) & 255u, (u >> 8) & 255u, u & 255u, u >> 24) / 255.0; }\n"
+"  if (type == 6u) { uint u = ld32(a);\n"
+"    return float4((float)((int)(u << 21) >> 21) / 1023.0, (float)((int)(u << 10) >> 21) / 1023.0,\n"
+"                  (float)((int)u >> 22) / 511.0, 1); }\n"
+"  [unroll] for (uint k = 0; k < 4u; k++) {\n"
+"    if (k < size) {\n"
+"      float f;\n"
+"      if (type == 2u) f = asfloat(ld32(a + k * 4u));\n"
+"      else if (type == 4u) f = (float)ld8(a + k) / 255.0;\n"
+"      else if (type == 1u) f = s16(ld16(a + k * 2u)) / 32767.0;\n"
+"      else f = s16(ld16(a + k * 2u));\n"
+"      r[k] = f;\n"
+"    }\n"
+"  }\n"
+"  return r;\n"
+"}\n"
+"uint cidx(int i) { return (i < 0 || i >= 192) ? 0u : (uint)i; }\n"
+"float4 vmin(float4 a, float4 b) {\n"
+"  return float4(a.x < b.x ? a.x : b.x, a.y < b.y ? a.y : b.y, a.z < b.z ? a.z : b.z, a.w < b.w ? a.w : b.w);\n"
+"}\n"
+"float4 vmax(float4 a, float4 b) {\n"
+"  return float4(a.x >= b.x ? a.x : b.x, a.y >= b.y ? a.y : b.y, a.z >= b.z ? a.z : b.z, a.w >= b.w ? a.w : b.w);\n"
+"}\n"
+"float4 ilu_rcc(float x) {\n"
+"  float f = 1.0 / x, m = abs(f);\n"
+"  m = m < 5.42101e-20 ? 5.42101e-20 : (m > 1.884467e19 ? 1.884467e19 : m);\n"
+"  return (f < 0 ? -m : m).xxxx;\n"
+"}\n"
+"float4 ilu_exp(float x) { float fl = floor(x); return float4(exp2(fl), x - fl, exp2(x), 1); }\n"
+"float4 ilu_log(float x) {\n"
+"  float ax = abs(x);\n"
+"  if (ax == 0) return float4(-asfloat(0x7F800000u), 1, -asfloat(0x7F800000u), 1);\n"
+"  float e = floor(log2(ax));\n"
+"  return float4(e, ax / exp2(e), log2(ax), 1);\n"
+"}\n"
+"float4 ilu_lit(float4 c) {\n"
+"  float nl = c.x > 0 ? c.x : 0, nh = c.y > 0 ? c.y : 0;\n"
+"  float p = c.w < -127.9961 ? -127.9961 : (c.w > 127.9961 ? 127.9961 : c.w);\n"
+"  return float4(1, nl, c.x > 0 ? pow(nh, p) : 0, 1);\n"
+"}\n"
+"float fogf(float d) {\n"
+"  if (fogm.y == 0u) return 1;\n"
+"  float px = fogp.x, py = fogp.y, f; uint m = fogm.x;\n"
+"  if (m == 0x800u || m == 0x802u) f = px + exp2(d * py * 16.0) - 1.5;\n"
+"  else if (m == 0x801u || m == 0x803u) f = px + exp2(-d * d * py * py * 32.0) - 1.5;\n"
+"  else f = px + d * py - 1.0;\n"
+"  if (m == 0x802u || m == 0x803u || m == 0x804u) f = abs(f);\n"
+"  if ((asuint(f) & 0x7FFFFFFFu) > 0x7F800000u) f = 1;\n"   /* NaN */
+"  return f;\n"                                             /* clamped per pixel */
+"}\n";
+
+static const char s_vsh_main[] =
+"VO main(uint vid : SV_VertexID) {\n"
+"  float4 P, O[13]; VO o;\n"
+"  vsh(vid, P, O);\n"
+"  if (asuint(P.w) == 0u) P.w = 1;\n"            /* +0: a program that never divided */
+"  P.xy *= aa.xy;\n"
+"  float w = P.w;\n"
+"  o.p = float4((P.x / rt.x * 2 - 1) * w, (1 - P.y / rt.y * 2) * w, (P.z / rt.z + rt.w) * w, w);\n"
+"  o.d0 = saturate(O[3]); o.d1 = saturate(O[4]); o.fog = fogf(O[5].x);\n"
+"  o.t0 = O[9]; o.t1 = O[10]; o.t2 = O[11]; o.t3 = O[12];\n"
+"  o.cd = float2(w - 1e-3, aa.z != 0 ? (P.z - c[59].z) * w : 1);\n"
+"  return o;\n"
+"}\n";
+
+typedef struct {
+    uint64_t hash;
+    ID3D11VertexShader *vs;
+    int state;                             /* 0 free, 1 ready, 2 failed */
+} ProgShader;
+
+#define PROG_SHADERS 1024                  /* a power of two */
+static ProgShader s_prog[PROG_SHADERS];
+static ID3D11Buffer *s_raw, *s_pcb;
+static ID3D11ShaderResourceView *s_raw_srv;
+static uint32_t s_raw_used;
+static int s_prog_failed;                  /* no raw buffers: everything stays on the CPU */
+static struct { uint32_t shaders, failed; double compile_ms; uint64_t draws, raw_bytes; } s_pstats;
+
+static int prog_up(void)
+{
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opt;
+    D3D11_BUFFER_DESC d;
+    D3D11_SHADER_RESOURCE_VIEW_DESC v;
+
+    if (s_raw_srv)
+        return 1;
+    if (s_prog_failed || !device_up())
+        return 0;
+    /* Writing a dynamic SRV buffer with NO_OVERWRITE is a D3D 11.1 feature. */
+    ZeroMemory(&opt, sizeof opt);
+    if (FAILED(ID3D11Device_CheckFeatureSupport(s_dev, D3D11_FEATURE_D3D11_OPTIONS, &opt, sizeof opt))
+        || !opt.MapNoOverwriteOnDynamicBufferSRV) {
+        fprintf(stderr, "[D3D11] no NO_OVERWRITE on shader buffers: vertex programs stay on the CPU\n");
+        s_prog_failed = 1;
+        return 0;
+    }
+    ZeroMemory(&d, sizeof d);
+    d.ByteWidth = RAW_BYTES;
+    d.Usage = D3D11_USAGE_DYNAMIC;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    ZeroMemory(&v, sizeof v);
+    v.Format = DXGI_FORMAT_R32_TYPELESS;
+    v.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+    v.BufferEx.NumElements = RAW_BYTES / 4;
+    v.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+    s_pcb = make_buffer(sizeof(ProgConstants), D3D11_BIND_CONSTANT_BUFFER);
+    if (!s_pcb || FAILED(ID3D11Device_CreateBuffer(s_dev, &d, NULL, &s_raw))
+        || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_raw, &v, &s_raw_srv))) {
+        fprintf(stderr, "[D3D11] vertex-program buffers failed: they stay on the CPU\n");
+        s_prog_failed = 1;
+        return 0;
+    }
+    /* Nothing else uses these vertex-shader slots: bound for good. */
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 2, 1, &s_pcb);
+    ID3D11DeviceContext_VSSetShaderResources(s_ctx, 0, 1, &s_raw_srv);
+    return 1;
+}
+
+/* The program's shader: compiled the first time it is seen. NULL if it does
+ * not compile (that program then stays on the CPU). */
+static ID3D11VertexShader *prog_shader(uint64_t hash)
+{
+    static char *src;
+    static const size_t cap = 256 * 1024;
+    uint32_t h = (uint32_t)(hash ^ (hash >> 32)) & (PROG_SHADERS - 1), probe;
+    ProgShader *e = NULL;
+
+    for (probe = 0; probe < PROG_SHADERS; probe++) {
+        ProgShader *p = &s_prog[(h + probe) & (PROG_SHADERS - 1)];
+        if (p->state && p->hash == hash)
+            return p->state == 1 ? p->vs : NULL;
+        if (!p->state) {
+            e = p;
+            break;
+        }
+    }
+    if (!e)
+        return NULL;                        /* full */
+    e->hash = hash;
+    e->state = 2;
+    if (!src && !(src = (char *)malloc(cap)))
+        return NULL;
+    {
+        size_t pre = sizeof s_vsh_prelude - 1, body, len;
+        LONGLONG t0 = ft_qpc();
+        ID3DBlob *code;
+
+        memcpy(src, s_vsh_prelude, pre);
+        body = nv2a_vsh_emit_hlsl(src + pre, cap - pre - sizeof s_vsh_main);
+        if (!body)
+            return NULL;
+        len = pre + body;
+        memcpy(src + len, s_vsh_main, sizeof s_vsh_main);   /* with its NUL */
+        len += sizeof s_vsh_main - 1;
+        code = compile_from(src, len, "main", "vs_5_0");
+        if (getenv("RECOMP_GPU_VSH_DUMP")) {
+            char name[64];
+            FILE *f;
+            snprintf(name, sizeof name, "vsh_%016llX.hlsl", (unsigned long long)hash);
+            if ((f = fopen(name, "wb")) != NULL) {
+                fwrite(src, 1, len, f);
+                fclose(f);
+            }
+        }
+        if (code) {
+            if (SUCCEEDED(ID3D11Device_CreateVertexShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                                          ID3D10Blob_GetBufferSize(code), NULL, &e->vs)))
+                e->state = 1;
+            ID3D10Blob_Release(code);
+        }
+        if (s_ft.qms)
+            s_pstats.compile_ms += (double)(ft_qpc() - t0) / s_ft.qms;
+        if (e->state == 1)
+            s_pstats.shaders++;
+        else {
+            s_pstats.failed++;
+            fprintf(stderr, "[D3D11] vertex program %016llX did not compile: it stays on the CPU\n",
+                    (unsigned long long)hash);
+        }
+    }
+    return e->state == 1 ? e->vs : NULL;
+}
+
+/* The batch's attribute bytes into the raw ring and its constants into s_pcb.
+ * Returns 0 if they do not fit. */
+static int prog_upload(const Nv2aBatch *b)
+{
+    const Nv2aProgramDraw *pd = b->program;
+    static ProgConstants pc;
+    D3D11_MAPPED_SUBRESOURCE m;
+    uint32_t at[NV2A_VSH_INPUTS], need = 0, r, a;
+
+    for (r = 0; r < pd->nranges; r++)
+        need += (pd->ranges[r].bytes + 15u) & ~15u;
+    if (need > RAW_BYTES)
+        return 0;
+    if (need) {
+        if (s_raw_used + need > RAW_BYTES) {
+            if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_raw, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+                return 0;
+            s_raw_used = 0;
+        } else if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_raw, 0,
+                                                  D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m))) {
+            return 0;
+        }
+        for (r = 0; r < pd->nranges; r++) {
+            at[r] = s_raw_used;
+            memcpy((uint8_t *)m.pData + s_raw_used, pd->ranges[r].src, pd->ranges[r].bytes);
+            s_raw_used += (pd->ranges[r].bytes + 15u) & ~15u;
+        }
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_raw, 0);
+        s_pstats.raw_bytes += need;
+    }
+    memcpy(pc.c, pd->constants, sizeof pc.c);
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        const Nv2aAttrib *d = &pd->attr[a];
+        pc.va[a][0] = d->kind == 2 ? at[d->range] + d->offset : 0;
+        pc.va[a][1] = d->stride;
+        pc.va[a][2] = (d->type & 15u) | (d->size & 15u) << 4 | d->kind << 8;
+        pc.va[a][3] = 0;
+    }
+    memcpy(pc.imm, pd->imm, sizeof pc.imm);
+    pc.aa[0] = pd->aa[0];
+    pc.aa[1] = pd->aa[1];
+    pc.aa[2] = pd->near_z ? 1.0f : 0.0f;
+    pc.fogp[0] = pd->fog_param[0];
+    pc.fogp[1] = pd->fog_param[1];
+    pc.fogm[0] = pd->fog_mode;
+    pc.fogm[1] = pd->fog_enable;
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_pcb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return 0;
+    memcpy(m.pData, &pc, sizeof pc);
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_pcb, 0);
     return 1;
 }
 
@@ -1598,15 +1899,30 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     D3D11_MAPPED_SUBRESOURCE m;
     Target *t;
     Zeta *z = NULL;
-    uint32_t bytes = b->count * (uint32_t)sizeof(Nv2aVshOutput), first;
+    uint32_t bytes = b->outputs ? b->count * (uint32_t)sizeof(Nv2aVshOutput) : 0, first = 0;
     uint32_t ibytes = b->indices ? b->index_count * (uint32_t)sizeof(uint32_t) : 0, first_index = 0;
     ID3D11ShaderResourceView *views[8];
     ID3D11SamplerState *samps[4];
     D3D11_RECT sc;
     int st, i;
 
-    if (!sh || !b->outputs || !device_up() || bytes > VB_BYTES || ibytes > IB_BYTES)
+    ID3D11VertexShader *pvs = NULL;
+    int cull = D3D11_CULL_NONE;
+
+    if (!sh || (!b->outputs && !b->program) || !device_up() || bytes > VB_BYTES || ibytes > IB_BYTES)
         return;
+    if (b->program) {
+        if (!ibytes || !prog_up() || !(pvs = prog_shader(b->program->hash)))
+            return;
+        /* Culled here from the projected winding, as the executor does for what
+         * it transforms: front_face 0x0900 is clockwise on screen. */
+        if (r->cull_enable) {
+            if (r->cull_face == 0x0408)
+                goto drawn;                 /* FRONT_AND_BACK: nothing */
+            cull = r->cull_face == 0x0404 ? D3D11_CULL_FRONT
+                 : r->cull_face == 0x0405 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
+        }
+    }
     t = target_for(s);
     if (!t)
         return;
@@ -1617,17 +1933,22 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
         z = zeta_get(s, r->zeta_va, t);
     bind_targets(t, z);
 
-    /* Vertices. */
-    if (s_vb_used + bytes > VB_BYTES) {
+    /* Vertices: finished ones, or a program's inputs. */
+    if (b->program) {
+        if (!prog_upload(b))
+            return;
+    } else if (s_vb_used + bytes > VB_BYTES) {
         ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
         s_vb_used = 0;
     } else {
         ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_vb, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &m);
     }
-    memcpy((uint8_t *)m.pData + s_vb_used, b->outputs, bytes);
-    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
-    first = s_vb_used / (uint32_t)sizeof(Nv2aVshOutput);
-    s_vb_used += bytes;
+    if (!b->program) {
+        memcpy((uint8_t *)m.pData + s_vb_used, b->outputs, bytes);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_vb, 0);
+        first = s_vb_used / (uint32_t)sizeof(Nv2aVshOutput);
+        s_vb_used += bytes;
+    }
     /* Indices, when the executor sends each shared vertex once: a ring like
      * the vertices'. */
     if (ibytes) {
@@ -1752,15 +2073,18 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
                                                r->stencil_ref & 0xFF);
     /* The slope term is per pixel, and a pixel here is 1/sy of a guest one (or
      * 1/sx across, when stretched: the larger is the safer bias). */
-    ID3D11DeviceContext_RSSetState(s_ctx, raster_for(r->poly_offset_fill
-                                                     ? r->poly_offset_scale * (t->sx > t->sy ? t->sx : t->sy) : 0.0f));
+    ID3D11DeviceContext_RSSetState(s_ctx, raster_cull(r->poly_offset_fill
+                                                      ? r->poly_offset_scale * (t->sx > t->sy ? t->sx : t->sy) : 0.0f,
+                                                      cull, r->front_face != 0x0900));
     sc.left = (LONG)((float)s->clip_x * t->sx + 0.5f);
     sc.top = (LONG)((float)s->clip_y * t->sy + 0.5f);
     sc.right = (LONG)((float)(s->clip_x + s->width) * t->sx + 0.5f);
     sc.bottom = (LONG)((float)(s->clip_y + s->height) * t->sy + 0.5f);
     ID3D11DeviceContext_RSSetScissorRects(s_ctx, 1, &sc);
 
-    ID3D11DeviceContext_VSSetShader(s_ctx, s_vs, NULL, 0);
+    /* A program draw reads no vertex buffer (the bound layout's elements go
+     * unused): its shader fetches from the raw ring by SV_VertexID. */
+    ID3D11DeviceContext_VSSetShader(s_ctx, pvs ? pvs : s_vs, NULL, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
     {
         /* -DrawLog's F5: leave out one kind of blended draw, to see what a stray
@@ -1791,7 +2115,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     t->seq = ++s_seq;
     if (z && r->depth_write)
         z->seq = s_seq;
-    if (s_drawlog) {
+    if (s_drawlog && b->outputs) {
         float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
         const Nv2aVshOutput *o = b->outputs;
         uint32_t k;
@@ -1869,6 +2193,9 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
             fprintf(stderr, "[DRAW]   rc%d %08X %08X %08X %08X k %08X %08X\n", i, sh->rc.color_icw[i], sh->rc.color_ocw[i],
                     sh->rc.alpha_icw[i], sh->rc.alpha_ocw[i], sh->rc.factor0[i], sh->rc.factor1[i]);
     }
+    if (pvs)
+        s_pstats.draws++;
+drawn:
     s_stats.draws++;
     s_stats.tris += (ibytes ? b->index_count : b->count) / 3;
 }
@@ -1879,6 +2206,37 @@ static void d3d11_draw(const Nv2aSurface *s, const Nv2aBatch *b)
     d3d11_draw_inner(s, b);
     if (s_ft.qms)
         s_ft.d3d += (double)(ft_qpc() - t) / s_ft.qms;
+}
+
+/* Nv2aBackend.draw_program: 0 when the program has no shader (it failed to
+ * compile, or the buffers could not be made), before anything is drawn. */
+static int d3d11_draw_program(const Nv2aSurface *s, const Nv2aBatch *b)
+{
+    /* RECOMP_GPU_VSH_SEL=<bits>:<hex>: only programs whose hash has those low
+     * bits (64: the whole hash) run on the GPU, the rest on the CPU -- for
+     * finding which program a difference between the paths comes from. A
+     * leading '!' inverts it. */
+    static int sel_bits = -1, sel_not;
+    static unsigned long long sel_val;
+    if (sel_bits < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH_SEL");
+        sel_bits = 0;
+        if (e && *e == '!') {
+            sel_not = 1;
+            e++;
+        }
+        if (e && sscanf(e, "%d:%llx", &sel_bits, &sel_val) != 2)
+            sel_bits = 0;
+    }
+    if (sel_bits > 0) {
+        uint64_t mask = sel_bits >= 64 ? ~0ull : (1ull << sel_bits) - 1;
+        if (((b->program->hash & mask) != sel_val) != sel_not)
+            return 0;
+    }
+    if (!device_up() || !prog_up() || !prog_shader(b->program->hash))
+        return 0;
+    d3d11_draw(s, b);
+    return 1;
 }
 
 static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, uint32_t flags,
@@ -2805,6 +3163,11 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
                 (unsigned long long)(s_tex_bytes / 1024), s_stats.hashes, s_stats.feedback, s_stats.zeta_copies);
         fprintf(stderr, "[D3D11] visibility: %u tests, %u with no pixels, at most %u pending\n",
                 s_vis_stats.reports, s_vis_stats.zero, s_vis_stats.max_pending);
+        if (s_pstats.draws || s_pstats.shaders || s_pstats.failed)
+            fprintf(stderr, "[D3D11] vertex programs: %llu GPU draws, %llu KB inputs; %u shaders (%u failed) in %.0f ms\n",
+                    (unsigned long long)s_pstats.draws, (unsigned long long)(s_pstats.raw_bytes / 1024),
+                    s_pstats.shaders, s_pstats.failed, s_pstats.compile_ms);
+        s_pstats.draws = s_pstats.raw_bytes = 0;
         memset(&s_vis_stats, 0, sizeof s_vis_stats);
         memset(&s_stats, 0, sizeof s_stats);
         s_stats.last = GetTickCount();
@@ -3049,7 +3412,8 @@ void gpu_d3d11_register(void)
 {
     static const Nv2aBackend backend = {
         d3d11_clear, d3d11_draw, NULL, d3d11_present, 1,
-        d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_report, 1
+        d3d11_zpass_clear, d3d11_zpass_enable, d3d11_zpass_report, 1,
+        d3d11_draw_program
     };
     const char *e = getenv("RECOMP_GPU");
 

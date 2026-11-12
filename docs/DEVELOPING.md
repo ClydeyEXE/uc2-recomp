@@ -90,6 +90,16 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   `drive_match.py` saves frames as shown and compares only the middle 4:3 when the HUD is kept there.
 - `RECOMP_LOG=<file>` writes the log straight to a file. Do not use `-RedirectStandardError`: its pipe slows the game.
 - `RECOMP_GPU=sw` restores the software rasteriser, and `RECOMP_GPU_STATS=1` logs renderer counts every 5 s.
+- `RECOMP_GPU_VSH=1` runs vertex programs on the GPU (#2): the walker hands D3D11 the program, its constants and the
+  raw attribute bytes, and each program becomes a vertex shader (cached by its hash) that transforms, clips and culls.
+  Fixed-function and screen-space batches, and programs that write constants, stay on the CPU. With
+  `RECOMP_GPU_STATS=1` it logs GPU draws, shaders compiled and the time spent compiling.
+  `RECOMP_GPU_VSH_FLIP=<ms>` alternates the GPU and CPU paths on the `GetTickCount64` clock (GPU while the count of
+  periods is even), so frames grabbed at one spot compare them. `RECOMP_GPU_VSH_SEL=<bits>:<hex>` keeps on the GPU
+  only programs whose hash has those low bits (`!` in front inverts it; 64 bits names one program), to find which
+  program a difference comes from; `RECOMP_GPU_VSH_DUMP=1` writes each program's HLSL to the working directory (game
+  data: move it under `build/`). `RECOMP_GPU_VSH_CHECK=1` reads every attribute back through what the GPU is handed
+  and reports where it differs from the CPU path's read, and logs each program's attribute formats once.
 - `RECOMP_FRAME_TRACE_ALL=1` with `RECOMP_FRAME_TRACE=<flag file>` logs every frame while the file exists, including
   each walk and jump, and `tools/frame_trace.py` summarises it. `run_match.ps1 -CaptureAt` frames are consecutive;
   report dumps are not, and `tools/sheet.py` makes a contact sheet of either.
