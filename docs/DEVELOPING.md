@@ -27,12 +27,20 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
     screen in a standalone game. It runs 4:3 with no bots unless `--bots N`, and with `RECOMP_BENCH_SPAWN=<--seed>`.
 - `RECOMP_BENCH_SPAWN=<seed>` fixes where the player spawns. The script picks a start with `RatePlayerStart`, which
   adds a random term through `RandRange`, so the wrapped `FRand` and `Rand` natives (`sub_0003E890`, `sub_0003D930` in
-  `src/recomp_manual.c`) return values from a private sequence when `RatePlayerStart` is one of the three script
-  frames running. It finds the caller's frame through `CallFunction`'s argument, and logs the first chains as
-  `[BENCH]`. That walk takes about 2 ms (its `VirtualQuery` checks), so it stops for the rest of the run once the
-  spawn is rated (`[BENCH] spawn chosen, hook off`); bots' first spawns are rated in the same burst, and respawns
-  are random. Script `FRand`/`Rand` run only about once a second in an idle match (`[BENCH] ... calls in 10 s`). Seed 1 is CTF-Aqueduct's corridor view; 2 spawns elsewhere and 3 one start further along the corridor.
+  `src/recomp_manual.c`) return values from a private sequence for those draws. Each call reads the UFunction of the
+  script function that made it from its `FFrame` and looks it up in a small cache, so it costs little; only a call
+  from `RandRange` walks one frame up to see whether `RatePlayerStart` called it. That walk takes about 0.3-2 ms (its
+  `VirtualQuery` checks), and stops once the spawn is rated (`[BENCH] spawn chosen, rating walk off`, seen when
+  `RandRange` is next used for something else); bots' first spawns are rated in the same burst, and respawns are
+  random. The functions that draw are logged once each (`[BENCH] script FRand/Rand caller`), and the rating draws
+  as `[BENCH] RatePlayerStart FRand -> x`, which `drive_match.py` takes as the spawn. Seed 1 is CTF-Aqueduct's
+  corridor view; 2 spawns elsewhere.
   A fixed `srand` would not do: every frame's emitters draw from the same `rand()` before the spawn.
+  - A on the "press fire" scoreboard starts a 3-4 s countdown, and A is also jump. A press that lands once the
+    player is in makes them jump, and they land in another pose with the camera set differently: same start, but
+    scene 5.3 against `corridor.png` for the rest of the run. The driver used to press every 2.5 s, which put the
+    second press right on the spawn, and a quarter to a half of runs looked like "one start further along the
+    corridor". It now presses again only after 6 s, and not at all once the spawn is logged.
   - It needs reference frames in `build/route/` (`main_menu.png`, `match.png` and others), captured on this machine
     at 2x window scale. They come from the game, so they stay local; a new machine has to capture its own.
   - It reads frames from the window with PrintWindow, so the window may be covered but not minimised. That costs the

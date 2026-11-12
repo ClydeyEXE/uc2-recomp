@@ -430,16 +430,21 @@ void sub_00266885(void)
  * number of frames before the match starts varies, so a fixed srand() would not
  * fix it.
  *
- * With RECOMP_BENCH_SPAWN=<seed> (non-zero), a call made while RatePlayerStart
- * runs (it draws through RandRange, a script function calling FRand) still draws
- * from rand() as before, but its result is replaced by the next value of a private
- * sequence started from the seed. The ratings, and so the spawn, are then the same
- * in every run of a map. The first calls log their chain of script callers as
- * [BENCH], which checks the offsets below. Off, the natives run unchanged.
+ * With RECOMP_BENCH_SPAWN=<seed> (non-zero), a call made for RatePlayerStart
+ * (it draws through RandRange, a script function calling FRand) still draws
+ * from rand() as before, but its result is replaced by the next value of a
+ * private sequence started from the seed. The ratings, and so the spawn, are
+ * then the same in every run of a map. The calling script function is told by
+ * its UFunction, cached by pointer, so a call costs a read and a short lookup;
+ * only a RandRange call looks one frame further up, which is slow (below). The
+ * functions seen and the rating draws are logged as [BENCH], and tools/
+ * drive_match.py --direct takes the first rating draw as the spawn. Off, the
+ * natives run unchanged.
  */
 #define FFRAME_NODE      0x04u        /* FFrame: the UFunction being run */
 #define UOBJECT_NAME     0x24u        /* UObject: FName index */
 #define GNAMES_DATA_VA   0x00440560u  /* TArray<FNameEntry*> data pointer */
+#define GNAMES_NUM_VA    0x00440564u  /* its count */
 #define FNAMEENTRY_TEXT  0x0Cu        /* FNameEntry: ANSI text */
 
 extern void sub_0003E890_gen(void);
@@ -460,7 +465,6 @@ static int bench_spawn(void)
     return on;
 }
 
-#define GNAMES_NUM_VA    0x00440564u  /* its count */
 /* Readable guest memory: the window goes up to 0x7FFE0000 (RECOMP_EXT_VMA), with
  * reserved pages in it that fault, and the crash handler is vectored, so test
  * the page first. Only bench runs come here. */
@@ -483,15 +487,15 @@ static uint32_t bench_rd(uint32_t va)
     return bench_readable(va, 4) ? *(const uint32_t *)((const char *)g_xbox_mem_offset + va) : 0;
 }
 
-/* The name of the script function an FFrame runs, or "?" if anything is off. */
-static const char *bench_frame_name(uint32_t frame)
+/* An object's name, or "?" if anything is off. */
+static const char *bench_obj_name(uint32_t obj)
 {
-    uint32_t node, names, index, entry;
+    uint32_t names, index, entry;
 
-    if (!GUEST_PTR_OK(frame) || !GUEST_PTR_OK(node = bench_rd(frame + FFRAME_NODE)))
+    if (!GUEST_PTR_OK(obj))
         return "?";
     names = bench_rd(GNAMES_DATA_VA);
-    index = bench_rd(node + UOBJECT_NAME);
+    index = bench_rd(obj + UOBJECT_NAME);
     if (!GUEST_PTR_OK(names) || index >= bench_rd(GNAMES_NUM_VA) || !GUEST_PTR_OK(entry = bench_rd(names + 4u * index)))
         return "?";
     return (const char *)g_xbox_mem_offset + entry + FNAMEENTRY_TEXT;
@@ -521,46 +525,50 @@ static uint32_t bench_caller(uint32_t frame, uint32_t *at)
 }
 
 /*
- * Whether RatePlayerStart is running: the calling script function, or the one
- * or two above it, as it may rate through RandRange (a script function that
- * calls FRand).
+ * What the script function running in an FFrame is to the bench. The FFrame is
+ * the native's argument, so its UFunction can be read directly; its name is
+ * looked up (with the slow checked reads) once per function and logged.
  */
-static int bench_in_rate(uint32_t stack, const char *native)
-{
-    static int logged;
-    const char *name[3] = {"-", "-", "-"};
-    uint32_t frame = stack, off[3] = {0, 0, 0};
-    int i, hit = 0;
+enum { BENCH_OTHER, BENCH_RANDRANGE, BENCH_RATE };
 
-    if (!GUEST_PTR_OK(stack))
-        return 0;
-    for (i = 0; i < 3 && frame; i++) {
-        name[i] = bench_frame_name(frame);
-        hit |= strcmp(name[i], "RatePlayerStart") == 0;
-        if (i < 2)
-            frame = bench_caller(frame, &off[i + 1]);
+static int bench_kind(uint32_t frame)
+{
+    static struct { uint32_t node; int kind; } cache[128];
+    static int n;
+    uint32_t node;
+    const char *name;
+    int i, kind;
+
+    if (frame < 0x10000u || frame >= 0x7FFE0000u - 8u)
+        return BENCH_OTHER;
+    node = *(const uint32_t *)((const char *)g_xbox_mem_offset + frame + FFRAME_NODE);
+    for (i = 0; i < n; i++)
+        if (cache[i].node == node)
+            return cache[i].kind;
+    name = GUEST_PTR_OK(frame) ? bench_obj_name(node) : "?";
+    kind = strcmp(name, "RandRange") == 0 ? BENCH_RANDRANGE
+         : strcmp(name, "RatePlayerStart") == 0 ? BENCH_RATE
+         : BENCH_OTHER;
+    if (n < (int)(sizeof cache / sizeof cache[0])) {
+        cache[n].node = node;
+        cache[n].kind = kind;
+        n++;
+        fprintf(stderr, "[BENCH] script FRand/Rand caller %.32s\n", name);
     }
-    if (logged < 12 || (hit && logged < 20)) {
-        logged++;
-        fprintf(stderr, "[BENCH] %s from %.32s < %.32s (+0x%X) < %.32s (+0x%X)\n", native, name[0],
-                name[1], off[1], name[2], off[2]);
-    }
-    return hit;
+    return kind;
 }
 
 /*
- * The walk costs a few VirtualQuery calls, so it stops once the spawn is chosen.
- * (Script FRand and Rand are rare, about one call a second in an idle match, as
- * emitters and AI call the CRT rand() directly, so the cost was small anyway.)
- * The spawn is rated in one burst, six draws on CTF-Aqueduct when the player
- * presses fire, so the first call that is not from RatePlayerStart and comes
- * BENCH_OFF_MS or more after a rating draw turns the walk off for the rest of the
- * run. With bots, their first spawns are rated in the same burst as the player's
- * (StartMatch restarts every controller in one loop); respawns after a death are
- * random again.
+ * The walk from RandRange to its caller costs a few VirtualQuery calls, about
+ * 2 ms, so it stops once the spawn is chosen. The spawn is rated in one burst,
+ * six draws on CTF-Aqueduct when the player presses fire, so the first
+ * RandRange call that is not for RatePlayerStart and comes BENCH_OFF_MS or more
+ * after a rating draw turns it off for the rest of the run. With bots, their
+ * first spawns are rated in the same burst as the player's (StartMatch restarts
+ * every controller in one loop); respawns after a death are random again.
  *
  * The calls are counted per 10 s (the first 30 windows), and the walks timed,
- * so the cost of the walk can be read from a run.
+ * so the cost can be read from a run.
  */
 #define BENCH_OFF_MS 2000u
 
@@ -583,33 +591,42 @@ static void bench_count(void)
     calls++;
     if (now - start >= 10000) {
         windows++;
-        fprintf(stderr, "[BENCH] %llu FRand/Rand calls in %.1f s, walk %s\n", (unsigned long long)calls,
+        fprintf(stderr, "[BENCH] %llu FRand/Rand calls in %.1f s, rating walk %s\n", (unsigned long long)calls,
                 (now - start) / 1000.0, bench_phase == 2 ? "off" : "on");
         start = now;
         calls = 0;
     }
 }
 
-static int bench_check(uint32_t stack, const char *native)
+/* Whether a draw is for RatePlayerStart, directly or through RandRange. */
+static int bench_rating(uint32_t stack, int kind)
 {
     LARGE_INTEGER t0, t1, f;
+    uint32_t caller, at = 0;
     int hit;
 
-    bench_count();
-    if (bench_phase == 2)
+    if (kind == BENCH_RATE)
+        hit = 1;
+    else if (kind != BENCH_RANDRANGE || bench_phase == 2)
         return 0;
-    QueryPerformanceCounter(&t0);
-    hit = bench_in_rate(stack, native);
-    QueryPerformanceCounter(&t1);
-    bench_walks++;
-    bench_walk_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
+    else {
+        QueryPerformanceCounter(&t0);
+        caller = bench_caller(stack, &at);
+        hit = caller && bench_kind(caller) == BENCH_RATE;
+        QueryPerformanceCounter(&t1);
+        bench_walks++;
+        bench_walk_ticks += (uint64_t)(t1.QuadPart - t0.QuadPart);
+        if (bench_walks == 1)
+            fprintf(stderr, "[BENCH] RandRange called from %.32s (+0x%X)\n",
+                    caller ? bench_obj_name(bench_rd(caller + FFRAME_NODE)) : "?", at);
+    }
     if (hit) {
         bench_phase = 1;
         bench_last_hit = GetTickCount64();
     } else if (bench_phase == 1 && GetTickCount64() - bench_last_hit >= BENCH_OFF_MS) {
         bench_phase = 2;
         QueryPerformanceFrequency(&f);
-        fprintf(stderr, "[BENCH] spawn chosen, hook off (%llu walks, %.2f us each)\n",
+        fprintf(stderr, "[BENCH] spawn chosen, rating walk off (%llu walks, %.2f us each)\n",
                 (unsigned long long)bench_walks, 1e6 * (double)bench_walk_ticks / bench_walks / f.QuadPart);
     }
     return hit;
@@ -634,7 +651,8 @@ void sub_0003E890(void)            /* UObject::execFRand(FFrame &Stack, float *R
     stack = *(const uint32_t *)(mem + g_esp + 4);
     result = *(const uint32_t *)(mem + g_esp + 8);
     sub_0003E890_gen();
-    if (bench_check(stack, "FRand")) {
+    bench_count();
+    if (bench_rating(stack, bench_kind(stack))) {
         float f = (float)bench_next() / 32767.0f;
         memcpy(mem + result, &f, 4);
         if (logged < 24) {
@@ -658,10 +676,11 @@ void sub_0003D930(void)            /* UObject::execRand(FFrame &Stack, int *Resu
     stack = *(const uint32_t *)(mem + esp0 + 4);
     result = *(const uint32_t *)(mem + esp0 + 8);
     sub_0003D930_gen();
+    bench_count();
     /* The body keeps Max in its local at entry esp - 4, which nothing below it
      * reuses before the return. */
     max = *(const int32_t *)(mem + esp0 - 4);
-    if (max > 0 && bench_check(stack, "Rand")) {
+    if (max > 0 && bench_rating(stack, bench_kind(stack))) {
         int32_t v = (int32_t)(bench_next() % (uint32_t)max);
         *(int32_t *)(mem + result) = v;
         if (logged < 24) {

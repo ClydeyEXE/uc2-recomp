@@ -15,12 +15,15 @@ Where the player spawns sets an idle match's fps: the red base has at least seve
 spawn points, from 65 to 158 fps, and the view from each is the same every time.
 The corridor view, looking down the long corridor, is the heavy view of issue #1.
 Spawns are told apart by the scene above the player against build/route/corridor.png
-(local, from the game; same spawn 0-1, the next start along the corridor about 5).
+(local, from the game; same view 0-1, the same spawn after a jump about 5.3, which
+drive_match avoids by not pressing A once the player is in).
 
 --direct (use this) boots straight into the match (drive_match --direct): no menus,
 no bots unless --bots, no time limit, and RECOMP_BENCH_SPAWN=<--seed> fixing the
-spawn. Seed 1, the default, is the corridor view every time (6 of 6 in the A/A below,
-plus 9 of 9 other runs). A run with --secs 60 takes 83-85 s (the match is up 9 s
+spawn. Seed 1, the default, is the corridor view every time: 30 of 30 on 2026-11-12
+(12 boots with no bots, 12 with 7, and an A/A of 3 a side at 100.5-102.2 fps, B/A
++0.8%). Before the driver stopped pressing A into the spawn, 31 of 56 no-bot runs
+and 13 of 14 with bots were. A run with --secs 60 takes 83-85 s (the match is up 9 s
 after launch); the A/A below ran before the boot logos were skipped, at 102 s. A run that spawns elsewhere fails rather than rerolling. With no bots nothing
 crosses the view, so every window is kept, but the workload is lighter than a played
 match: --bots N puts bots back for real load (and they end the measurement when they

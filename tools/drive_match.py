@@ -19,7 +19,8 @@ once the screen it is meant for is up:
     arena       down until Portrait_Arena_<map name>, then A
     character   A, until Portrait_Armory_<x>.xmv
     armory      A for each category, then A on "Begin Match?", until <map>.lin opens
-    scoreboard  A ("press fire") every 2.5 s until the HUD shows
+    scoreboard  A ("press fire") every 6 s until the HUD shows, and none once
+                the game logs the bench spawn (A is also jump)
     match       frame: the HUD's coloured pixels match route/match.png, twice running
 
 --direct skips the menus: RECOMP_CMDLINE gives the game a start URL (see
@@ -98,22 +99,26 @@ HUD_BOXES = [(0, 0, 250, 45), (500, 0, 640, 100), (30, 290, 150, 420)]
 HUD_MIN = 0.6         # share of those pixels that match: 0.77-1.0 in a match, 0.4 or less elsewhere
 HEADER_MAX, SCORE_MAX = 9.0, 10.0
 # The scene above the player and clear of the HUD, for telling spawn views apart:
-# at 4:3 the same spawn measures 0-1 against its reference, the next start along
-# the CTF-Aqueduct corridor about 5, any other 28 or more. SPAWN_MAX tells spawns
-# apart; SCENE_MAX is what tools/ab.py counts as the view lost (a bot or a death).
+# at 4:3 the same spawn measures 0-1 against its reference, the same spawn after a
+# jump (a press of A once spawned; see match()) about 5.3, any other 28 or more.
+# SPAWN_MAX tells them apart; SCENE_MAX is what tools/ab.py counts as the view lost
+# (a bot or a death).
 SCENE = ((160, 50, 620, 280), (46, 23))
 SPAWN_MAX = 3.0
 SCENE_MAX = 8.0
 # Seconds to leave a screen after the last file the game opened, before pressing.
 SETTLE, SETTLE_MAX = 1.2, 3.0
+# Seconds between presses of A on the "press fire" scoreboard: longer than the
+# countdown a taken press starts (see Driver.match).
+PRESS_AGAIN = 6.0
 # --direct: the game class for a map prefix, and the spawn seed whose view on
-# CTF-Aqueduct is the corridor (build/route/corridor.png). Seed 2 spawns elsewhere
-# and 3 at the next start along the corridor.
+# CTF-Aqueduct is the corridor (build/route/corridor.png). Seed 2 spawns elsewhere.
 GAME_CLASSES = {"CTF": "UCGameplay.CTFGame"}
 BENCH_SEED = 1
 # Game type portraits, by map prefix. Only CTF has been seen; the rest are guesses.
 GAMETYPES = {"CTF": ["CTF"], "DM": ["DM", "DeathMatch"], "TDM": ["TDM", "TeamDeathMatch"]}
 
+RE_SPAWN = "[BENCH] RatePlayerStart"   # the bench spawn hook's first rating draw
 RE_FILE = re.compile(r"\[FILE\] (\S+) \(disp [^)]*\) -> 0x00000000")
 RE_PORTRAIT = re.compile(r"Portrait_(GameType|Arena|Char|Armory)_(\w+)\.xmv$", re.I)
 RE_MAP = re.compile(r"XboxMaps\\([\w-]+)\.lin$", re.I)
@@ -348,6 +353,7 @@ class Driver:
         self.resets = 0
         self.last_press = 0
         self.reached = None
+        self.spawned = None       # when the game logged the spawn rating (bench spawn only)
         want = args.map.split("-", 1)
         self.want_type = want[0].upper() if len(want) == 2 else "CTF"
         self.want_arena = want[-1]
@@ -420,6 +426,9 @@ class Driver:
             m = RE_FILE.search(ln)
             if m:
                 self.events.append((t, m.group(1)))
+            elif self.spawned is None and ln.startswith(RE_SPAWN):
+                self.spawned = t
+                self.note("spawn rated")
         if self.proc.poll() is not None:
             raise Fatal("game exited with code %d" % self.proc.returncode)
         if t > self.args.timeout:
@@ -431,12 +440,15 @@ class Driver:
             self.poll()
             time.sleep(0.1)
 
-    def press(self, button, hold=100):
+    def press(self, button, hold=100, unless=None):
         # A screen ignores input while it slides in: give it a moment after the
-        # file that announced it (or whatever the game last opened).
+        # file that announced it (or whatever the game last opened). unless() is
+        # asked again after that wait, and if true nothing is pressed (None).
         end = self.now() + SETTLE_MAX
         while self.events and self.now() - self.events[-1][0] < SETTLE and self.now() < end:
             self.wait(0.1)
+        if unless is not None and unless():
+            return None
         self.last_press = len(self.events)
         with open(self.pad_path, "a") as f:
             f.write("%s:%d\n" % (button, hold))
@@ -641,10 +653,19 @@ class Driver:
         # The load shows the scoreboard with "LOADING...", then "PRESS FIRE".
         # A is pressed every few seconds until the HUD shows: route/scoreboard.png
         # only matches with Aqueduct behind it, so it is noted, not waited for.
+        # A press that is taken starts the countdown, and the player spawns 3-4 s
+        # later (more with bots); the HUD shows a second or so after that. A is
+        # also jump, and a press that lands once the player is in makes them jump:
+        # they land in another pose with the camera set differently (scene 5.3
+        # against the corridor reference, for the rest of the run). Pressing every
+        # 2.5 s put the second press right on the spawn, and a quarter to a half
+        # of runs jumped. So A is pressed again only after PRESS_AGAIN, past the
+        # countdown, and with the bench spawn hook not at all once the game has
+        # logged the spawn.
         t_map = self.now()
         hud = 0
         board = False
-        last_a = 0.0
+        last_a = 2.5 - PRESS_AGAIN    # so the first press goes in at once
         self.enter("scoreboard")
         while True:
             im = self.frame()
@@ -657,8 +678,8 @@ class Driver:
             if im is not None and not board and self.is_scoreboard(im):
                 board = True
                 self.note("scoreboard seen")
-            if hud == 0 and self.now() - last_a > 2.5:
-                self.press("a")
+            if hud == 0 and self.spawned is None and self.now() - last_a > PRESS_AGAIN:
+                self.press("a", unless=lambda: self.spawned is not None)
                 last_a = self.now()
             if self.now() - t_map > 120:
                 self.frames.save("not_in_match")
