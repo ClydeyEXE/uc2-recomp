@@ -31,7 +31,8 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   the code addresses found in the first 4 KB of the stack, by share of those samples: a scan, not an unwind, so stale
   return addresses show too, and sampling runs slower (about 40 sweeps a second).
 - Generated functions keep the guest's integer registers (eax..edi, esp) in C locals, written back to the per-thread
-  copies (`g_eax` and the others) only before calls and at returns (#32). Hand-written code and the runtime see the
+  copies (`g_eax` and the others) only before calls and at returns (#32). Functions that use x87 do the same with
+  its stack (`_l_fp`, top `_l_fptop`). Hand-written code and the runtime see the
   per-thread copies, which is all they ever need; a debugger stopped inside a generated function sees stale ones
   there, so look at the `_l_eax` locals instead. `RECOMP_REGISTER_LOCALS=0` in the environment of a regenerate turns
   it off. The lifter decides which registers each function can change; compiling the generated files with

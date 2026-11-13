@@ -2332,7 +2332,7 @@ index a5b912c..7327b25 100644
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 47491e5..71815d8 100644
+index 47491e5..be41a7a 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
 @@ -1325,20 +1325,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
@@ -2370,7 +2370,7 @@ index 47491e5..71815d8 100644
  
  /* A guarded arm of an indirect call. When a recorded run saw a call site
   * reach only a few translated functions, the lifter compares the target
-@@ -1546,6 +1555,85 @@ void xbox_GuestCpuPreempt(uint32_t va);
+@@ -1546,6 +1555,96 @@ void xbox_GuestCpuPreempt(uint32_t va);
  #define esi g_esi
  #define edi g_edi
  
@@ -2449,6 +2449,17 @@ index 47491e5..71815d8 100644
 +#else
 +#define RECOMP_READ_ONLY(x) x
 +#endif
++/* The x87 stack the same way, in functions that use it (register_locals):
++ * its top and its eight slots, copied in at entry and after calls and out
++ * before calls and returns. The slots are indexed by the top, so they stay in
++ * memory, but in the function's own frame, where no guest store can reach. */
++#define RECOMP_LOCAL_FP \
++    int _l_fptop = *_rp_g_fp_top; double _l_fp[8]; \
++    memcpy(_l_fp, _rp_g_fp_stack, sizeof _l_fp);
++#define RECOMP_SPILL_FP() \
++    (*_rp_g_fp_top = _l_fptop, (void)memcpy(_rp_g_fp_stack, _l_fp, sizeof _l_fp))
++#define RECOMP_RELOAD_FP() \
++    (_l_fptop = *_rp_g_fp_top, (void)memcpy(_l_fp, _rp_g_fp_stack, sizeof _l_fp))
 +#define RECOMP_RELOAD_LOCALS() ((void)(_l_eax = *_rp_g_eax, _l_ecx = *_rp_g_ecx, \
 +    _l_edx = *_rp_g_edx, _l_esp = *_rp_g_esp, _l_ebx = *_rp_g_ebx, \
 +    _l_esi = *_rp_g_esi, _l_edi = *_rp_g_edi))
@@ -2512,10 +2523,10 @@ index 1a56995..4d172dd 100644
  def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
 diff --git a/tools/recomp/test_register_locals.py b/tools/recomp/test_register_locals.py
 new file mode 100644
-index 0000000..8bed733
+index 0000000..c939d72
 --- /dev/null
 +++ b/tools/recomp/test_register_locals.py
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,70 @@
 +"""Guest registers as function locals (translator.register_locals)."""
 +
 +from tools.recomp.translator import register_locals
@@ -2570,6 +2581,22 @@ index 0000000..8bed733
 +def test_a_function_that_calls_setjmp_keeps_its_registers_volatile():
 +    code = _text(["    { int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp))); }"])
 +    assert "RECOMP_LOCAL_REGS_VOLATILE" in code
++
++
++def test_the_x87_stack_is_local_where_the_function_uses_it():
++    code = _text(["    fp_push(MEMF(eax)); /* fld */", "    esp += 4; return;"])
++    assert "    RECOMP_LOCAL_REGS\n    RECOMP_LOCAL_FP\n" in code
++    assert '#pragma push_macro("g_fp_top")\n#undef g_fp_top\n#define g_fp_top _l_fptop' in code
++    assert "#define g_fp_stack _l_fp" in code
++    assert "RECOMP_SPILL_FP()))" in code
++    assert "#define RECOMP_RELOAD() (RECOMP_RELOAD_LOCALS(), RECOMP_RELOAD_FP())" in code
++    assert code.index("\n}\n") < code.index('#pragma pop_macro("g_fp_stack")')
++
++
++def test_the_x87_stack_stays_shared_without_x87_or_beside_fnsave():
++    assert "RECOMP_LOCAL_FP" not in _text(["    eax = 1; return;"])
++    code = _text(["    fp_push(1.0);", "    recomp_fnsave(ecx + 8, 0);", "    return;"])
++    assert "RECOMP_LOCAL_FP" not in code and "push_macro" not in code
 diff --git a/tools/recomp/test_section_readable_end.py b/tools/recomp/test_section_readable_end.py
 index b21b075..5124070 100644
 --- a/tools/recomp/test_section_readable_end.py
@@ -2584,10 +2611,10 @@ index b21b075..5124070 100644
  
  def test_coalesce_end_in_the_fill_is_accepted():
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 21600d3..69babc0 100644
+index 21600d3..f58df67 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -514,6 +514,111 @@ def _mark_back_edges(bb, stmts):
+@@ -514,6 +514,128 @@ def _mark_back_edges(bb, stmts):
      return stmts if out is None else out
  
  
@@ -2628,6 +2655,7 @@ index 21600d3..69babc0 100644
 +# Macros that write a register given as their first argument, or as the
 +# destination of a pop.
 +_WRITING_MACROS = r"(?:PUSH32|POP32|PUSH16|POP16|SET_\w+)"
++_FP_USE_RE = re.compile(r"\bg_fp_(?:top|stack)\b|\bfp_(?:push|pop|top|st1?)\(")
 +
 +
 +def _register_writes(body):
@@ -2658,9 +2686,15 @@ index 21600d3..69babc0 100644
 +    text = "\n".join(lines)
 +    open_at = text.index("\n{\n") + 3
 +    head, body = text[:open_at], text[open_at:]
++    # The x87 stack too, where the function uses it, except beside setjmp
++    # (no volatile copy) and FNSAVE/FRSTOR, whose helpers work on the
++    # per-thread copy.
++    fp_local = (bool(_FP_USE_RE.search(body)) and "setjmp(" not in body
++                and not re.search(r"\brecomp_f(?:nsave|rstor)\(", body))
 +    body = body.replace("    RECOMP_STATE_PTRS\n",
-+                        "    RECOMP_STATE_PTRS\n    RECOMP_LOCAL_REGS%s\n"
-+                        % ("_VOLATILE" if "setjmp(" in body else ""), 1)
++                        "    RECOMP_STATE_PTRS\n    RECOMP_LOCAL_REGS%s\n%s"
++                        % ("_VOLATILE" if "setjmp(" in body else "",
++                           "    RECOMP_LOCAL_FP\n" if fp_local else ""), 1)
 +    body = _TAIL_CALL_RE.sub(r"RECOMP_SPILL(); \1(); @RETURN@", body)
 +    body = _RETURN_RE.sub("{ RECOMP_SPILL(); return; }", body)
 +    body = body.replace("@RETURN@", "return;")
@@ -2677,12 +2711,22 @@ index 21600d3..69babc0 100644
 +    for r in LOCAL_REGS:
 +        target = f"_l_{r}" if r in written else f"RECOMP_READ_ONLY(_l_{r})"
 +        pre.append(f"#define g_{r} {target}")
-+    spill = ", ".join(f"*_rp_g_{r} = _l_{r}" for r in LOCAL_REGS if r in written)
++    spill = [f"*_rp_g_{r} = _l_{r}" for r in LOCAL_REGS if r in written]
++    reload = "RECOMP_RELOAD_LOCALS()"
++    if fp_local:
++        spill.append("RECOMP_SPILL_FP()")
++        reload = "(RECOMP_RELOAD_LOCALS(), RECOMP_RELOAD_FP())"
++        for state, local in (("g_fp_top", "_l_fptop"), ("g_fp_stack", "_l_fp")):
++            pre += [f'#pragma push_macro("{state}")', f"#undef {state}",
++                    f"#define {state} {local}"]
++    spill = ", ".join(spill)
 +    pre += ["#undef RECOMP_SPILL",
 +            f"#define RECOMP_SPILL() ((void)({spill or 0}))",
 +            "#undef RECOMP_RELOAD",
-+            "#define RECOMP_RELOAD() RECOMP_RELOAD_LOCALS()"]
++            f"#define RECOMP_RELOAD() {reload}"]
 +    post = [f"#undef g_{r}" for r in LOCAL_REGS]
++    if fp_local:
++        post += ['#pragma pop_macro("g_fp_top")', '#pragma pop_macro("g_fp_stack")']
 +    post += ["#undef RECOMP_SPILL", "#define RECOMP_SPILL() ((void)0)",
 +             "#undef RECOMP_RELOAD", "#define RECOMP_RELOAD() ((void)0)"]
 +    out = (head + body).split("\n")
@@ -2699,7 +2743,7 @@ index 21600d3..69babc0 100644
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -3062,9 +3167,16 @@ class FunctionTranslator:
+@@ -3062,9 +3184,16 @@ class FunctionTranslator:
          # Function signature
          lines.append(f"{ret_type} {name}({param_str})")
          lines.append(f"{{")
@@ -2717,7 +2761,7 @@ index 21600d3..69babc0 100644
  
          # Optional entry trace. Bring-up is mostly "which of these ten init
          # calls does it not come back from", and answering that by overriding
-@@ -3501,6 +3613,23 @@ class FunctionTranslator:
+@@ -3501,6 +3630,23 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -2741,7 +2785,7 @@ index 21600d3..69babc0 100644
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3922,6 +4051,11 @@ class BatchTranslator:
+@@ -3922,6 +4068,11 @@ class BatchTranslator:
              "",
              '#include "recomp_types.h"',
              "",
@@ -2753,7 +2797,7 @@ index 21600d3..69babc0 100644
          ]
          for addr, name, _ in translations:
              decl = self._make_declaration(addr, name)
-@@ -4028,7 +4162,7 @@ class BatchTranslator:
+@@ -4028,7 +4179,7 @@ class BatchTranslator:
                  f'#include "{header_name}"',
                  '#include <math.h>',
                  "",
