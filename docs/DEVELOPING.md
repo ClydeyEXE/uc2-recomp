@@ -30,6 +30,13 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   /disasm /range` on it says what it is. `--callers NAME` adds, for samples in a function whose name contains NAME,
   the code addresses found in the first 4 KB of the stack, by share of those samples: a scan, not an unwind, so stale
   return addresses show too, and sampling runs slower (about 40 sweeps a second).
+- Generated functions keep the guest's integer registers (eax..edi, esp) in C locals, written back to the per-thread
+  copies (`g_eax` and the others) only before calls and at returns (#32). Hand-written code and the runtime see the
+  per-thread copies, which is all they ever need; a debugger stopped inside a generated function sees stale ones
+  there, so look at the `_l_eax` locals instead. `RECOMP_REGISTER_LOCALS=0` in the environment of a regenerate turns
+  it off. The lifter decides which registers each function can change; compiling the generated files with
+  `/DRECOMP_VERIFY_REG_WRITES` (a syntax check, `/Zs`, is enough) makes the others read-only, so a missed write
+  fails to compile.
 - Overlays inject into the game. With RivaTuner Statistics Server running (OSD on, no frame limit, 2026-11-12),
   `RTSSHooks64.dll` is loaded and calls NvAPI, which calls `EnumDisplayDevicesW`: every 9 s or so a frame took about
   235 ms, the walker inside `Present` (in `NtUserEnumDisplayDevices` or `NtGdiDdDDISetQueuedLimit`), which put up to

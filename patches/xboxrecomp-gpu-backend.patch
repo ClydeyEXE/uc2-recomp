@@ -2332,10 +2332,45 @@ index a5b912c..7327b25 100644
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 47491e5..17ba0bb 100644
+index 47491e5..71815d8 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -1546,6 +1546,49 @@ void xbox_GuestCpuPreempt(uint32_t va);
+@@ -1325,20 +1325,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
+                               uint32_t edi0, uint32_t esp0);
+ #define RECOMP_ABI_CALL(va, fn) do { \
+-    uint32_t _ab = g_ebx, _as = g_esi, _ad = g_edi, _ap = g_esp; \
++    RECOMP_SPILL(); { \
++    uint32_t _ab = *recomp_addr_g_ebx(), _as = *recomp_addr_g_esi(), \
++        _ad = *recomp_addr_g_edi(), _ap = *recomp_addr_g_esp(); \
+     (fn)(); \
+-    if (g_ebx != _ab || g_esi != _as || g_edi != _ad || g_esp < _ap + 4) \
+-        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); \
++    if (*recomp_addr_g_ebx() != _ab || *recomp_addr_g_esi() != _as || \
++        *recomp_addr_g_edi() != _ad || *recomp_addr_g_esp() < _ap + 4) \
++        recomp_abi_violation_log((va), _ab, _as, _ad, _ap); } \
++    RECOMP_RELOAD(); \
+ } while(0)
+ #elif defined(RECOMP_CALL_PROFILE)
+ /* Opt-in profiling: every direct call reports its target to the project, which
+  * keeps the counts (a project defines recomp_call_profile_hit). Diffing the counts
+  * of two situations shows which functions one of them runs and the other does not. */
+ void recomp_call_profile_hit(uint32_t va);
+-#define RECOMP_ABI_CALL(va, fn) do { recomp_call_profile_hit(va); (fn)(); } while(0)
++#define RECOMP_ABI_CALL(va, fn) do { \
++    RECOMP_SPILL(); recomp_call_profile_hit(va); (fn)(); RECOMP_RELOAD(); } while(0)
+ #else
+-#define RECOMP_ABI_CALL(va, fn) (fn)()
++#define RECOMP_ABI_CALL(va, fn) do { RECOMP_SPILL(); (fn)(); RECOMP_RELOAD(); } while(0)
+ #endif
++/* Write a function's register locals back before a call, and read them again
++ * after it (RECOMP_LOCAL_REGS). Nothing where the registers are not locals. */
++#define RECOMP_SPILL() ((void)0)
++#define RECOMP_RELOAD() ((void)0)
+ 
+ /* A guarded arm of an indirect call. When a recorded run saw a call site
+  * reach only a few translated functions, the lifter compares the target
+@@ -1546,6 +1555,85 @@ void xbox_GuestCpuPreempt(uint32_t va);
  #define esi g_esi
  #define edi g_edi
  
@@ -2382,14 +2417,177 @@ index 47491e5..17ba0bb 100644
 +    RECOMP_STATE_PTR(uint16_t, g_fp_control_word) \
 +    RECOMP_STATE_PTR(uint32_t, g_mxcsr) RECOMP_STATE_PTR(double, g_fp_stack)
 +
++/* Guest integer registers as C locals.
++ *
++ * Through pointers the compiler still reloads a register after every guest
++ * store, since a store through a guest pointer may alias the per-thread copy.
++ * So each generated function maps eax..edi and esp onto locals of its own
++ * (register_locals in translator.py), loaded at entry and written back only
++ * where something else can see them: before every call (RECOMP_ABI_CALL and
++ * tail calls) and at every return; they are read again after each call.
++ * RECOMP_SPILL is defined per function and writes back only the registers
++ * that function can change. A build with RECOMP_VERIFY_REG_WRITES turns the
++ * others into rvalues, so a write the lifter missed fails to compile instead
++ * of being lost.
++ *
++ * Nothing else reads these registers between those points: interrupts run on
++ * a worker stack and save and restore the per-thread copies (kernel_hal.c), a
++ * preemption at a loop's back edge only hands the guest CPU to another host
++ * thread, and device-register traps decode the host instruction, not the guest
++ * state. A function that calls setjmp keeps them volatile: a longjmp back into
++ * it restores the per-thread copies, which the setjmp site reads again. */
++#define RECOMP_LOCAL_REGS_AS(Q) \
++    Q uint32_t _l_eax = *_rp_g_eax, _l_ecx = *_rp_g_ecx, _l_edx = *_rp_g_edx, \
++        _l_esp = *_rp_g_esp, _l_ebx = *_rp_g_ebx, _l_esi = *_rp_g_esi, \
++        _l_edi = *_rp_g_edi; \
++    (void)_l_eax; (void)_l_ecx; (void)_l_edx; (void)_l_esp; \
++    (void)_l_ebx; (void)_l_esi; (void)_l_edi;
++#define RECOMP_LOCAL_REGS RECOMP_LOCAL_REGS_AS(/* plain */)
++#define RECOMP_LOCAL_REGS_VOLATILE RECOMP_LOCAL_REGS_AS(volatile)
++#ifdef RECOMP_VERIFY_REG_WRITES
++#define RECOMP_READ_ONLY(x) (+(x))
++#else
++#define RECOMP_READ_ONLY(x) x
++#endif
++#define RECOMP_RELOAD_LOCALS() ((void)(_l_eax = *_rp_g_eax, _l_ecx = *_rp_g_ecx, \
++    _l_edx = *_rp_g_edx, _l_esp = *_rp_g_esp, _l_ebx = *_rp_g_ebx, \
++    _l_esi = *_rp_g_esi, _l_edi = *_rp_g_edi))
++
  /* ================================================================
   * MMX register file
   *
+diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
+index 4174bca..109f9f2 100644
+--- a/tools/recomp/lifter.py
++++ b/tools/recomp/lifter.py
+@@ -2639,16 +2639,24 @@ class Lifter:
+             # Both keep the guest call as a fallback: a buffer armed by a
+             # setjmp that was reached some other way has no native counterpart,
+             # and the old behaviour is still better than ignoring the jump.
++            #
++            # With the registers in locals (RECOMP_LOCAL_REGS), a longjmp back
++            # here brings the registers in the per-thread copies, so the
++            # resumed side reads them again; the guest calls write them back.
+             if insn.call_target == self.SETJMP_FN:
+                 lines.append(
+                     "{ int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp)));"
+-                    " if (_sjv) { ebp = g_seh_ebp; eax = (uint32_t)_sjv; }"
+-                    f" else {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }} }}"
++                    " if (_sjv) { RECOMP_RELOAD(); ebp = g_seh_ebp;"
++                    " eax = (uint32_t)_sjv; }"
++                    f" else {{ PUSH32(esp, 0x{ret_va:08X}u); RECOMP_SPILL();"
++                    f" {name}(); RECOMP_RELOAD(); }} }}"
+                     f" /* setjmp 0x{insn.call_target:08X} */")
+             elif insn.call_target == self.LONGJMP_FN:
+                 lines.append(
++                    "RECOMP_SPILL(); "
+                     "if (!recomp_guest_longjmp(MEM32(esp), MEM32(esp + 4)))"
+-                    f" {{ PUSH32(esp, 0x{ret_va:08X}u); {name}(); }}"
++                    f" {{ PUSH32(esp, 0x{ret_va:08X}u); RECOMP_SPILL();"
++                    f" {name}(); RECOMP_RELOAD(); }}"
+                     f" /* longjmp 0x{insn.call_target:08X} */")
+             elif insn.call_target in self.manual_functions:
+                 # A function the project replaces by hand. recomp_lookup_manual
+diff --git a/tools/recomp/test_function_coalescence.py b/tools/recomp/test_function_coalescence.py
+index 1a56995..4d172dd 100644
+--- a/tools/recomp/test_function_coalescence.py
++++ b/tools/recomp/test_function_coalescence.py
+@@ -430,7 +430,7 @@ def test_targeted_int3_traps_but_int2d_path_bypasses_it():
+     before_int3, after_int3 = code.split(f"loc_{int3:08X}:", 1)
+     int3_body, _ = after_int3.split(f"loc_{continuation:08X}:", 1)
+     assert f"goto loc_{continuation:08X}; /* int 0x2d skips slide int3 */" in before_int3
+-    assert "return; /* trap ends recovered control flow */" in int3_body
++    assert "{ RECOMP_SPILL(); return; } /* trap ends recovered control flow */" in int3_body
+ 
+ 
+ def test_computed_entry_into_int3_traps_but_int2d_path_bypasses_it():
+@@ -447,7 +447,7 @@ def test_computed_entry_into_int3_traps_but_int2d_path_bypasses_it():
+     before_int3, after_int3 = code.split(f"loc_{int3:08X}:", 1)
+     int3_body, _ = after_int3.split(f"loc_{continuation:08X}:", 1)
+     assert f"goto loc_{continuation:08X}; /* int 0x2d skips slide int3 */" in before_int3
+-    assert "return; /* trap ends recovered control flow */" in int3_body
++    assert "{ RECOMP_SPILL(); return; } /* trap ends recovered control flow */" in int3_body
+ 
+ 
+ def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
+diff --git a/tools/recomp/test_register_locals.py b/tools/recomp/test_register_locals.py
+new file mode 100644
+index 0000000..8bed733
+--- /dev/null
++++ b/tools/recomp/test_register_locals.py
+@@ -0,0 +1,54 @@
++"""Guest registers as function locals (translator.register_locals)."""
++
++from tools.recomp.translator import register_locals
++
++
++def _function(body):
++    return ["/**", " * sub_00010000", " */", "void sub_00010000(void)", "{",
++            "    const uintptr_t _recomp_mb = (uintptr_t)g_xbox_mem_offset; (void)_recomp_mb;",
++            "    RECOMP_STATE_PTRS"] + body + ["}", ""]
++
++
++def _text(body):
++    return "\n".join(register_locals(_function(body), "sub_00010000"))
++
++
++def test_written_registers_are_spilled_and_the_rest_are_read_only():
++    code = _text(["    eax = MEM32(ecx + 4);", "    PUSH32(esp, ebx);",
++                  "    POP32(esp, esi);", "    esp += 4; return;"])
++    assert "#define RECOMP_SPILL() ((void)(*_rp_g_eax = _l_eax, *_rp_g_esp = _l_esp, "\
++        "*_rp_g_esi = _l_esi))" in code
++    for reg in ("ecx", "edx", "ebx", "edi"):
++        assert f"#define g_{reg} RECOMP_READ_ONLY(_l_{reg})" in code
++    assert "#define g_eax _l_eax" in code
++
++
++def test_locals_load_at_entry_and_the_mapping_ends_with_the_function():
++    lines = register_locals(_function(["    eax = 1; return;"]), "sub_00010000")
++    code = "\n".join(lines)
++    assert "    RECOMP_STATE_PTRS\n    RECOMP_LOCAL_REGS\n" in code
++    # The header comment stays first; the mapping sits between it and the
++    # signature, and is undone after the closing brace.
++    assert lines[0] == "/**"
++    assert code.index("#define g_eax") < code.index("void sub_00010000(void)")
++    assert code.index("\n}\n") < code.index("#undef g_eax")
++    assert code.rstrip().endswith("#define RECOMP_RELOAD() ((void)0)")
++
++
++def test_returns_spill_and_tail_calls_spill_before_the_callee():
++    code = _text(["    if (eax) { g_seh_ebp = ebp; sub_00020000(); return; }",
++                  "    esp += 4; return; /* ret */"])
++    assert "g_seh_ebp = ebp; RECOMP_SPILL(); sub_00020000(); return; }" in code
++    assert "esp += 4; { RECOMP_SPILL(); return; } /* ret */" in code
++    # Falling off the end writes back too.
++    assert "    RECOMP_SPILL();\n}" in code
++
++
++def test_indirect_calls_write_eax_and_esp():
++    code = _text(["    RECOMP_ICALL_SAFE_AT(MEM32(ecx), _icall_esp, 0x10000u);"])
++    assert "#define g_eax _l_eax" in code and "#define g_esp _l_esp" in code
++
++
++def test_a_function_that_calls_setjmp_keeps_its_registers_volatile():
++    code = _text(["    { int _sjv = setjmp(*recomp_setjmp_slot(MEM32(esp))); }"])
++    assert "RECOMP_LOCAL_REGS_VOLATILE" in code
+diff --git a/tools/recomp/test_section_readable_end.py b/tools/recomp/test_section_readable_end.py
+index b21b075..5124070 100644
+--- a/tools/recomp/test_section_readable_end.py
++++ b/tools/recomp/test_section_readable_end.py
+@@ -84,7 +84,7 @@ def test_body_past_the_readable_end_is_refused(capsys):
+ def test_ret_in_the_fill_lifts_with_its_zero_byte():
+     t = translator(splits=[])
+     code = t.translate_function(BASE, t.func_db[BASE])
+-    assert "esp += 8; return; /* ret 4 */" in code
++    assert "esp += 8; { RECOMP_SPILL(); return; } /* ret 4 */" in code
+ 
+ 
+ def test_coalesce_end_in_the_fill_is_accepted():
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 21600d3..5522b93 100644
+index 21600d3..69babc0 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -514,6 +514,28 @@ def _mark_back_edges(bb, stmts):
+@@ -514,6 +514,111 @@ def _mark_back_edges(bb, stmts):
      return stmts if out is None else out
  
  
@@ -2405,20 +2603,103 @@ index 21600d3..5522b93 100644
 +    "#undef XBOX_PTR",
 +    "#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + _recomp_mb)",
 +] + [
-+    # The guest state through the addresses each function takes once
-+    # (RECOMP_STATE_PTRS in recomp_types.h); the register names already map
-+    # onto these g_ names.
++    # The rest of the guest state through the addresses each function takes
++    # once (RECOMP_STATE_PTRS in recomp_types.h). The integer registers are
++    # each function's own locals (register_locals).
 +    f"#define {name} (*_rp_{name})" for name in (
-+        "g_eax", "g_ecx", "g_edx", "g_esp", "g_ebx", "g_esi", "g_edi",
 +        "g_ebp", "g_seh_ebp", "g_eflags", "g_df", "g_fp_top", "g_fp_cmp",
 +        "g_fp_cc", "g_fp_control_word", "g_mxcsr")
 +] + ["#define g_fp_stack _rp_g_fp_stack"]
 +
 +
++# Guest integer registers as C locals of each generated function
++# (RECOMP_LOCAL_REGS in recomp_types.h). RECOMP_REGISTER_LOCALS=0 in the
++# environment of a regenerate keeps them in the per-thread copies.
++REGISTER_LOCALS = os.environ.get("RECOMP_REGISTER_LOCALS", "1") != "0"
++LOCAL_REGS = ("eax", "ecx", "edx", "esp", "ebx", "esi", "edi")
++
++# A call with no arguments straight before a return is a tail call, and the
++# callee reads the registers: they go back before it, not after.
++_TAIL_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\(\); return;")
++_RETURN_RE = re.compile(r"(?<![\w@])return;")
++# Any other call with no arguments that is not a known helper: these see the
++# per-thread registers, so they are reported (RECOMP_LOCAL_REGS warns).
++_BARE_CALL_RE = re.compile(r"(?<![\w.>])((?:sub|loc|str|xbe)_\w*)\(\);")
++# Macros that write a register given as their first argument, or as the
++# destination of a pop.
++_WRITING_MACROS = r"(?:PUSH32|POP32|PUSH16|POP16|SET_\w+)"
++
++
++def _register_writes(body):
++    """The registers a function's C text can change. Over-reporting costs
++    a store per call; missing one loses the write, which a build with
++    RECOMP_VERIFY_REG_WRITES catches (the others are rvalues there)."""
++    written = set()
++    for r in LOCAL_REGS:
++        n = rf"(?:g_)?{r}"
++        pats = (rf"\b{n}\s*(?:[-+*/%&|^]|<<|>>)?=(?!=)",
++                rf"\b{n}\s*(?:\+\+|--)", rf"(?:\+\+|--)\s*{n}\b",
++                rf"&\s*{n}\b", rf"\b{_WRITING_MACROS}\(\s*{n}\b",
++                rf"\bPOP(?:32|16)\([^;]*?,\s*{n}\s*\)")
++        if any(re.search(pat, body) for pat in pats):
++            written.add(r)
++    # The indirect-call macros set eax and esp themselves when the target is
++    # not code.
++    if re.search(r"\bRECOMP_I(?:CALL|TAIL)", body):
++        written |= {"eax", "esp"}
++    return written
++
++
++def register_locals(lines, name):
++    """A translated function (its lines, from the header comment to the
++    closing brace) with the integer registers as locals: mapped onto them for
++    this function only, written back before tail calls and returns, and
++    RECOMP_SPILL defined for the registers it can change."""
++    text = "\n".join(lines)
++    open_at = text.index("\n{\n") + 3
++    head, body = text[:open_at], text[open_at:]
++    body = body.replace("    RECOMP_STATE_PTRS\n",
++                        "    RECOMP_STATE_PTRS\n    RECOMP_LOCAL_REGS%s\n"
++                        % ("_VOLATILE" if "setjmp(" in body else ""), 1)
++    body = _TAIL_CALL_RE.sub(r"RECOMP_SPILL(); \1(); @RETURN@", body)
++    body = _RETURN_RE.sub("{ RECOMP_SPILL(); return; }", body)
++    body = body.replace("@RETURN@", "return;")
++    # Falling off the end is a return too.
++    close_at = body.rindex("\n}")
++    body = body[:close_at] + "\n    RECOMP_SPILL();" + body[close_at:]
++    for m in _BARE_CALL_RE.finditer(body):
++        before = body[max(0, m.start() - 20):m.start()]
++        if "RECOMP_SPILL(); " not in before and "_enter" not in m.group(1):
++            print(f"  warning: {name} calls {m.group(1)} with its registers "
++                  "in locals", file=sys.stderr)
++    written = _register_writes(body)
++    pre = []
++    for r in LOCAL_REGS:
++        target = f"_l_{r}" if r in written else f"RECOMP_READ_ONLY(_l_{r})"
++        pre.append(f"#define g_{r} {target}")
++    spill = ", ".join(f"*_rp_g_{r} = _l_{r}" for r in LOCAL_REGS if r in written)
++    pre += ["#undef RECOMP_SPILL",
++            f"#define RECOMP_SPILL() ((void)({spill or 0}))",
++            "#undef RECOMP_RELOAD",
++            "#define RECOMP_RELOAD() RECOMP_RELOAD_LOCALS()"]
++    post = [f"#undef g_{r}" for r in LOCAL_REGS]
++    post += ["#undef RECOMP_SPILL", "#define RECOMP_SPILL() ((void)0)",
++             "#undef RECOMP_RELOAD", "#define RECOMP_RELOAD() ((void)0)"]
++    out = (head + body).split("\n")
++    # Keep the header comment first; the mapping goes right before the
++    # signature.
++    sig = next(i for i, l in enumerate(out)
++               if not l.startswith((" ", "/", "#")) and f" {name}(" in l)
++    trail = len(out)
++    while trail and out[trail - 1] == "":
++        trail -= 1
++    return out[:sig] + pre + out[sig:trail] + post + out[trail:]
++
++
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -3062,6 +3084,13 @@ class FunctionTranslator:
+@@ -3062,9 +3167,16 @@ class FunctionTranslator:
          # Function signature
          lines.append(f"{ret_type} {name}({param_str})")
          lines.append(f"{{")
@@ -2431,8 +2712,12 @@ index 21600d3..5522b93 100644
 +        lines.append("    RECOMP_STATE_PTRS")
          if func_addr in ENTRY_HOOKS:
              lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
-             lines.append(f"    sub_{func_addr:08X}_enter();")
-@@ -3501,6 +3530,20 @@ class FunctionTranslator:
+-            lines.append(f"    sub_{func_addr:08X}_enter();")
++            lines.append(f"    sub_{func_addr:08X}_enter(); RECOMP_RELOAD();")
+ 
+         # Optional entry trace. Bring-up is mostly "which of these ten init
+         # calls does it not come back from", and answering that by overriding
+@@ -3501,6 +3613,23 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -2442,6 +2727,9 @@ index 21600d3..5522b93 100644
 +        # The very largest then take most of an hour each to compile (a
 +        # 26,666-instruction one held its file for 62 minutes) and are left
 +        # as they were: unoptimized, but in seconds.
++        if REGISTER_LOCALS:
++            lines = register_locals(lines, name)
++
 +        if len(instructions) > UNOPTIMIZED_INSNS:
 +            lines[:0] = ["#if defined(_MSC_VER) && !defined(__clang__)",
 +                         '#pragma optimize("", off)  /* too large to optimize in reasonable time */',
@@ -2453,7 +2741,7 @@ index 21600d3..5522b93 100644
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3922,6 +3965,11 @@ class BatchTranslator:
+@@ -3922,6 +4051,11 @@ class BatchTranslator:
              "",
              '#include "recomp_types.h"',
              "",
@@ -2465,7 +2753,7 @@ index 21600d3..5522b93 100644
          ]
          for addr, name, _ in translations:
              decl = self._make_declaration(addr, name)
-@@ -4028,7 +4076,7 @@ class BatchTranslator:
+@@ -4028,7 +4162,7 @@ class BatchTranslator:
                  f'#include "{header_name}"',
                  '#include <math.h>',
                  "",
