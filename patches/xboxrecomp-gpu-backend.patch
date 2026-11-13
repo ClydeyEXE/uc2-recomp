@@ -2331,11 +2331,65 @@ index a5b912c..7327b25 100644
  
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
+diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
+index 47491e5..17ba0bb 100644
+--- a/templates/runtime/recomp_types.h
++++ b/templates/runtime/recomp_types.h
+@@ -1546,6 +1546,49 @@ void xbox_GuestCpuPreempt(uint32_t va);
+ #define esi g_esi
+ #define edi g_edi
+ 
++/* The guest state's addresses, taken once per function (RECOMP_STATE_PTRS).
++ *
++ * Each access to a per-thread variable costs a lookup of this thread's TLS
++ * block, and the compiler repeats that lookup after every guest store, since a
++ * store through a guest pointer might, as far as it can tell, have changed the
++ * block pointer's slot. Generated functions take these addresses once at entry
++ * and the chunk files map the state's names onto them (MEMORY_BASE_LOCAL in
++ * translator.py), so an access is one load or store through a pointer the
++ * compiler keeps in a register. */
++#define RECOMP_STATE_ADDR(T, name) \
++    static __forceinline T *recomp_addr_##name(void) { return &name; }
++RECOMP_STATE_ADDR(uint32_t, g_eax)
++RECOMP_STATE_ADDR(uint32_t, g_ecx)
++RECOMP_STATE_ADDR(uint32_t, g_edx)
++RECOMP_STATE_ADDR(uint32_t, g_esp)
++RECOMP_STATE_ADDR(uint32_t, g_ebx)
++RECOMP_STATE_ADDR(uint32_t, g_esi)
++RECOMP_STATE_ADDR(uint32_t, g_edi)
++RECOMP_STATE_ADDR(uint32_t, g_ebp)
++RECOMP_STATE_ADDR(uint32_t, g_seh_ebp)
++RECOMP_STATE_ADDR(uint32_t, g_eflags)
++RECOMP_STATE_ADDR(int, g_df)
++RECOMP_STATE_ADDR(int, g_fp_top)
++RECOMP_STATE_ADDR(int, g_fp_cmp)
++RECOMP_STATE_ADDR(uint16_t, g_fp_cc)
++RECOMP_STATE_ADDR(uint16_t, g_fp_control_word)
++RECOMP_STATE_ADDR(uint32_t, g_mxcsr)
++static __forceinline double *recomp_addr_g_fp_stack(void) { return g_fp_stack; }
++#undef RECOMP_STATE_ADDR
++
++#define RECOMP_STATE_PTR(T, name) \
++    T *const _rp_##name = recomp_addr_##name(); (void)_rp_##name;
++#define RECOMP_STATE_PTRS \
++    RECOMP_STATE_PTR(uint32_t, g_eax) RECOMP_STATE_PTR(uint32_t, g_ecx) \
++    RECOMP_STATE_PTR(uint32_t, g_edx) RECOMP_STATE_PTR(uint32_t, g_esp) \
++    RECOMP_STATE_PTR(uint32_t, g_ebx) RECOMP_STATE_PTR(uint32_t, g_esi) \
++    RECOMP_STATE_PTR(uint32_t, g_edi) RECOMP_STATE_PTR(uint32_t, g_ebp) \
++    RECOMP_STATE_PTR(uint32_t, g_seh_ebp) RECOMP_STATE_PTR(uint32_t, g_eflags) \
++    RECOMP_STATE_PTR(int, g_df) RECOMP_STATE_PTR(int, g_fp_top) \
++    RECOMP_STATE_PTR(int, g_fp_cmp) RECOMP_STATE_PTR(uint16_t, g_fp_cc) \
++    RECOMP_STATE_PTR(uint16_t, g_fp_control_word) \
++    RECOMP_STATE_PTR(uint32_t, g_mxcsr) RECOMP_STATE_PTR(double, g_fp_stack)
++
+ /* ================================================================
+  * MMX register file
+  *
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 21600d3..0dbacde 100644
+index 21600d3..5522b93 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -514,6 +514,20 @@ def _mark_back_edges(bb, stmts):
+@@ -514,6 +514,28 @@ def _mark_back_edges(bb, stmts):
      return stmts if out is None else out
  
  
@@ -2350,13 +2404,21 @@ index 21600d3..0dbacde 100644
 +MEMORY_BASE_LOCAL = [
 +    "#undef XBOX_PTR",
 +    "#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + _recomp_mb)",
-+]
++] + [
++    # The guest state through the addresses each function takes once
++    # (RECOMP_STATE_PTRS in recomp_types.h); the register names already map
++    # onto these g_ names.
++    f"#define {name} (*_rp_{name})" for name in (
++        "g_eax", "g_ecx", "g_edx", "g_esp", "g_ebx", "g_esi", "g_edi",
++        "g_ebp", "g_seh_ebp", "g_eflags", "g_df", "g_fp_top", "g_fp_cmp",
++        "g_fp_cc", "g_fp_control_word", "g_mxcsr")
++] + ["#define g_fp_stack _rp_g_fp_stack"]
 +
 +
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -3062,6 +3076,12 @@ class FunctionTranslator:
+@@ -3062,6 +3084,13 @@ class FunctionTranslator:
          # Function signature
          lines.append(f"{ret_type} {name}({param_str})")
          lines.append(f"{{")
@@ -2366,10 +2428,11 @@ index 21600d3..0dbacde 100644
 +        # have changed it, which was one load per memory access. Nothing
 +        # changes it once guest code runs.
 +        lines.append("    const uintptr_t _recomp_mb = (uintptr_t)g_xbox_mem_offset; (void)_recomp_mb;")
++        lines.append("    RECOMP_STATE_PTRS")
          if func_addr in ENTRY_HOOKS:
              lines.append(f"    extern void sub_{func_addr:08X}_enter(void);")
              lines.append(f"    sub_{func_addr:08X}_enter();")
-@@ -3501,6 +3521,20 @@ class FunctionTranslator:
+@@ -3501,6 +3530,20 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -2390,7 +2453,7 @@ index 21600d3..0dbacde 100644
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3922,6 +3956,11 @@ class BatchTranslator:
+@@ -3922,6 +3965,11 @@ class BatchTranslator:
              "",
              '#include "recomp_types.h"',
              "",
@@ -2402,7 +2465,7 @@ index 21600d3..0dbacde 100644
          ]
          for addr, name, _ in translations:
              decl = self._make_declaration(addr, name)
-@@ -4028,7 +4067,7 @@ class BatchTranslator:
+@@ -4028,7 +4076,7 @@ class BatchTranslator:
                  f'#include "{header_name}"',
                  '#include <math.h>',
                  "",
