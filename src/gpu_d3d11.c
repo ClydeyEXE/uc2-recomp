@@ -3984,18 +3984,40 @@ static void ui_draw(float x0, float y0)
  * millisecond is spun. Holding the walker holds the game, which waits on its
  * flips. A late frame starts a new schedule rather than letting the next ones
  * hurry to catch up. Returns the ms spent waiting. */
+/* The highest rate frames are drawn at whatever the limit says, vsync off: the
+ * main loop passes the engine the real frame delta but never less than 0.0005 s
+ * (docs/HISTORY.md, item 21), so past 2,000 fps game time outruns real time, and
+ * menus (about 1,000 fps) and cutscenes (a few thousand) came near or past it.
+ * RECOMP_FPS_CEILING=<fps> changes it, 0 for none. */
+#define FPS_CEILING 800
+
+static int fps_ceiling(void)
+{
+    static int ceiling = -1;
+    if (ceiling < 0) {
+        ceiling = FPS_CEILING;
+        env_int("RECOMP_FPS_CEILING", &ceiling);
+        if (ceiling < 0)
+            ceiling = 0;
+    }
+    return ceiling;
+}
+
 static double limit_wait(void)
 {
     static HANDLE timer;
     static int tried;
     static LONGLONG next;
     LONGLONG now = ft_qpc(), start = now, period;
+    int limit = s_cfg.limit, ceiling = s_cfg.vsync ? 0 : fps_ceiling();
 
-    if (!s_cfg.limit || !s_ft.qms) {
+    if (ceiling && (!limit || limit > ceiling))
+        limit = ceiling;
+    if (!limit || !s_ft.qms) {
         next = 0;
         return 0.0;
     }
-    period = (LONGLONG)(s_ft.qms * 1000.0 / s_cfg.limit);
+    period = (LONGLONG)(s_ft.qms * 1000.0 / limit);
     if (!tried) {
         tried = 1;
         timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,

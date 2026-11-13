@@ -54,7 +54,7 @@ or removing a hand-written function in `src/recomp_manual.c`.
 `Play.cmd` (`tools/play.ps1`) sets everything, and logs to `play_log.txt`. Its options: `-Software` for the old CPU
 rasteriser, `-Limit60` for flip pacing, `-Scale N` and `-Fps N` for this run only, and `-DrawLog` (see
 `docs/DEVELOPING.md`). For one run, `RECOMP_RES_SCALE`, `RECOMP_RES_HEIGHT=<lines>`, `RECOMP_WIDESCREEN=1`,
-`RECOMP_WIDE_VIEW=1` (with it, 16:9 widescreen), `RECOMP_FPS_LIMIT`, `RECOMP_PRESENT_VSYNC`,
+`RECOMP_WIDE_VIEW=1` (with it, 16:9 widescreen), `RECOMP_FPS_LIMIT`, `RECOMP_FPS_CEILING`, `RECOMP_PRESENT_VSYNC`,
 `RECOMP_PRESENT_FILTER=point`, `RECOMP_ANISOTROPY=<1-16>` and `RECOMP_SKIP_BOOT_WAITS=1` override the settings panel's file, `%LOCALAPPDATA%\xboxrecomp\ucc2_video.ini`.
 
 With vsync off the swap chain may tear (`DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`, where Windows supports it), so a window
@@ -62,6 +62,11 @@ is not held to the display's refresh rate and a VRR display follows the game. Th
 says whether it is on, and gives the display's refresh rate, from which the panel offers a frame limit just under it
 (about 3% under: 160 at 165 Hz, 140 at 144 Hz). `RECOMP_PRESENT_TEARING=0` turns tearing off, which holds a
 window to the refresh rate as before.
+
+With vsync off, frames are held to at most 800 a second even with the frame limit off, or set higher: the game
+passes the engine the real frame delta but never less than 0.0005 s (`docs/HISTORY.md`, item 21), so past 2,000 fps
+game time would run faster than real time, and menus and cutscenes otherwise reach 1,000 fps and more.
+`RECOMP_FPS_CEILING=<fps>` changes the ceiling for one run, and 0 removes it.
 
 The first line of the log is the version: `git describe` at build time, with `-modified` if tracked files had changes,
 or for a source zip, `tools/version.txt`, which git fills in as it makes the zip.
