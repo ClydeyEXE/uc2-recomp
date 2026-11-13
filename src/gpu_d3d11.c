@@ -96,6 +96,17 @@ static const char s_hlsl[] =
 "  uint4  cube;\n"
 "  uint4  flags;\n"          /* x: combiners programmed, y: stage 0 usable, z: dot mapping, w: stage inputs */
 "};\n"
+/* The combiner setup is read through these: the constant buffer here, and
+ * literals in a shader made for one setup (psh_for), where the compiler then
+ * folds the branches, unrolls the stages and keeps R[] in registers. */
+"#ifndef K_SPECIAL\n"
+"#define K_FIN fin\n"
+"#define K_COL(s) col[s]\n"
+"#define K_MISC misc\n"
+"#define K_FLAGS flags\n"
+"#define K_CUBE cube\n"
+"#define K_LOOP\n"
+"#endif\n"
 "Texture2D t0_ : register(t0); Texture2D t1_ : register(t1);\n"
 "Texture2D t2_ : register(t2); Texture2D t3_ : register(t3);\n"
 "TextureCube c0_ : register(t4); TextureCube c1_ : register(t5);\n"
@@ -115,7 +126,7 @@ static const char s_hlsl[] =
 "  return o;\n"
 "}\n"
 "float4 fetch(uint st, Texture2D tx, TextureCube cx, SamplerState s, float4 c) {\n"
-"  uint mode = (fin.w >> (st * 5)) & 31;\n"
+"  uint mode = (K_FIN.w >> (st * 5)) & 31;\n"
 "  float q = c.w != 0 ? c.w : 1;\n"
 "  float2 uv = c.xy / q * ts[st].xy, dx = ddx(uv), dy = ddy(uv);\n"
 "  float3 dxd = ddx(c.xyz), dyd = ddy(c.xyz);\n"
@@ -125,13 +136,13 @@ static const char s_hlsl[] =
 "    return ts[st].z != 0 ? float4(v.bbb, 1) : v;\n"   /* an 8-bit target: see d3d11_draw */
 "  }\n"
 "  if (mode == 3) {\n"
-"    if (cube[st]) return cx.SampleGrad(s, c.xyz, dxd, dyd);\n"
+"    if (K_CUBE[st]) return cx.SampleGrad(s, c.xyz, dxd, dyd);\n"
 "    return tx.SampleGrad(s, c.xy * ts[st].xy, ddx(c.xy * ts[st].xy), ddy(c.xy * ts[st].xy));\n"
 "  }\n"
 "  if (mode == 4) return saturate(c);\n"
 "  if (mode == 5) {\n"
 "    for (uint j = 0; j < 4; j++) {\n"
-"      uint ge = (misc.w >> (st * 4 + j)) & 1;\n"
+"      uint ge = (K_MISC.w >> (st * 4 + j)) & 1;\n"
 "      if (ge ? c[j] >= 0 : c[j] < 0) discard;\n"
 "    }\n"
 "    return float4(0, 0, 0, 0);\n"
@@ -180,13 +191,13 @@ static const char s_hlsl[] =
 "float3 rgb(uint b) { b &= 0xFF; float4 r = R[b & 15]; return mi3((b & 0x10) ? r.aaa : r.rgb, b); }\n"
 "float alp(uint b) { b &= 0xFF; float4 r = R[b & 15]; return mi((b & 0x10) ? r.a : r.b, b); }\n"
 "float4 combine(float4 v0, float4 v1, float fog, float4 t0, float4 t1, float4 t2, float4 t3) {\n"
-"  uint n = min(fin.z & 0xFF, 8), fl = fin.z >> 8, s, i;\n"
+"  uint n = min(K_FIN.z & 0xFF, 8), fl = K_FIN.z >> 8, s, i;\n"
 "  for (i = 0; i < 16; i++) R[i] = float4(0, 0, 0, 0);\n"
 "  R[3] = float4(fogc.rgb, fog); R[4] = v0; R[5] = v1;\n"
 "  R[8] = t0; R[9] = t1; R[10] = t2; R[11] = t3;\n"
-"  R[12].a = (fin.w & 31) ? t0.a : 1;\n"
-"  for (s = 0; s < n; s++) {\n"
-"    uint icw = col[s].x, ocw = col[s].y, aicw = col[s].z, aocw = col[s].w;\n"
+"  R[12].a = (K_FIN.w & 31) ? t0.a : 1;\n"
+"  K_LOOP for (s = 0; s < n; s++) {\n"
+"    uint icw = K_COL(s).x, ocw = K_COL(s).y, aicw = K_COL(s).z, aocw = K_COL(s).w;\n"
 "    uint f = ocw >> 12, af = aocw >> 12, mux;\n"
 "    float3 A, B, C, D, pab, pcd, sum, ab, cd, ms;\n"
 "    float aA, aB, aC, aD, ap, aq, as_;\n"
@@ -214,8 +225,8 @@ static const char s_hlsl[] =
 "    { uint d = (aocw >> 8) & 15; if (d) R[d].a = as_; }\n"
 "    R[0] = float4(0, 0, 0, 0);\n"
 "  }\n"
-"  if (fin.x || fin.y) {\n"
-"    uint f0w = fin.x, f1w = fin.y, ff = f1w & 0xFF;\n"
+"  if (K_FIN.x || K_FIN.y) {\n"
+"    uint f0w = K_FIN.x, f1w = K_FIN.y, ff = f1w & 0xFF;\n"
 "    float3 A, B, C, D, E, F;\n"
 "    R[1] = fc0; R[2] = fc1;\n"
 "    {\n"
@@ -235,27 +246,27 @@ static const char s_hlsl[] =
  * UC2's heat haze and its colour grading both read the scene this way. */
 "float3 dotmap(float3 x, uint m) { return m >= 1 && m <= 3 ? x * 2 - 1 : x; }\n"
 "float dot_stage(uint st, float4 c, float4 t0, float4 t1, float4 t2) {\n"
-"  uint from = (flags.w >> (16 + (st - 1) * 4)) & 15;\n"
+"  uint from = (K_FLAGS.w >> (16 + (st - 1) * 4)) & 15;\n"
 "  float3 v = from == 2 ? t2.rgb : from == 1 ? t1.rgb : t0.rgb;\n"
-"  return dot(c.xyz, dotmap(v, (flags.z >> ((st - 1) * 4)) & 15));\n"
+"  return dot(c.xyz, dotmap(v, (K_FLAGS.z >> ((st - 1) * 4)) & 15));\n"
 "}\n"
 "float4 ps(VO i) : SV_Target {\n"
 "  float4 t0 = fetch(0, t0_, c0_, s0_, i.t0), t1 = fetch(1, t1_, c1_, s1_, i.t1);\n"
 "  float4 t2 = fetch(2, t2_, c2_, s2_, i.t2), t3 = fetch(3, t3_, c3_, s3_, i.t3);\n"
 "  float4 c;\n"
-"  if (((fin.w >> 5) & 31) == 0x11 && ((fin.w >> 10) & 31) == 9) {\n"
+"  if (((K_FIN.w >> 5) & 31) == 0x11 && ((K_FIN.w >> 10) & 31) == 9) {\n"
 "    float2 uv = float2(dot_stage(1, i.t1, t0, t1, t2), dot_stage(2, i.t2, t0, t1, t2)) * ts[2].xy;\n"
 "    t2 = t2_.SampleGrad(s2_, uv, ddx(uv), ddy(uv));\n"
 "  }\n"
-"  if (flags.x) {\n"
+"  if (K_FLAGS.x) {\n"
 "    c = combine(i.d0, i.d1, saturate(i.fog), t0, t1, t2, t3);\n"   /* arrives unclamped */
 "  } else {\n"
 "    c = i.d0;\n"
-"    if (flags.y) c *= t0_.Sample(s0_, i.t0.xy / (i.t0.w != 0 ? i.t0.w : 1) * ts[0].xy);\n"
+"    if (K_FLAGS.y) c *= t0_.Sample(s0_, i.t0.xy / (i.t0.w != 0 ? i.t0.w : 1) * ts[0].xy);\n"
 "  }\n"
-"  if (misc.x) {\n"
+"  if (K_MISC.x) {\n"
 "    int v = (int)(saturate(c.a) * 255 + 0.5), r = (int)(misc.z & 0xFF); bool ok = true;\n"
-"    switch (misc.y) {\n"
+"    switch (K_MISC.y) {\n"
 "    case 0x200: ok = false; break;\n"
 "    case 0x201: ok = v < r; break;\n"
 "    case 0x202: ok = v == r; break;\n"
@@ -1863,9 +1874,18 @@ typedef struct {
     volatile LONG state;                   /* 0 free, 1 ready, 2 failed, 3 compiling */
 } ProgShader;
 
+/* A pixel shader made for one combiner setup (psh_for). */
+typedef struct {
+    uint64_t key;
+    ID3D11PixelShader *volatile ps;
+    volatile LONG state;                   /* 0 free, 1 ready, 2 failed, 3 compiling */
+} PsShader;
+static void psh_compile(PsShader *e, const char *src, size_t len, uint64_t srchash);
+
 typedef struct ProgJob {
     struct ProgJob *next;
     ProgShader *e;
+    PsShader *pe;                          /* or this: a pixel shader */
     char *src;
     size_t len;
     uint64_t srchash;
@@ -1878,6 +1898,7 @@ static HANDLE s_job_event;
 static ProgJob *s_job_head, *s_job_tail;
 static int s_job_mode = -1;                /* 0 sync, 1 a compile thread */
 static char s_vsh_dir[MAX_PATH];           /* "": no disk cache */
+static char s_psh_dir[MAX_PATH];           /* the same for pixel shaders */
 
 /* An attribute's format as its fetch is written: kind, and for an array the
  * type, size and whether every element is 4-byte aligned. Ranges start 4-byte
@@ -2077,7 +2098,10 @@ static DWORD WINAPI prog_compiler(LPVOID unused)
             LeaveCriticalSection(&s_job_lock);
             if (!j)
                 break;
-            prog_compile(j->e, j->src, j->len, j->srchash);
+            if (j->pe)
+                psh_compile(j->pe, j->src, j->len, j->srchash);
+            else
+                prog_compile(j->e, j->src, j->len, j->srchash);
             free(j->src);
             free(j);
         }
@@ -2109,6 +2133,9 @@ static void prog_cache_init(void)
         snprintf(s_vsh_dir, sizeof s_vsh_dir, "%s\\xboxrecomp\\vsh", base);
         if (!CreateDirectoryA(s_vsh_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
             s_vsh_dir[0] = 0;
+        snprintf(s_psh_dir, sizeof s_psh_dir, "%s\\xboxrecomp\\psh", base);
+        if (!CreateDirectoryA(s_psh_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS)
+            s_psh_dir[0] = 0;
     }
 }
 
@@ -2202,6 +2229,7 @@ static ID3D11VertexShader *prog_shader(const Nv2aProgramDraw *pd)
         j->src = copy;
         j->len = t.n;
         j->srchash = srchash;
+        j->pe = NULL;
         EnterCriticalSection(&s_job_lock);
         if (s_job_tail)
             s_job_tail->next = j;
@@ -2212,6 +2240,282 @@ static ID3D11VertexShader *prog_shader(const Nv2aProgramDraw *pd)
         SetEvent(s_job_event);
     }
     return NULL;
+}
+
+/* ---- Pixel shaders per combiner setup ---------------------------------------
+ * The general pixel shader reads the register-combiner setup from constants and
+ * works it out for every pixel: a loop over up to 8 stages, registers in an array
+ * indexed by values known only at run time, and a chain of tests for each input
+ * mapping. At scale 3 that was most of the GPU's frame (2.5 of 3.2 ms in the
+ * corridor). A setup is the words that say what the combiners do: the stage
+ * count and each stage's input, output and mapping words, the final combiner,
+ * the texture stages' modes, the dot mapping, the alpha test and which stages
+ * sample cube maps. psh_for compiles the same source with those words as
+ * literals (K_SPECIAL), so the compiler folds the tests, unrolls the stages and
+ * keeps the registers in registers; colours, factors, the alpha reference and
+ * texture scales stay in the constant buffer. It is the same arithmetic, so the
+ * pixels are the general shader's.
+ *
+ * Compiled on the vertex programs' thread, kept in %LOCALAPPDATA%\xboxrecomp\psh
+ * named by a hash of the source, and drawn with the general shader until ready.
+ * RECOMP_GPU_PS_SPECIAL=0 keeps the general shader for every draw;
+ * RECOMP_GPU_PS_FLIP=<ms> alternates the two on the GetTickCount64 clock (the
+ * general one while the count of periods is odd), for comparing frames.
+ * RECOMP_GPU_VSH_SYNC=1 and RECOMP_GPU_VSH_CACHE=0 apply here too. */
+#define PS_SHADERS 4096                    /* a power of two */
+static PsShader s_psh[PS_SHADERS];
+static int s_psh_on = -1, s_psh_flip_ms;
+static struct {
+    uint32_t special, general, compiled, loaded, failed, variants;
+    double ms, max_ms;
+} s_psst;
+
+typedef struct {
+    uint32_t fin[4], col[8][4], misc[4], flags[4], cube[4];
+} PsKey;
+
+static void psh_key(const DrawConstants *c, PsKey *k)
+{
+    uint32_t n, i;
+
+    memset(k, 0, sizeof *k);
+    k->fin[3] = c->fin[3];                         /* texture modes: always read */
+    memcpy(k->flags, c->flags, sizeof k->flags);
+    memcpy(k->cube, c->cube, sizeof k->cube);
+    k->misc[0] = c->misc[0];
+    k->misc[1] = c->misc[0] ? c->misc[1] : 0;      /* the alpha function, if testing */
+    k->misc[3] = c->misc[3];                       /* clip-plane stages' comparisons */
+    if (c->flags[0]) {                             /* combiners in use */
+        k->fin[0] = c->fin[0];
+        k->fin[1] = c->fin[1];
+        k->fin[2] = c->fin[2];
+        n = c->fin[2] & 0xFF;
+        if (n > 8)
+            n = 8;
+        for (i = 0; i < n; i++)
+            memcpy(k->col[i], c->col[i], sizeof k->col[i]);
+    }
+}
+
+static void psh_compiled(PsShader *e, ID3D11PixelShader *ps, double ms, int from_disk)
+{
+    EnterCriticalSection(&s_job_lock);
+    if (ps) {
+        if (from_disk)
+            s_psst.loaded++;
+        else
+            s_psst.compiled++;
+    } else {
+        s_psst.failed++;
+    }
+    s_psst.ms += ms;
+    if (ms > s_psst.max_ms)
+        s_psst.max_ms = ms;
+    LeaveCriticalSection(&s_job_lock);
+    e->ps = ps;
+    InterlockedExchange(&e->state, ps ? 1 : 2);
+    if (!ps)
+        fprintf(stderr, "[PSH] setup %016llX did not compile: it keeps the general shader\n",
+                (unsigned long long)e->key);
+}
+
+static void psh_cache_path(char *out, size_t n, uint64_t srchash)
+{
+    snprintf(out, n, "%s\\%016llX.cso", s_psh_dir, (unsigned long long)srchash);
+}
+
+static void psh_compile(PsShader *e, const char *src, size_t len, uint64_t srchash)
+{
+    LARGE_INTEGER t0, t1, f;
+    ID3D11PixelShader *ps = NULL;
+    ID3DBlob *code;
+
+    QueryPerformanceCounter(&t0);
+    code = compile_from(src, len, "ps", "ps_5_0");
+    if (code) {
+        const void *p = ID3D10Blob_GetBufferPointer(code);
+        SIZE_T n = ID3D10Blob_GetBufferSize(code);
+        if (FAILED(ID3D11Device_CreatePixelShader(s_dev, p, n, NULL, &ps)))
+            ps = NULL;
+        if (ps && s_psh_dir[0]) {
+            char path[MAX_PATH], tmp[MAX_PATH + 16];
+            FILE *fp;
+            psh_cache_path(path, sizeof path, srchash);
+            snprintf(tmp, sizeof tmp, "%s.%lu", path, GetCurrentThreadId());
+            if ((fp = fopen(tmp, "wb")) != NULL) {
+                int ok = fwrite(p, 1, n, fp) == n;
+                ok = fclose(fp) == 0 && ok;
+                if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                    DeleteFileA(tmp);
+            }
+        }
+        ID3D10Blob_Release(code);
+    }
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&f);
+    psh_compiled(e, ps, (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)f.QuadPart, 0);
+}
+
+static void psh_words(Txt *t, const char *name, const uint32_t *w, int n)
+{
+    int i;
+    tx(t, "static const uint4 %s = uint4(", name);
+    for (i = 0; i < n; i++)
+        tx(t, "%s0x%08Xu", i ? ", " : "", w[i]);
+    tx(t, ");\n");
+}
+
+/* The draw's specialised pixel shader, or NULL for the general one: switched off,
+ * still compiling, or failed. */
+static ID3D11PixelShader *psh_for(const DrawConstants *c)
+{
+    static char *src;
+    static const size_t cap = 64 * 1024;
+    PsKey k;
+    uint64_t key, srchash;
+    uint32_t h, probe, i;
+    PsShader *e = NULL;
+    Txt t;
+
+    if (s_psh_on < 0) {
+        const char *on = getenv("RECOMP_GPU_PS_SPECIAL"), *flip = getenv("RECOMP_GPU_PS_FLIP");
+        s_psh_on = !(on && on[0] == '0');
+        s_psh_flip_ms = flip ? atoi(flip) : 0;
+    }
+    if (!s_psh_on || (s_psh_flip_ms > 0 && (GetTickCount64() / (ULONGLONG)s_psh_flip_ms) % 2)) {
+        s_psst.general++;
+        return NULL;
+    }
+    psh_key(c, &k);
+    key = fnv64((const char *)&k, sizeof k);
+    h = (uint32_t)(key ^ (key >> 32)) & (PS_SHADERS - 1);
+    for (probe = 0; probe < PS_SHADERS; probe++) {
+        PsShader *p = &s_psh[(h + probe) & (PS_SHADERS - 1)];
+        if (p->state && p->key == key) {
+            if (p->state == 1) {
+                s_psst.special++;
+                return p->ps;
+            }
+            s_psst.general++;
+            return NULL;
+        }
+        if (!p->state) {
+            e = p;
+            break;
+        }
+    }
+    s_psst.general++;
+    if (!e)
+        return NULL;                        /* full */
+    if (s_job_mode < 0)
+        prog_cache_init();
+    e->key = key;
+    e->state = 3;
+    s_psst.variants++;
+    if (!src && !(src = (char *)malloc(cap))) {
+        e->state = 2;
+        return NULL;
+    }
+    t.p = src; t.n = 0; t.cap = cap;
+    tx(&t, "#define K_SPECIAL 1\n");
+    psh_words(&t, "K_FIN", k.fin, 4);
+    tx(&t, "static const uint4 K_COLS[8] = {\n");
+    for (i = 0; i < 8; i++)
+        tx(&t, "  uint4(0x%08Xu, 0x%08Xu, 0x%08Xu, 0x%08Xu)%s\n",
+           k.col[i][0], k.col[i][1], k.col[i][2], k.col[i][3], i < 7 ? "," : "");
+    tx(&t, "};\n#define K_COL(s) K_COLS[s]\n");
+    psh_words(&t, "K_MISCK", k.misc, 4);
+    tx(&t, "#define K_MISC uint4(K_MISCK.x, K_MISCK.y, misc.z, K_MISCK.w)\n");
+    psh_words(&t, "K_FLAGS", k.flags, 4);
+    psh_words(&t, "K_CUBE", k.cube, 4);
+    tx(&t, "#define K_LOOP [unroll]\n");
+    tx(&t, "%s", s_hlsl);
+    if (t.n >= t.cap) {
+        e->state = 2;
+        return NULL;
+    }
+    srchash = fnv64(src, t.n);
+    if (getenv("RECOMP_GPU_PS_DUMP")) {
+        char name[64];
+        FILE *f;
+        snprintf(name, sizeof name, "psh_%016llX.hlsl", (unsigned long long)key);
+        if ((f = fopen(name, "wb")) != NULL) {
+            fwrite(src, 1, t.n, f);
+            fclose(f);
+        }
+    }
+    if (s_psh_dir[0]) {                     /* compiled in an earlier run */
+        char path[MAX_PATH];
+        FILE *f;
+        psh_cache_path(path, sizeof path, srchash);
+        if ((f = fopen(path, "rb")) != NULL) {
+            static uint8_t buf[256 * 1024];
+            size_t n = fread(buf, 1, sizeof buf, f);
+            ID3D11PixelShader *ps = NULL;
+            fclose(f);
+            if (n && n < sizeof buf
+                && SUCCEEDED(ID3D11Device_CreatePixelShader(s_dev, buf, n, NULL, &ps))) {
+                psh_compiled(e, ps, 0.0, 1);
+                s_psst.general--;
+                s_psst.special++;
+                return ps;
+            }
+        }
+    }
+    if (!s_job_mode) {
+        psh_compile(e, src, t.n, srchash);
+        if (e->state == 1) {
+            s_psst.general--;
+            s_psst.special++;
+        }
+        return e->state == 1 ? e->ps : NULL;
+    }
+    {
+        ProgJob *j = (ProgJob *)malloc(sizeof *j);
+        char *copy = (char *)malloc(t.n + 1);
+        if (!j || !copy) {
+            free(j);
+            free(copy);
+            e->state = 2;
+            return NULL;
+        }
+        memcpy(copy, src, t.n + 1);
+        j->next = NULL;
+        j->e = NULL;
+        j->pe = e;
+        j->src = copy;
+        j->len = t.n;
+        j->srchash = srchash;
+        EnterCriticalSection(&s_job_lock);
+        if (s_job_tail)
+            s_job_tail->next = j;
+        else
+            s_job_head = j;
+        s_job_tail = j;
+        LeaveCriticalSection(&s_job_lock);
+        SetEvent(s_job_event);
+    }
+    return NULL;
+}
+
+/* Every 10 s while setups are new or the general shader still draws: [PSH]. */
+static void psh_report(void)
+{
+    static DWORD last;
+    static uint32_t last_variants;
+    DWORD now = GetTickCount();
+
+    if (!s_psh_on || s_psh_on < 0 || now - last < 10000)
+        return;
+    last = now;
+    if (s_psst.variants != last_variants || s_psst.general) {
+        fprintf(stderr, "[PSH] %u setups (%u compiled, %u loaded, %u failed; compiles %.0f ms, longest %.1f ms);"
+                        " draws %u specialised, %u general\n",
+                s_psst.variants, s_psst.compiled, s_psst.loaded, s_psst.failed, s_psst.ms, s_psst.max_ms,
+                s_psst.special, s_psst.general);
+        last_variants = s_psst.variants;
+    }
+    s_psst.special = s_psst.general = 0;
 }
 
 /* The batch's attribute bytes into the raw ring and its constants into s_pcb.
@@ -2677,7 +2981,10 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
     /* A program draw reads no vertex buffer (the bound layout's elements go
      * unused): its shader fetches from the raw ring by SV_VertexID. */
     ID3D11DeviceContext_VSSetShader(s_ctx, pvs ? pvs : s_vs, NULL, 0);
-    ID3D11DeviceContext_PSSetShader(s_ctx, s_ps, NULL, 0);
+    {
+        ID3D11PixelShader *sp = psh_for(&c);
+        ID3D11DeviceContext_PSSetShader(s_ctx, sp ? sp : s_ps, NULL, 0);
+    }
     {
         /* -DrawLog's F5: leave out one kind of blended draw, to see what a stray
          * shape on screen is made of. */
@@ -3795,6 +4102,7 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
     t0 = ft_qpc();
     s_flip++;
     s_stats.presents++;
+    psh_report();
     /* RECOMP_GPU_DRAWLOG=<flag file>: log every draw and clear of the frame that
      * follows, once per second while the file exists, and every frame while F7 is
      * held. F5 steps through the kinds of draw to leave out (see d3d11_draw). */

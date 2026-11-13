@@ -152,6 +152,16 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   mark, so GPU idle time between them counts too. At scale 3 (2026-11-13) the GPU took 3.2 ms a frame in the
   corridor and 3.3-3.5 with 7 bots, nearly all of it draws; the combiner pixel shader is most of that: replaced
   by a trivial one for a test, it fell to 0.7 and 1.5 ms.
+- Pixel shaders are made per combiner setup (`psh_for` in `src/gpu_d3d11.c`): the general shader's source compiled
+  with the setup's words (stage count, each stage's input/output/mapping words, the final combiner, texture modes,
+  dot mapping, alpha test, cube stages) as literals, so the compiler folds the tests and keeps the combiner
+  registers in registers. Colours, factors, the alpha reference and texture scales stay constants. They compile
+  on the vertex programs' thread (a draw uses the general shader until its setup's is ready) and are kept in
+  `%LOCALAPPDATA%\xboxrecomp\psh`; a match through the menus makes about 55 setups, about 20 ms each to compile (at most about 40).
+  `[PSH]` reports setups and draws by shader every 10 s while either changes. `RECOMP_GPU_PS_SPECIAL=0` keeps the
+  general shader, `RECOMP_GPU_PS_FLIP=<ms>` alternates the two (general while the count of periods is odd) for
+  comparing frames, `RECOMP_GPU_PS_DUMP=1` writes each setup's HLSL to the working directory (move it under
+  `build/`), and `RECOMP_GPU_VSH_SYNC=1` and `RECOMP_GPU_VSH_CACHE=0` apply to them too.
 - Vertex programs run on the GPU (#2; `RECOMP_GPU_VSH=0` keeps them on the CPU): the walker hands D3D11 the
   program, its constants and the raw attribute bytes, and each program becomes a vertex shader (cached by its hash)
   that transforms, clips and culls.
