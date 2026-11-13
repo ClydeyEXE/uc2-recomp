@@ -145,6 +145,13 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   "walks" counts pushbuffer walks, one per PUT the title kicks to (4-7 a frame in a match). A texture is hashed
   once a walk to see whether it changed, not at every draw: the title can rewrite one only after D3D's Lock has
   waited for the GPU to finish with it, so its bytes hold still within a walk.
+- `RECOMP_GPU_TIMING=1` times the GPU by pass with D3D11 timestamp queries, read back several frames late so
+  nothing waits. Every 10 s `[GPUTIME]` gives the mean GPU ms a frame by kind (draws, draws with a GPU vertex
+  program, clears, the depth encode and decode passes, feedback and grow copies, the final blit) and by target
+  (address, host size, draws), and `[GPUCALLS]` the device-context calls a frame. A pass's time runs to the next
+  mark, so GPU idle time between them counts too. At scale 3 (2026-11-13) the GPU took 3.2 ms a frame in the
+  corridor and 3.3-3.5 with 7 bots, nearly all of it draws; the combiner pixel shader is most of that: replaced
+  by a trivial one for a test, it fell to 0.7 and 1.5 ms.
 - Vertex programs run on the GPU (#2; `RECOMP_GPU_VSH=0` keeps them on the CPU): the walker hands D3D11 the
   program, its constants and the raw attribute bytes, and each program becomes a vertex shader (cached by its hash)
   that transforms, clips and culls.

@@ -35,6 +35,49 @@
 #include "d3d/d3d8_swizzle.h"
 #include "version.h"            /* written by tools/version.cmake as the game builds */
 
+/* Device-context calls, counted for RECOMP_GPU_TIMING's [GPUCALLS] line: the
+ * wrappers below replace COBJMACROS' own, so every call site counts. */
+static struct {
+    uint32_t map, vs, ps, blend, depth, raster, scissor, srv, samp, cbuf, rt, draw, clear, copy;
+} s_gc;
+#undef ID3D11DeviceContext_Map
+#define ID3D11DeviceContext_Map(c, r, s, t, f, m) (s_gc.map++, (c)->lpVtbl->Map(c, r, s, t, f, m))
+#undef ID3D11DeviceContext_VSSetShader
+#define ID3D11DeviceContext_VSSetShader(c, x, i, n) (s_gc.vs++, (c)->lpVtbl->VSSetShader(c, x, i, n))
+#undef ID3D11DeviceContext_PSSetShader
+#define ID3D11DeviceContext_PSSetShader(c, x, i, n) (s_gc.ps++, (c)->lpVtbl->PSSetShader(c, x, i, n))
+#undef ID3D11DeviceContext_OMSetBlendState
+#define ID3D11DeviceContext_OMSetBlendState(c, b, f, m) (s_gc.blend++, (c)->lpVtbl->OMSetBlendState(c, b, f, m))
+#undef ID3D11DeviceContext_OMSetDepthStencilState
+#define ID3D11DeviceContext_OMSetDepthStencilState(c, d, r) (s_gc.depth++, (c)->lpVtbl->OMSetDepthStencilState(c, d, r))
+#undef ID3D11DeviceContext_RSSetState
+#define ID3D11DeviceContext_RSSetState(c, r) (s_gc.raster++, (c)->lpVtbl->RSSetState(c, r))
+#undef ID3D11DeviceContext_RSSetScissorRects
+#define ID3D11DeviceContext_RSSetScissorRects(c, n, r) (s_gc.scissor++, (c)->lpVtbl->RSSetScissorRects(c, n, r))
+#undef ID3D11DeviceContext_PSSetShaderResources
+#define ID3D11DeviceContext_PSSetShaderResources(c, a, n, v) (s_gc.srv++, (c)->lpVtbl->PSSetShaderResources(c, a, n, v))
+#undef ID3D11DeviceContext_PSSetSamplers
+#define ID3D11DeviceContext_PSSetSamplers(c, a, n, v) (s_gc.samp++, (c)->lpVtbl->PSSetSamplers(c, a, n, v))
+#undef ID3D11DeviceContext_VSSetConstantBuffers
+#define ID3D11DeviceContext_VSSetConstantBuffers(c, a, n, v) (s_gc.cbuf++, (c)->lpVtbl->VSSetConstantBuffers(c, a, n, v))
+#undef ID3D11DeviceContext_PSSetConstantBuffers
+#define ID3D11DeviceContext_PSSetConstantBuffers(c, a, n, v) (s_gc.cbuf++, (c)->lpVtbl->PSSetConstantBuffers(c, a, n, v))
+#undef ID3D11DeviceContext_OMSetRenderTargets
+#define ID3D11DeviceContext_OMSetRenderTargets(c, n, r, d) (s_gc.rt++, (c)->lpVtbl->OMSetRenderTargets(c, n, r, d))
+#undef ID3D11DeviceContext_Draw
+#define ID3D11DeviceContext_Draw(c, n, f) (s_gc.draw++, (c)->lpVtbl->Draw(c, n, f))
+#undef ID3D11DeviceContext_DrawIndexed
+#define ID3D11DeviceContext_DrawIndexed(c, n, f, b) (s_gc.draw++, (c)->lpVtbl->DrawIndexed(c, n, f, b))
+#undef ID3D11DeviceContext_ClearRenderTargetView
+#define ID3D11DeviceContext_ClearRenderTargetView(c, v, k) (s_gc.clear++, (c)->lpVtbl->ClearRenderTargetView(c, v, k))
+#undef ID3D11DeviceContext_ClearDepthStencilView
+#define ID3D11DeviceContext_ClearDepthStencilView(c, v, f, d, st) (s_gc.clear++, (c)->lpVtbl->ClearDepthStencilView(c, v, f, d, st))
+#undef ID3D11DeviceContext_CopyResource
+#define ID3D11DeviceContext_CopyResource(c, d, sr) (s_gc.copy++, (c)->lpVtbl->CopyResource(c, d, sr))
+#undef ID3D11DeviceContext_CopySubresourceRegion
+#define ID3D11DeviceContext_CopySubresourceRegion(c, d, ds, x, y, z, sr, ss, b) \
+    (s_gc.copy++, (c)->lpVtbl->CopySubresourceRegion(c, d, ds, x, y, z, sr, ss, b))
+
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
 /* ---- Shaders ------------------------------------------------------------ */
@@ -622,6 +665,242 @@ static void surface_size(const Nv2aSurface *s, uint32_t *w, uint32_t *h)
     *h = s->clip_y + s->height;
 }
 
+/* ---- GPU time by pass (RECOMP_GPU_TIMING=1) ---------------------------------
+ * Timestamp queries at each change of pass (the kind of GPU work and the target
+ * it goes to), read back several frames later with no wait, so nothing stalls.
+ * Every 10 s a [GPUTIME] line gives the mean GPU ms a frame by kind and by
+ * target, and [GPUCALLS] the device-context calls a frame. A segment's time runs
+ * from its mark to the next one, so it includes any time the GPU sat idle
+ * waiting for commands in between; "frame" is first mark to last. */
+enum { GT_START, GT_DRAW, GT_DRAW_PROG, GT_CLEAR, GT_ZENC, GT_ZDEC, GT_FEEDBACK, GT_GROW, GT_BLIT, GT_END,
+       GT_KINDS };
+static const char *const GT_NAME[GT_KINDS] = {
+    "start", "draw", "draw-vsh", "clear", "zenc", "zdec", "feedback", "grow", "blit", "end" };
+#define GT_FRAMES 8
+#define GT_MARKS  1024
+#define GT_TARGETS 32
+typedef struct {
+    ID3D11Query *disjoint, *q[GT_MARKS];
+    uint8_t kind[GT_MARKS];
+    int8_t tgt[GT_MARKS];
+    uint32_t tva[MAX_TARGETS], tw[MAX_TARGETS], th[MAX_TARGETS], tdraws[MAX_TARGETS];
+    int n, open, pending;
+} GtFrame;
+static int s_gt_on = -1;
+static GtFrame *s_gt;
+static int s_gt_cur, s_gt_kind = -1, s_gt_tgt = -2;
+static struct {
+    double kind[GT_KINDS], frame, max_frame;
+    uint32_t frames, dropped, marks;
+    struct { uint32_t va, w, h; double ms; uint32_t draws; } t[GT_TARGETS];
+    int nt;
+    DWORD last;
+} s_gtw;
+static struct { uint64_t gc[14]; uint32_t frames; } s_gcw;
+
+static int gt_on(void)
+{
+    if (s_gt_on < 0) {
+        const char *e = getenv("RECOMP_GPU_TIMING");
+        s_gt_on = e && *e && *e != '0';
+        if (s_gt_on && !(s_gt = (GtFrame *)calloc(GT_FRAMES, sizeof *s_gt)))
+            s_gt_on = 0;
+    }
+    return s_gt_on && s_dev;
+}
+
+static ID3D11Query *gt_query(ID3D11Query **slot, D3D11_QUERY kind)
+{
+    D3D11_QUERY_DESC qd = { kind, 0 };
+    if (!*slot && FAILED(ID3D11Device_CreateQuery(s_dev, &qd, slot)))
+        *slot = NULL;
+    return *slot;
+}
+
+static void gt_mark(int kind, const Target *t)
+{
+    GtFrame *f;
+    int ti = t ? (int)(t - s_targets) : -1;
+
+    if (s_gt_on <= 0 || !s_gt)
+        return;
+    f = &s_gt[s_gt_cur];
+    if (!f->open)
+        return;
+    if ((kind != s_gt_kind || ti != s_gt_tgt) && f->n < GT_MARKS - 1
+        && gt_query(&f->q[f->n], D3D11_QUERY_TIMESTAMP)) {
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->q[f->n]);
+        f->kind[f->n] = (uint8_t)kind;
+        f->tgt[f->n] = (int8_t)ti;
+        f->n++;
+        s_gt_kind = kind;
+        s_gt_tgt = ti;
+    }
+    if (t && (kind == GT_DRAW || kind == GT_DRAW_PROG)) {
+        f->tva[ti] = t->va; f->tw[ti] = t->pw; f->th[ti] = t->ph;
+        f->tdraws[ti]++;
+    }
+}
+
+static int gt_slot(uint32_t va, uint32_t w, uint32_t h)
+{
+    int j;
+    for (j = 0; j < s_gtw.nt; j++)
+        if (s_gtw.t[j].va == va && s_gtw.t[j].w == w && s_gtw.t[j].h == h)
+            return j;
+    if (s_gtw.nt == GT_TARGETS)
+        return -1;
+    j = s_gtw.nt++;
+    s_gtw.t[j].va = va; s_gtw.t[j].w = w; s_gtw.t[j].h = h;
+    s_gtw.t[j].ms = 0; s_gtw.t[j].draws = 0;
+    return j;
+}
+
+/* Read back every finished frame, without waiting for any. */
+static void gt_collect(void)
+{
+    static UINT64 ts[GT_MARKS];
+    int k, i;
+
+    for (k = 0; k < GT_FRAMES; k++) {
+        GtFrame *f = &s_gt[k];
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj;
+        int ok = 1;
+
+        if (!f->pending)
+            continue;
+        if (ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)f->disjoint, &dj, sizeof dj,
+                                        D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            continue;
+        for (i = 0; i < f->n && ok; i++)
+            ok = ID3D11DeviceContext_GetData(s_ctx, (ID3D11Asynchronous *)f->q[i], &ts[i], sizeof ts[i],
+                                             D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        f->pending = 0;
+        if (!ok || dj.Disjoint || !dj.Frequency || f->n < 2) {
+            s_gtw.dropped++;
+            continue;
+        }
+        {
+            double per = 1000.0 / (double)dj.Frequency, all = (double)(ts[f->n - 1] - ts[0]) * per;
+            for (i = 0; i + 1 < f->n; i++) {
+                double ms = (double)(ts[i + 1] - ts[i]) * per;
+                int ti = f->tgt[i], j;
+                s_gtw.kind[f->kind[i]] += ms;
+                if (ti < 0 || (f->kind[i] != GT_DRAW && f->kind[i] != GT_DRAW_PROG))
+                    continue;
+                if ((j = gt_slot(f->tva[ti], f->tw[ti], f->th[ti])) >= 0)
+                    s_gtw.t[j].ms += ms;
+            }
+            for (i = 0; i < MAX_TARGETS; i++) {
+                int j;
+                if (f->tdraws[i] && (j = gt_slot(f->tva[i], f->tw[i], f->th[i])) >= 0)
+                    s_gtw.t[j].draws += f->tdraws[i];
+            }
+            s_gtw.frame += all;
+            if (all > s_gtw.max_frame)
+                s_gtw.max_frame = all;
+            s_gtw.marks += (uint32_t)f->n;
+            s_gtw.frames++;
+        }
+    }
+}
+
+static void gt_report(void)
+{
+    char line[1400];
+    int n = 0, i, k, order[GT_TARGETS];
+    double fr = s_gtw.frames ? (double)s_gtw.frames : 1.0;
+
+    if (!s_gtw.last)
+        s_gtw.last = GetTickCount();
+    if (GetTickCount() - s_gtw.last < 10000)
+        return;
+    if (s_gtw.frames) {
+        for (k = 1; k < GT_END; k++)
+            if (s_gtw.kind[k] > 0)
+                n += snprintf(line + n, sizeof line - n, " %s %.3f", GT_NAME[k], s_gtw.kind[k] / fr);
+        fprintf(stderr, "[GPUTIME] %u frames (%u dropped): frame %.3f ms (max %.2f), %.0f marks | ms a frame:%s\n",
+                s_gtw.frames, s_gtw.dropped, s_gtw.frame / fr, s_gtw.max_frame, s_gtw.marks / fr, line);
+        for (i = 0; i < s_gtw.nt; i++)
+            order[i] = i;
+        for (i = 0; i < s_gtw.nt; i++)
+            for (k = i + 1; k < s_gtw.nt; k++)
+                if (s_gtw.t[order[k]].ms > s_gtw.t[order[i]].ms) {
+                    int x = order[i]; order[i] = order[k]; order[k] = x;
+                }
+        n = 0;
+        for (i = 0; i < s_gtw.nt && i < 10; i++) {
+            int j = order[i];
+            n += snprintf(line + n, sizeof line - n, " | %08X %ux%u %.3f ms %.1f draws",
+                          s_gtw.t[j].va, s_gtw.t[j].w, s_gtw.t[j].h, s_gtw.t[j].ms / fr, s_gtw.t[j].draws / fr);
+            if (n >= (int)sizeof line) { n = (int)sizeof line - 1; break; }
+        }
+        fprintf(stderr, "[GPUTIME] draws by target, a frame:%s\n", line);
+    }
+    if (s_gcw.frames) {
+        double g = (double)s_gcw.frames;
+        fprintf(stderr, "[GPUCALLS] a frame: draw %.0f, clear %.1f, copy %.1f, rt %.1f, map %.0f, vs %.0f, ps %.0f, "
+                        "blend %.0f, depth %.0f, raster %.0f, scissor %.0f, srv %.0f, samp %.0f, cbuf %.1f\n",
+                s_gcw.gc[11] / g, s_gcw.gc[12] / g, s_gcw.gc[13] / g, s_gcw.gc[10] / g, s_gcw.gc[0] / g,
+                s_gcw.gc[1] / g, s_gcw.gc[2] / g, s_gcw.gc[3] / g, s_gcw.gc[4] / g, s_gcw.gc[5] / g,
+                s_gcw.gc[6] / g, s_gcw.gc[7] / g, s_gcw.gc[8] / g, s_gcw.gc[9] / g);
+        fflush(stderr);
+    }
+    memset(&s_gtw, 0, sizeof s_gtw);
+    memset(&s_gcw, 0, sizeof s_gcw);
+    s_gtw.last = GetTickCount();
+}
+
+/* Just before Present: closes the frame's marks, and reports. */
+static void gt_frame_end(void)
+{
+    GtFrame *f;
+    uint32_t *g = (uint32_t *)&s_gc;
+    int i;
+
+    if (!gt_on())
+        return;
+    f = &s_gt[s_gt_cur];
+    if (f->open) {
+        s_gt_kind = -1;
+        gt_mark(GT_END, NULL);
+        ID3D11DeviceContext_End(s_ctx, (ID3D11Asynchronous *)f->disjoint);
+        f->open = 0;
+        f->pending = 1;
+    }
+    for (i = 0; i < 14; i++)
+        s_gcw.gc[i] += g[i];
+    memset(&s_gc, 0, sizeof s_gc);
+    s_gcw.frames++;
+    gt_collect();
+    gt_report();
+}
+
+/* Just after Present: the next frame's marks start. A slot still waiting for the
+ * GPU is dropped rather than waited for. */
+static void gt_frame_begin(void)
+{
+    GtFrame *f;
+
+    if (!gt_on())
+        return;
+    s_gt_cur = (s_gt_cur + 1) % GT_FRAMES;
+    f = &s_gt[s_gt_cur];
+    if (f->pending) {
+        f->pending = 0;
+        s_gtw.dropped++;
+    }
+    if (!gt_query(&f->disjoint, D3D11_QUERY_TIMESTAMP_DISJOINT))
+        return;
+    f->n = 0;
+    memset(f->tdraws, 0, sizeof f->tdraws);
+    ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)f->disjoint);
+    f->open = 1;
+    s_gt_kind = -1;
+    s_gt_tgt = -2;
+    gt_mark(GT_START, NULL);
+}
+
 static Target *target_for(const Nv2aSurface *s)
 {
     uint32_t w, h;
@@ -669,6 +948,7 @@ static Target *target_for(const Nv2aSurface *s)
         }
         if (kept && t) {
             D3D11_BOX box = {0, 0, 0, t->pw, t->ph, 1};
+            gt_mark(GT_GROW, NULL);
             ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)tex, 0, 0, 0, 0,
                                                       (ID3D11Resource *)t->tex, 0, &box);
         }
@@ -2048,6 +2328,7 @@ static ID3D11ShaderResourceView *target_view(Target *t)
             || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)t->copy, NULL, &t->copy_srv)))
             return s_white;
     }
+    gt_mark(GT_FEEDBACK, t);
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)t->copy, (ID3D11Resource *)t->tex);
     s_stats.feedback++;
     return t->copy_srv;
@@ -2148,6 +2429,7 @@ static void zeta_encode(uint32_t va)
     zeta_pass_state(t->pw, t->ph, 0);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_zenc, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 8, 1, &z->srv);
+    gt_mark(GT_ZENC, t);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 8, 2, none);
     t->from_zeta = 1;
@@ -2178,6 +2460,7 @@ static void zeta_decode(Zeta *z)
     zeta_pass_state(z->w, z->h, 1);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_ps_zdec, NULL, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 9, 1, &c->srv);
+    gt_mark(GT_ZDEC, NULL);
     ID3D11DeviceContext_Draw(s_ctx, 3, 0);
     ID3D11DeviceContext_PSSetShaderResources(s_ctx, 8, 2, none);
     z->seq = ++s_seq;
@@ -2411,6 +2694,7 @@ static void d3d11_draw_inner(const Nv2aSurface *s, const Nv2aBatch *b)
         }
         if (s_drawlog && passed_q && !s_vis_open)
             ID3D11DeviceContext_Begin(s_ctx, (ID3D11Asynchronous *)passed_q);
+        gt_mark(b->program ? GT_DRAW_PROG : GT_DRAW, t);
         if (!skip && ibytes)
             ID3D11DeviceContext_DrawIndexed(s_ctx, b->index_count, first_index, (INT)first);
         else if (!skip)
@@ -2591,6 +2875,7 @@ static void d3d11_clear_inner(const Nv2aSurface *s, const Nv2aRenderState *r, ui
     if (x0 >= x1 || y0 >= y1)
         return;
     unpack(argb, col);
+    gt_mark(GT_CLEAR, t);
     s_stats.clears++;
 
     if (x0 == 0 && y0 == 0 && x1 == t->w && y1 == t->h && (!colour || (flags & 0xF0) == 0xF0)) {
@@ -3450,6 +3735,7 @@ static void blit_present(Target *t)
         s_bw = cw;
         s_bh = ch;
     }
+    gt_mark(GT_BLIT, NULL);
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_back, NULL);
     ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back, black);
     /* The largest 4:3 (or 16:9) rectangle that fits, centred. */
@@ -3484,10 +3770,12 @@ static void blit_present(Target *t)
     s_cur_zeta = NULL;
     s_ft.limit += limit_wait();
     s_ft.pq = ft_qpc();
+    gt_frame_end();
     if (s_cfg.vsync)
         IDXGISwapChain1_Present(s_chain, 1, 0);
     else
         IDXGISwapChain1_Present(s_chain, 0, s_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    gt_frame_begin();
 }
 
 /* The frame is finished: copy it to guest memory, where the window and the frame
