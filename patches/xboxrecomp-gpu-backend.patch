@@ -1666,10 +1666,53 @@ index a5ea9cc..78dacee 100644
          fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                  s_gpu.batches_ffp);
 diff --git a/src/kernel/nv2a_pb_scan.c b/src/kernel/nv2a_pb_scan.c
-index 5fab4c3..d09e366 100644
+index 5fab4c3..25e7748 100644
 --- a/src/kernel/nv2a_pb_scan.c
 +++ b/src/kernel/nv2a_pb_scan.c
-@@ -478,12 +478,53 @@ int nv2a_pb_dma_walk(void)
+@@ -84,7 +84,14 @@ static uint16_t s_seen_slot[8][0x2000 / 4];
+ 
+ static void note(uint32_t subch, uint32_t method)
+ {
+-    uint16_t *slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
++    uint16_t *slot;
++
++    /* The inventory is only ever reported under RECOMP_PB_SCAN. Kept on the
++     * executor's own runs too, it was 8% of the walker's thread in Unreal
++     * Championship 2 with seven bots, for counts nobody read. */
++    if (!s_scan_enabled)
++        return;
++    slot = &s_seen_slot[subch & 7][(method & 0x1FFC) / 4];
+ 
+     if (*slot) {
+         s_seen[*slot - 1].count++;
+@@ -307,6 +314,18 @@ static void pb_consume(const uint8_t *mem, uint32_t put, uint32_t *words)
+     }
+ }
+ 
++/* Walks begun: one for each PUT the title kicked to. Nothing the walk reads can
++ * be rewritten by the title until the GPU has passed every command that uses it
++ * (D3D's Lock waits for the resource's fence, and that is at or after its last
++ * use in the kicked commands), so a back end may treat guest memory a draw reads
++ * as unchanged for the rest of the walk. */
++static volatile uint32_t s_walk_seq;
++
++uint32_t nv2a_pb_walk_seq(void)
++{
++    return s_walk_seq;
++}
++
+ void nv2a_pb_scan(uint32_t put_phys)
+ {
+     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+@@ -316,6 +335,7 @@ void nv2a_pb_scan(uint32_t put_phys)
+ 
+     if (!pb_walk_enabled())
+         return;
++    s_walk_seq++;
+     if (s_get == 0xFFFFFFFFu) {               /* never resynced: start at PUT */
+         s_get = put, s_pend_left = 0;
+         return;
+@@ -478,12 +498,53 @@ int nv2a_pb_dma_walk(void)
  static int s_in_call;
  int nv2a_pb_scan_in_call(void) { return s_in_call; }
  
@@ -1723,7 +1766,7 @@ index 5fab4c3..d09e366 100644
      while (va < end_va && words < 0x100000u) {
          uint32_t w = *(const uint32_t *)(mem + va);
          va += 4;
-@@ -493,8 +534,28 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -493,8 +554,28 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
              uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                               : (w & 0x1FFFFFFCu);
              (*jumps)++;
@@ -1753,7 +1796,7 @@ index 5fab4c3..d09e366 100644
              va = 0x80000000u | (target & 0x0FFFFFFFu);
              end_va = va + 0x400000u;
              continue;
-@@ -507,6 +568,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -507,6 +588,12 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
          if ((w & 3u) == 2u) {                    /* CALL */
              if (!in_call) {
                  uint32_t sub = 0x80000000u | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
@@ -1766,7 +1809,7 @@ index 5fab4c3..d09e366 100644
                  s_tot_calls++;
                  s_in_call = 1;
                  words += pb_walk_segment(sub, sub + 0x400000u, 1, jumps, unknown);
-@@ -520,14 +587,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -520,14 +607,7 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
              uint32_t method =  w & 0x1FFCu;
              int noninc = (w & 0xE0000000u) == 0x40000000u;
  
@@ -1782,7 +1825,7 @@ index 5fab4c3..d09e366 100644
              continue;
          }
          (*unknown)++;
-@@ -535,6 +595,50 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
+@@ -535,6 +615,50 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
      return words;
  }
  
@@ -2138,10 +2181,43 @@ index 8acb0af..5b0b9c3 100644
  /* Direct access, for the self-test. */
  void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 diff --git a/src/kernel/xbox_memory_layout.c b/src/kernel/xbox_memory_layout.c
-index 7ade793..03d92dc 100644
+index 7ade793..306c936 100644
 --- a/src/kernel/xbox_memory_layout.c
 +++ b/src/kernel/xbox_memory_layout.c
-@@ -1449,6 +1449,28 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
+@@ -1406,6 +1406,7 @@ static void framebuffer_probe_tick(void)
+ static void nv2a_ack_busy_bits(int flip_held)
+ {
+     volatile uint32_t *regs = (volatile uint32_t *)g_nv2a_memory;
++    int held = -1;
+ 
+     if (!regs)
+         return;
+@@ -1415,13 +1416,22 @@ static void nv2a_ack_busy_bits(int flip_held)
+         uint32_t mask = NV2A_ACK[i].busy_mask;
+         if (flip_held && NV2A_ACK[i].offset == NV2A_ACK_PFB_FLUSH)
+             continue;
++        if (!(*r & mask))
++            continue;
+         /* Once the vblank is delivered its two bits belong to the
+          * vblank-ack thread (kernel_bridge.c), which clears them on the
+          * DPC's ack. Cleared here too, a pass that landed between the
+          * vblank and the DPC's read of PMC_INTR_0 took the vblank away
+          * from the DPC: no ack, no count, and the title's present at
+-         * vblank slipped a frame. */
+-        if (xbox_VblankAckHeld()) {
++         * vblank slipped a frame.
++         *
++         * Asked only when a bit is up, and once a call: it reads the
++         * performance counter, and asked for each register on every call
++         * (every pass and every 256 words of a walk) it was about 16% of
++         * the walker's thread. */
++        if ((NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0
++             || NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
++            && (held < 0 ? (held = xbox_VblankAckHeld()) : held)) {
+             if (NV2A_ACK[i].offset == NV2A_ACK_PMC_INTR_0)
+                 mask &= ~NV2A_ACK_PMC_INTR_PCRTC;
+             else if (NV2A_ACK[i].offset == NV2A_ACK_PCRTC_INTR_0)
+@@ -1449,6 +1459,28 @@ volatile uint32_t *xbox_Nv2aRegPtr(uint32_t offset)
      return (volatile uint32_t *)((char *)g_nv2a_memory + offset);
  }
  
@@ -2170,7 +2246,7 @@ index 7ade793..03d92dc 100644
  static DWORD WINAPI nv2a_ack_thread(LPVOID param)
  {
      volatile uint32_t *regs = (volatile uint32_t *)param;
-@@ -1556,26 +1578,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1556,26 +1588,11 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                              nv2a_pb_scan(put);
                      } else {
                          /* The segment scan, the default: the bytes between
@@ -2202,7 +2278,7 @@ index 7ade793..03d92dc 100644
                      }
                      /* Periodic, because what the title submits at init is not
                       * what it submits once it is drawing a menu, and the
-@@ -1645,10 +1652,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
+@@ -1645,10 +1662,16 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
           * which silently breaks every timeout that polls it: Halo's DHCP setup
           * waits on a tick deadline that never arrives and spins forever bringing
           * up XNet. A live clock is also just the truth -- KeTickCount ticks on
@@ -2222,7 +2298,7 @@ index 7ade793..03d92dc 100644
  
          Sleep(0);  /* yield; the waiter is spinning on another core */
      }
-@@ -4230,9 +4243,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
+@@ -4230,9 +4253,15 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
      }
      contig_unlock();
  

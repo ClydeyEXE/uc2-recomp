@@ -142,6 +142,9 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   `drive_match.py` saves frames as shown and compares only the middle 4:3 when the HUD is kept there.
 - `RECOMP_LOG=<file>` writes the log straight to a file. Do not use `-RedirectStandardError`: its pipe slows the game.
 - `RECOMP_GPU=sw` restores the software rasteriser, and `RECOMP_GPU_STATS=1` logs renderer counts every 5 s.
+  "walks" counts pushbuffer walks, one per PUT the title kicks to (4-7 a frame in a match). A texture is hashed
+  once a walk to see whether it changed, not at every draw: the title can rewrite one only after D3D's Lock has
+  waited for the GPU to finish with it, so its bytes hold still within a walk.
 - Vertex programs run on the GPU (#2; `RECOMP_GPU_VSH=0` keeps them on the CPU): the walker hands D3D11 the
   program, its constants and the raw attribute bytes, and each program becomes a vertex shader (cached by its hash)
   that transforms, clips and culls.

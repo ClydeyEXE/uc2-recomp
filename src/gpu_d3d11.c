@@ -752,9 +752,17 @@ typedef struct {
     uint32_t va, color, w, h, pitch, levels, palette, cube;
     uint32_t bytes;
     uint64_t hash;
-    uint32_t checked_flip, last_flip;
+    uint32_t checked_flip, checked_seg, last_flip;
     ID3D11ShaderResourceView *srv;
 } TexEntry;
+
+/* Which walk of the pushbuffer this is: one per PUT the title kicked to
+ * (nv2a_pb_scan.c). D3D lets the title rewrite a texture only once the GPU is
+ * done with it (its Lock waits for the fence, which comes after the texture's
+ * last use in what was kicked), so a texture's bytes are the same for every draw
+ * of a walk, and are hashed once a walk rather than at every draw. */
+extern uint32_t nv2a_pb_walk_seq(void);
+#define tex_segment() nv2a_pb_walk_seq()
 
 static TexEntry *s_tex;
 static uint64_t s_tex_bytes;
@@ -913,7 +921,7 @@ static ID3D11ShaderResourceView *tex_lookup(const Nv2aTexture *t, const uint8_t 
 {
     uint32_t key, i, levels = t->levels ? t->levels : 1, maxlv = 1, bytes;
     uint32_t pitch = tex_is_linear(t) ? t->pitch : 0;
-    uint32_t tries, free_slot = TEX_SLOTS;
+    uint32_t tries, free_slot = TEX_SLOTS, seg;
     TexEntry *e = NULL;
     uint64_t h;
 
@@ -965,13 +973,15 @@ static ID3D11ShaderResourceView *tex_lookup(const Nv2aTexture *t, const uint8_t 
     }
     e->last_flip = s_flip;
     bytes = pitch ? pitch * t->height : e->bytes;
-    if (e->checked_flip == s_flip && (e->srv || bytes > TEX_LARGE) && bytes > TEX_LARGE)
+    seg = tex_segment();
+    if (e->checked_flip == s_flip && (bytes > TEX_LARGE || (e->srv && e->checked_seg == seg)))
         return e->srv;
     h = hash_texture(mem + t->offset, bytes);
     if (t->color == 0x0B && t->palette)
         h = hash_span(mem + t->palette, 1024, h);
     s_stats.hashes++;
     e->checked_flip = s_flip;
+    e->checked_seg = seg;
     if (e->srv && e->hash == h)
         return e->srv;
     if (e->srv) {
@@ -3532,12 +3542,17 @@ static void d3d11_present(uint32_t va, uint32_t pitch)
     }
     ui_input();
     if (getenv("RECOMP_GPU_STATS") && GetTickCount() - s_stats.last > 5000) {
+        static uint32_t walks0;
+        uint32_t walks = nv2a_pb_walk_seq();
+
         s_stats.last = GetTickCount();
         fprintf(stderr, "[D3D11] %u presents, %u draws, %u tris, %u clears, %u uploads (%llu KB, %llu KB held), "
-                        "%u hashes, %u feedback copies, %u depth copies\n",
+                        "%u hashes, %u feedback copies, %u depth copies, %u walks\n",
                 s_stats.presents, s_stats.draws, s_stats.tris, s_stats.clears, s_stats.uploads,
                 (unsigned long long)(s_stats.upload_bytes / 1024),
-                (unsigned long long)(s_tex_bytes / 1024), s_stats.hashes, s_stats.feedback, s_stats.zeta_copies);
+                (unsigned long long)(s_tex_bytes / 1024), s_stats.hashes, s_stats.feedback, s_stats.zeta_copies,
+                walks - walks0);
+        walks0 = walks;
         fprintf(stderr, "[D3D11] visibility: %u tests, %u with no pixels, at most %u pending\n",
                 s_vis_stats.reports, s_vis_stats.zero, s_vis_stats.max_pending);
         if (s_pstats.draws || s_pstats.shaders || s_pstats.loaded || s_pstats.failed)
