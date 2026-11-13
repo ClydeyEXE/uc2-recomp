@@ -38,6 +38,9 @@ Open work is tracked in GitHub Issues, in the order of the pinned Roadmap issue.
   it off. The lifter decides which registers each function can change; compiling the generated files with
   `/DRECOMP_VERIFY_REG_WRITES` (a syntax check, `/Zs`, is enough) makes the others read-only, so a missed write
   fails to compile.
+- An x87 result that the next instruction stores as a float and pops (`fmul; fstp dword`) is rounded once, by the
+  store (`RECOMP_FP_STORE_F`), not first to 24 bits as well; only a subnormal float result takes the long way, so the
+  stored bits match the x87's. `RECOMP_FUSE_FLOAT_STORES=0` in the environment of a regenerate turns it off.
 - Overlays inject into the game. With RivaTuner Statistics Server running (OSD on, no frame limit, 2026-11-12),
   `RTSSHooks64.dll` is loaded and calls NvAPI, which calls `EnumDisplayDevicesW`: every 9 s or so a frame took about
   235 ms, the walker inside `Present` (in `NtUserEnumDisplayDevices` or `NtGdiDdDDISetQueuedLimit`), which put up to

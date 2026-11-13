@@ -2332,10 +2332,31 @@ index a5b912c..7327b25 100644
  #if !defined(_WIN32)
  /* POSIX hosts: the framebuffer window needs the process main thread (AppKit
 diff --git a/templates/runtime/recomp_types.h b/templates/runtime/recomp_types.h
-index 47491e5..be41a7a 100644
+index 47491e5..9bf68f3 100644
 --- a/templates/runtime/recomp_types.h
 +++ b/templates/runtime/recomp_types.h
-@@ -1325,20 +1325,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
+@@ -319,6 +319,20 @@ static inline double recomp_fp_round24(double x) {
+     return ldexp((double)(float)x, e);
+ }
+ #define RECOMP_FP_PC(x) ((g_fp_control_word & 0x300u) ? (double)(x) : recomp_fp_round24(x))
++/* A result that goes straight to a float store (`fmul; fstp dword`) skips
++ * RECOMP_FP_PC and is stored with this. Rounding to float precision and then
++ * to float is rounding to float once, except where the float is subnormal:
++ * there the x87 rounds twice (24 bits at its own exponent range, then to the
++ * subnormal), which can differ by an ulp. Only those take the long way, and
++ * only under PC=24. A float result of 0 needs nothing: the value was at most
++ * half the smallest subnormal, and its 24-bit rounding is too. */
++static inline float recomp_fp_store_f(double x, const uint16_t *control_word) {
++    float f = (float)x;
++    if (fabsf(f) <= 1.17549435e-38f && f != 0.0f && !(*control_word & 0x300u))
++        f = (float)recomp_fp_round24(x);
++    return f;
++}
++#define RECOMP_FP_STORE_F(x) recomp_fp_store_f((x), &g_fp_control_word)
+ #define RECOMP_FCMP_CC(c) ((uint16_t)((c)==2 ? 0x4500u : (c)<0 ? 0x0100u : (c)>0 ? 0u : 0x4000u))
+ /* Values in the existing double-backed stack are all representable as normal
+  * x87 extended values, including binary64 subnormals. Empty stack tags and
+@@ -1325,20 +1339,29 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
                                uint32_t edi0, uint32_t esp0);
  #define RECOMP_ABI_CALL(va, fn) do { \
@@ -2370,7 +2391,7 @@ index 47491e5..be41a7a 100644
  
  /* A guarded arm of an indirect call. When a recorded run saw a call site
   * reach only a few translated functions, the lifter compares the target
-@@ -1546,6 +1555,96 @@ void xbox_GuestCpuPreempt(uint32_t va);
+@@ -1546,6 +1569,96 @@ void xbox_GuestCpuPreempt(uint32_t va);
  #define esi g_esi
  #define edi g_edi
  
@@ -2467,6 +2488,29 @@ index 47491e5..be41a7a 100644
  /* ================================================================
   * MMX register file
   *
+diff --git a/tests/fp_precision/fp_precision_test.c b/tests/fp_precision/fp_precision_test.c
+index c67e955..86f6207 100644
+--- a/tests/fp_precision/fp_precision_test.c
++++ b/tests/fp_precision/fp_precision_test.c
+@@ -15,6 +15,18 @@ int main(void) {
+     CHECK(recomp_fp_round24(-3.0) == -3.0 && recomp_fp_round24(0.0) == 0.0);
+     CHECK(isinf(recomp_fp_round24(INFINITY)));
+     CHECK(isnan(recomp_fp_round24(NAN)));
++    /* A result stored straight to a float rounds once, except into float's
++     * subnormals, where the x87 rounds to 24 bits first: just under 1.5 of the
++     * smallest subnormal goes to 1.5 exactly, then to 2 (ties to even). */
++    {
++        uint16_t pc24 = 0x000u, pc53 = 0x200u;
++        double t = ldexp(1.5, -149) - ldexp(1.0, -179);
++        CHECK(recomp_fp_store_f(t, &pc24) == ldexpf(1.0f, -148));
++        CHECK(recomp_fp_store_f(t, &pc53) == ldexpf(1.0f, -149));
++        CHECK(recomp_fp_store_f(v, &pc24) == (float)v);
++        CHECK(recomp_fp_store_f(1e300, &pc24) == INFINITY);
++        CHECK(recomp_fp_store_f(-1e-300, &pc24) == 0.0f && signbit(recomp_fp_store_f(-1e-300, &pc24)));
++    }
+     puts("ok");
+     return 0;
+ }
 diff --git a/tools/recomp/lifter.py b/tools/recomp/lifter.py
 index 4174bca..109f9f2 100644
 --- a/tools/recomp/lifter.py
@@ -2521,6 +2565,55 @@ index 1a56995..4d172dd 100644
  
  
  def test_noncoalesced_int2d_int3_does_not_tail_fallthrough():
+diff --git a/tools/recomp/test_fuse_float_stores.py b/tools/recomp/test_fuse_float_stores.py
+new file mode 100644
+index 0000000..34c82b7
+--- /dev/null
++++ b/tools/recomp/test_fuse_float_stores.py
+@@ -0,0 +1,43 @@
++"""Rounding once at a float store (translator.fuse_float_stores)."""
++
++from tools.recomp.translator import fuse_float_stores
++
++
++def test_a_result_stored_as_a_float_is_rounded_by_the_store():
++    out = fuse_float_stores([
++        "    fp_top() = RECOMP_FP_PC(fp_top() * MEMF(esp + 0x28)); /* fmul dword ptr [esp + 0x28] */",
++        "    MEMF(esp + 0x10) = (float)fp_top(); fp_pop(); /* fstp */"])
++    assert out == [
++        "    fp_top() = fp_top() * MEMF(esp + 0x28); /* fmul dword ptr [esp + 0x28] */",
++        "    MEMF(esp + 0x10) = RECOMP_FP_STORE_F(fp_top()); fp_pop(); /* fstp */"]
++
++
++def test_a_pop_form_result_reaches_the_store_through_st0():
++    out = fuse_float_stores([
++        "    fp_st1() = RECOMP_FP_PC(fp_st1() + fp_top()); fp_pop(); /* faddp st(1) */",
++        "    MEMF(eax) = (float)fp_top(); fp_pop(); /* fstp */"])
++    assert out[0] == "    fp_st1() = fp_st1() + fp_top(); fp_pop(); /* faddp st(1) */"
++    assert "RECOMP_FP_STORE_F(fp_top())" in out[1]
++
++
++def test_results_that_stay_on_the_stack_keep_their_rounding():
++    keep = [
++        # fst leaves the result on the stack.
++        ["    fp_top() = RECOMP_FP_PC(fp_top() * MEMF(eax)); /* fmul */",
++         "    MEMF(ecx) = (float)fp_top(); /* fst */"],
++        # A double store keeps the 24-bit value.
++        ["    fp_top() = RECOMP_FP_PC(fp_top() * MEMF(eax)); /* fmul */",
++         "    MEMD(ecx) = fp_top(); fp_pop(); /* fstp */"],
++        # The pop discards the result; the store reads another value.
++        ["    fp_top() = RECOMP_FP_PC(fp_top() + fp_st1()); fp_pop(); /* faddp */",
++         "    MEMF(ecx) = (float)fp_top(); fp_pop(); /* fstp */"],
++        # st1 written but not popped: st0 is stored, not the result.
++        ["    fp_st1() = RECOMP_FP_PC(fp_st1() * fp_top()); /* fmul st(1), st(0) */",
++         "    MEMF(ecx) = (float)fp_top(); fp_pop(); /* fstp */"],
++        # A label between them: the store can be reached another way.
++        ["    fp_top() = RECOMP_FP_PC(fp_top() * MEMF(eax)); /* fmul */",
++         "loc_00010010:",
++         "    MEMF(ecx) = (float)fp_top(); fp_pop(); /* fstp */"],
++    ]
++    for lines in keep:
++        assert fuse_float_stores(lines) == lines
 diff --git a/tools/recomp/test_register_locals.py b/tools/recomp/test_register_locals.py
 new file mode 100644
 index 0000000..c939d72
@@ -2611,10 +2704,10 @@ index b21b075..5124070 100644
  
  def test_coalesce_end_in_the_fill_is_accepted():
 diff --git a/tools/recomp/translator.py b/tools/recomp/translator.py
-index 21600d3..f58df67 100644
+index 21600d3..98ab8db 100644
 --- a/tools/recomp/translator.py
 +++ b/tools/recomp/translator.py
-@@ -514,6 +514,128 @@ def _mark_back_edges(bb, stmts):
+@@ -514,6 +514,172 @@ def _mark_back_edges(bb, stmts):
      return stmts if out is None else out
  
  
@@ -2656,6 +2749,50 @@ index 21600d3..f58df67 100644
 +# destination of a pop.
 +_WRITING_MACROS = r"(?:PUSH32|POP32|PUSH16|POP16|SET_\w+)"
 +_FP_USE_RE = re.compile(r"\bg_fp_(?:top|stack)\b|\bfp_(?:push|pop|top|st1?)\(")
++
++
++# An x87 result that the next instruction stores as a float and pops is
++# rounded once, by the store (RECOMP_FP_STORE_F in recomp_types.h), instead
++# of to float precision first. RECOMP_FUSE_FLOAT_STORES=0 keeps both.
++FUSE_FLOAT_STORES = os.environ.get("RECOMP_FUSE_FLOAT_STORES", "1") != "0"
++_ROUNDED_RE = re.compile(r"^(\s*)(fp_top\(\)|fp_st1\(\)) = RECOMP_FP_PC\((.*?)\);"
++                         r"( fp_pop\(\);)? (/\*.*\*/)$")
++_FLOAT_STORE_RE = re.compile(r"^(\s*MEMF\(.*\)) = \(float\)fp_top\(\); fp_pop\(\); "
++                             r"(/\*.*\*/)$")
++
++
++def _balanced(text):
++    depth = 0
++    for ch in text:
++        depth += {"(": 1, ")": -1}.get(ch, 0)
++        if depth < 0:
++            return False
++    return depth == 0
++
++
++def fuse_float_stores(lines):
++    """Drop the PC=24 rounding of an x87 result that the very next line
++    stores as a float and pops. The pair sit on adjacent lines, so no label
++    (and no jump into the middle) separates them, and the pop discards the
++    unrounded value. A pop form (`faddp st(1)`) leaves its result in st0 for
++    the store the same way."""
++    out = list(lines)
++    for i in range(len(out) - 1):
++        m = _ROUNDED_RE.match(out[i])
++        if not m or not _balanced(m.group(3)):
++            continue
++        dst, pop = m.group(2), m.group(4) or ""
++        # The store must read the result: st0 written, or st1 written and
++        # then popped into st0.
++        if (dst == "fp_st1()") != bool(pop):
++            continue
++        s = _FLOAT_STORE_RE.match(out[i + 1])
++        if not s:
++            continue
++        out[i] = f"{m.group(1)}{dst} = {m.group(3)};{pop} {m.group(5)}"
++        out[i + 1] = (f"{s.group(1)} = RECOMP_FP_STORE_F(fp_top()); fp_pop(); "
++                      f"{s.group(2)}")
++    return out
 +
 +
 +def _register_writes(body):
@@ -2743,7 +2880,7 @@ index 21600d3..f58df67 100644
  class FunctionTranslator:
      """Translates individual x86 functions to C source code."""
  
-@@ -3062,9 +3184,16 @@ class FunctionTranslator:
+@@ -3062,9 +3228,16 @@ class FunctionTranslator:
          # Function signature
          lines.append(f"{ret_type} {name}({param_str})")
          lines.append(f"{{")
@@ -2761,7 +2898,7 @@ index 21600d3..f58df67 100644
  
          # Optional entry trace. Bring-up is mostly "which of these ten init
          # calls does it not come back from", and answering that by overriding
-@@ -3501,6 +3630,23 @@ class FunctionTranslator:
+@@ -3501,6 +3674,25 @@ class FunctionTranslator:
          lines.append(f"}}")
          lines.append(f"")
  
@@ -2771,6 +2908,8 @@ index 21600d3..f58df67 100644
 +        # The very largest then take most of an hour each to compile (a
 +        # 26,666-instruction one held its file for 62 minutes) and are left
 +        # as they were: unoptimized, but in seconds.
++        if FUSE_FLOAT_STORES:
++            lines = fuse_float_stores(lines)
 +        if REGISTER_LOCALS:
 +            lines = register_locals(lines, name)
 +
@@ -2785,7 +2924,7 @@ index 21600d3..f58df67 100644
          return "\n".join(lines)
  
      def _find_used_registers(self, instructions):
-@@ -3922,6 +4068,11 @@ class BatchTranslator:
+@@ -3922,6 +4114,11 @@ class BatchTranslator:
              "",
              '#include "recomp_types.h"',
              "",
@@ -2797,7 +2936,7 @@ index 21600d3..f58df67 100644
          ]
          for addr, name, _ in translations:
              decl = self._make_declaration(addr, name)
-@@ -4028,7 +4179,7 @@ class BatchTranslator:
+@@ -4028,7 +4225,7 @@ class BatchTranslator:
                  f'#include "{header_name}"',
                  '#include <math.h>',
                  "",
